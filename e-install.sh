@@ -8,13 +8,13 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-readonly VERSION="1.02"
+readonly VERSION="1.03"
 readonly SCRIPT_NAME="$(basename "$0")"
 
 set -euo pipefail
 
 readonly CUSTOM_GITHUB_TOOLS=(
-    "mautg.py|https://www.jeitler.cc/mautg/mautg.py"
+    "mautg.py|https://raw.githubusercontent.com/ewaldj/mautg/main/mautg.py"
 )
 
 readonly DEFAULT_BINDIR="/usr/local/bin"

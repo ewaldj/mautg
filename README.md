@@ -32,7 +32,7 @@ By Ewald Jeitler - https://www.jeitler.cc (also shown in the menus, the status b
 ## Installation / Update
 
 ```
-/bin/bash -c "$(curl -fsSL https://www.jeitler.cc/mautg/e-install.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ewaldj/mautg/main/e-install.sh)"
 ```
 
 The installer puts `mautg.py` into `/usr/local/bin` and creates the command `mautg`. Running it again updates.
@@ -40,7 +40,7 @@ The installer puts `mautg.py` into `/usr/local/bin` and creates the command `mau
 or
 
 ```bash
-# download mautg.py from https://www.jeitler.cc/mautg/
+# download mautg.py from https://github.com/ewaldj/mautg
 chmod +x mautg.py
 ```
 
@@ -51,6 +51,26 @@ mautg runs on **Python 3.6.1 or newer** (standard library only). Newer Python ve
 **Special characters (check marks, dashes, box frames, `us`)**: mautg writes Unicode only if the locale says UTF-8 (`echo $LANG` shows e.g. `en_US.UTF-8`); otherwise (e.g. `LANG` unset or `C`, as in the Guest Shell) it automatically falls back to plain ASCII (`OK`, `-`, `+===+`). `--ascii` or `MAUTG_ASCII=1` forces ASCII. If instead you see strange sequences such as `‚úì` or `‚Äî`, the *terminal program* is decoding UTF-8 with the wrong character set (typical: Mac Roman in SecureCRT): set the session's character encoding to UTF-8 (SecureCRT: Session Options > Terminal > Appearance > Character encoding), and `export LANG=en_US.UTF-8` on the router side, or just use `--ascii`.
 
 Guest Shell notes: the container has its own network namespace and sees only its own interface (management port `eth0`, or the VirtualPortGroup / AppGigabitEthernet interface of the application); traffic on the router's front ports is not visible there. Unicast works with an address on that interface. Multicast needs the router to forward the group to that interface (PIM, or `ip igmp join-group` / static join on the VirtualPortGroup). The packets run through the router CPU and the Guest Shell resource profile, so use low rates (hundreds to a few thousand pps) and no performance tests there.
+
+## Screenshots
+
+Sender form, receiver form (`mautg`, tabs switch with `S` / `R`):
+
+![Sender form](screenshots/form-sender.png)
+
+![Receiver form](screenshots/form-receiver.png)
+
+Sender live view, three streams (EF 8 Mbit/s, AF41, CS1):
+
+![Sender live view](screenshots/send-live.png)
+
+Receiver live view: stream table, interval summaries, MC/UC cast, DSCP, delay:
+
+![Receiver live view](screenshots/recv-live.png)
+
+Receiver per-packet view (`-i 0`, key `D`):
+
+![Receiver per-packet view](screenshots/recv-packets.png)
 
 ## Quick Start
 
@@ -71,7 +91,7 @@ No sender IP needed: the receiver detects it from the first packet and shows del
 ```
 
 ```
-+- mautg v1.46 --  Sender -- Receiver ----------------------------------------+
++- mautg v1.47 --  Sender -- Receiver ----------------------------------------+
 | Destination            239.1.1.1                                           |
 | Destination port       5001                                                |
 | Packet size (bytes)    1500                                                |
@@ -121,7 +141,7 @@ Rows marked "choose from list" open a sub menu (Up/Down/PgUp/PgDn, Enter = choos
 ### Receiver form
 
 ```
-+- mautg v1.46 --  Sender -- Receiver ----------------------------------------+
++- mautg v1.47 --  Sender -- Receiver ----------------------------------------+
 | Receive mode           < Multicast >                                       |
 | Multicast group(s)     239.1.1.1                                           |
 | Multicast interface    all                                                 |
@@ -151,7 +171,7 @@ Rows marked "choose from list" open a sub menu (Up/Down/PgUp/PgDn, Enter = choos
 With *Live view* on (default in the form; default of `recv` too; `--no-live` switches it off, terminal at least 80x16) the receiver uses the whole screen:
 
 ```
- mautg v1.46  239.1.1.1:5001-5008  sync auto  streams 2  00:01:23  summary 2s
+ mautg v1.47  239.1.1.1:5001-5008  sync auto  streams 2  00:01:23  summary 2s
 --------------------------------------------------------------------------------
  St | Source          |  Port | Cast |  Packets |  Loss% |  Miss |    Avg |    Max |  Mbit/s | Sync
 ------------------------------------------------------------------------------------------------
@@ -207,7 +227,7 @@ Traffic generator. `./mautg.py send` without a destination (and without `--burst
 ### Sender live view and multiple streams
 
 ```
- mautg v1.46  send  sync port 5556  streams 3/32 (2 running)  00:02:10
+ mautg v1.47  send  sync port 5556  streams 3/32 (2 running)  00:02:10
 --------------------------------------------------------------------------------
   # State   | Destination     |  Port | Size | Rate     | DSCP    |  Sent Mbit/s
 --------------------------------------------------------------------------------
@@ -602,7 +622,8 @@ hostA$ ./mautg.py recv -u -i 10
 
 ```
 ├── mautg.py             # Traffic generator + receiver + OWD sync server (single script)
-├── e-install.sh          # One-line installer/updater (fetches from www.jeitler.cc)
+├── e-install.sh          # One-line installer/updater (fetches from GitHub)
+├── screenshots/          # Images used in this README
 ├── wireshark/
 │   ├── mau_protocol.lua           # Wireshark Lua dissector (data-packet protocol)
 │   ├── mau_owd_sync_protocol.lua  # Wireshark Lua dissector (OWD sync protocol)

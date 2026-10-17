@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-VERSION = "1.46"
+VERSION = "1.47"
 AUTHOR = "Ewald Jeitler"
 URL = "https://www.jeitler.cc"
 CREDIT = f"by {AUTHOR} - {URL}"

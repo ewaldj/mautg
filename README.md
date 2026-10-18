@@ -25,7 +25,7 @@ Installs `mautg.py` to `/usr/local/bin` as command `mautg`; running it again upd
 ### Python 3.6 / Cisco Guest Shell
 
 - Python 3.6.1 or newer. Per-packet receiver cost: 2.0 us (3.8), 1.3 us (3.11/3.13).
-- Python 3.6 is the Guest Shell interpreter: `python3 mautg.py`. Not yet run on a real 3.6.
+- Python 3.6 is the Guest Shell interpreter: `python3 mautg.py`.
 - The Guest Shell sees only its own interface (`eth0` or VirtualPortGroup / AppGigabitEthernet). Multicast needs PIM or an IGMP join towards that interface. Use low rates (up to a few thousand pps).
 
 ### Character set

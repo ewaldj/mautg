@@ -7,10 +7,12 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-VERSION = "1.48"
+VERSION = "1.87"
 AUTHOR = "Ewald Jeitler"
 URL = "https://www.jeitler.cc"
 CREDIT = f"by {AUTHOR} - {URL}"
+WEB_DEFAULT_PORT = 8081
+WEB_DEFAULT_BIND = '0.0.0.0'
 
 
 def _pad_credit(room):
@@ -43,9 +45,17 @@ import signal
 import shutil
 import select
 import selectors
+import re
+import gzip
+import zipfile
+import tempfile
+import _thread
+import http.server
+import socketserver
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
-from collections import defaultdict, OrderedDict
+from collections import defaultdict, OrderedDict, deque
 from typing import NamedTuple, Optional
 
 # --- Output encoding ----------------------------------------------------------
@@ -133,7 +143,7 @@ class Colors:
     RED = '\033[91m'
     BLUE = '\033[94m'
     WHITE = '\033[1;97m'
-    GRAY = '\033[90m'
+    GRAY = '\033[37m'
     BOLD = '\033[1m'
     ENDC = '\033[0m'
 
@@ -889,21 +899,29 @@ class SyncController:
 #   [0:4]   sequence      uint32 BE
 #   [4:12]  timestamp     uint64 BE, microseconds, CLOCK_REALTIME
 #   [12:16] magic         b"MAUT"
-#   [16]    format ver.   1
+#   [16]    format ver.   2
 #   [17:19] sync port     uint16 BE, port of the sender's OWD sync server
 #                         (0 = sender runs no sync server)
-#   [19:-4] padding       readable preamble (if it fits) + 0x2A fill
+#   [19:23] stream id     uint32 BE, random, new at every start of a stream
+#   [23:-4] padding       readable preamble (if it fits) + 0x2A fill
 #   [-4:]   CRC32         uint32 BE over everything before it
 _HDR_STRUCT = struct.Struct('!IQ')   # seq(4) + timestamp(8) = 12 bytes
 _CRC_STRUCT = struct.Struct('!I')    # crc32(4)
 _PORT_STRUCT = struct.Struct('!H')   # sync port(2)
+_ID_STRUCT = struct.Struct('!I')     # stream id(4)
 _MAGIC = b'MAUT'
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
 _MAGIC_OFFSET = _HDR_STRUCT.size                 # 12
 _VERSION_OFFSET = _MAGIC_OFFSET + len(_MAGIC)    # 16
 _PORT_OFFSET = _VERSION_OFFSET + 1               # 17
-_PAD_OFFSET = _PORT_OFFSET + _PORT_STRUCT.size   # 19
-_HEADER_SIZE = _PAD_OFFSET + _CRC_STRUCT.size    # 23 (incl. CRC)
+_ID_OFFSET = _PORT_OFFSET + _PORT_STRUCT.size    # 19
+_PAD_OFFSET = _ID_OFFSET + _ID_STRUCT.size       # 23
+_HEADER_SIZE = _PAD_OFFSET + _CRC_STRUCT.size    # 27 (incl. CRC)
+
+
+def _new_stream_id():
+    """Random stream id (never 0) - identifies one run of one sender stream."""
+    return int.from_bytes(os.urandom(4), 'big') or 1
 _PREAMBLE = b'mautg_trafficgen_www.jeitler.cc:'
 _FILL_BYTE = 0x2A  # decimal 42
 
@@ -932,7 +950,7 @@ def _verify_packet(packet):
 # User enters wire size (e.g. 1500), we subtract this for UDP payload
 _UDP_IP_OVERHEAD = 28
 
-_MIN_PACKET_SIZE = _HEADER_SIZE  # 23 bytes
+_MIN_PACKET_SIZE = _HEADER_SIZE  # 27 bytes
 
 
 class PacketInfo(NamedTuple):
@@ -988,6 +1006,7 @@ def _rcvbuf_hint(size):
 
 _RX_HDR = _HDR_STRUCT.unpack_from      # per-packet parsing (receiver fast path)
 _RX_PORT = _PORT_STRUCT.unpack_from
+_RX_ID = _ID_STRUCT.unpack_from
 
 
 # --- Statistics ---------------------------------------------------------------
@@ -1140,26 +1159,30 @@ def format_ports(ports):
 _STREAM_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
 
-class Stream:
-    """State of ONE detected sender stream (source IP + advertised sync port).
+_SEQ_WINDOW = 2048                       # packets remembered for reorder / duplicate detection
+_SEQ_MASK = (1 << _SEQ_WINDOW) - 1
 
-    Every stream has its own sequence tracker, statistics and OWD sync, so
-    several senders (or the same sender reaching us over two interfaces)
-    never get mixed up.
+
+class Stream:
+    """State of ONE detected sender stream: source IP + destination port + stream id.
+
+    The stream id is chosen by the sender at every start of a stream. A new id
+    on the same IP/port after the old one fell silent is a restart of the same
+    stream (the sequence tracker starts over, no false loss); a new id while the
+    old one is still arriving is another sender (own stream).
+    Every stream has its own sequence tracker, statistics and OWD sync.
     """
 
-    # Sender restart detection: if seq drops by more than this threshold
-    # relative to last_seq, treat it as a sender restart, not misorder.
-    _RESTART_THRESHOLD = 10
-
-    def __init__(self, label, ip, sync_port, sync, port=0, show_port=False):
+    def __init__(self, label, ip, sync_port, sync, port=0, show_port=False, sid=0):
         self.label = label
         self.ip = ip
         self.sync_port = sync_port
+        self.sid = sid                    # stream id of the sender (current run)
         self.port = port                  # local destination port
         self.show_port = show_port
         self.sync = sync                  # _SyncSlot or None
         self.first_time = time.monotonic()
+        self.last_rx = self.first_time    # monotonic time of the latest packet
 
         # lifetime totals
         self.total_packets = 0
@@ -1177,12 +1200,18 @@ class Stream:
         self.iv_misorder = 0
         self.iv_dscp_stats = defaultdict(DscpStats)
 
-        # sequence tracking
-        self.expected_seq = None
-        self.last_seq = -1
-        self.total_missing = 0
-        self.total_misorder = 0
-        self.restart_from = None          # last_seq before the latest restart
+        # sequence tracking: highest seq seen + bitmap of the last _SEQ_WINDOW
+        # sequence numbers (bit k = highest - k was received)
+        self.highest = None
+        self.bitmap = 0
+        self.total_missing = 0            # lost packets (a late arrival takes it back)
+        self.total_misorder = 0           # late arrivals
+        self.gaps = []                    # [first, last] of the packets still missing (extended seq numbers)
+        self.gap_done = 0                 # longest run of lost packets that can no longer be filled
+        self.ext = 0                      # highest seq as a running (non-wrapping) number
+        self.dup_same = 0                 # exact copies of a packet of this stream
+        self.pending_restart = False      # the next packet is the first of a new run
+        self.restart_from = None          # highest seq before the latest restart
         self.restarts = 0
 
         # copies of the same packets seen on another stream (two interfaces)
@@ -1195,53 +1224,93 @@ class Stream:
         t = f"{self.ip} (sync port {self.sync_port})" if self.sync_port else self.ip
         return t + (f" -> port {self.port}" if self.show_port else "")
 
+    def silent_for(self, now):
+        """Seconds without a packet, and how long is 'silent' for this stream."""
+        n = self.total_packets
+        gap = (self.last_rx - self.first_time) / (n - 1) if n > 1 else 0.0
+        return now - self.last_rx, min(5.0, max(0.3, 4 * gap))
+
+    @property
+    def max_gap(self):
+        """Most packets lost in a row: longest run of sequence numbers that never
+        arrived (a late arrival splits a run, so this can also go down)."""
+        cur = max((b - a + 1 for a, b in self.gaps), default=0)
+        return max(self.gap_done, cur)
+
+    def rebind(self, sid):
+        """The sender started this stream again (new id)."""
+        self.gap_done = self.max_gap
+        self.gaps = []
+        self.restart_from = self.highest
+        self.restarts += 1
+        self.sid = sid
+        self.highest = None
+        self.bitmap = 0
+        self.pending_restart = True
+
     def loss_pct(self):
-        total_expected = self.total_packets + self.total_missing
+        total_expected = self.total_packets - self.dup_same + self.total_missing
         if total_expected <= 0:
             return 0.0
         return (self.total_missing / total_expected) * 100
 
     def check_order(self, seq):
-        """Check sequence order. Returns (status, gap).
-
-        gap = number of missing packets for LOSS status, else 0.
-        Detects sender restart:
-          1) seq == 0 always indicates a fresh sender start
-          2) seq drops by more than _RESTART_THRESHOLD
-        On RESTART `restart_from` holds the previous sequence number.
-        """
-        if self.expected_seq is None:
-            self.expected_seq = seq
-
-        gap = 0
-        is_restart = False
-
-        if seq == 0 and self.last_seq > 0:
-            is_restart = True
-        elif seq < self.last_seq and (self.last_seq - seq) > self._RESTART_THRESHOLD:
-            is_restart = True
-
-        if is_restart:
-            self.restart_from = self.last_seq
-            self.restarts += 1
-            self.expected_seq = seq
-            self.last_seq = -1
-            status = 'RESTART'
-        elif seq < self.last_seq:
-            self.total_misorder += 1
-            status = 'MISORDER'
-        elif seq > self.expected_seq:
-            gap = seq - self.expected_seq
-            self.total_missing += gap
-            status = 'LOSS'
-        else:
-            status = 'OK'
-
-        if seq >= self.expected_seq:
-            self.expected_seq = seq + 1
-        self.last_seq = max(self.last_seq, seq)
-
-        return status, gap
+        """Sequence check. Returns (status, gap):
+        OK, LOSS (gap = packets missing before this one), MISORDER (late arrival of
+        a packet counted as lost), DUP (exact copy), RESTART (first packet of a new
+        run of the sender stream)."""
+        hi = self.highest
+        if hi is None:
+            self.highest = seq
+            self.bitmap = 1
+            if self.pending_restart:
+                self.pending_restart = False
+                return 'RESTART', 0
+            return 'OK', 0
+        diff = ((seq - hi + 0x80000000) & 0xFFFFFFFF) - 0x80000000
+        if diff > 0:
+            self.bitmap = ((self.bitmap << diff) | 1) & _SEQ_MASK if diff < _SEQ_WINDOW else 1
+            self.highest = seq
+            if diff > 1:
+                self.total_missing += diff - 1
+                self.gaps.append([self.ext + 1, self.ext + diff - 1])
+            self.ext += diff
+            gaps = self.gaps
+            if gaps and gaps[0][1] < self.ext - _SEQ_WINDOW:       # can no longer be filled
+                limit = self.ext - _SEQ_WINDOW
+                while gaps and gaps[0][1] < limit:
+                    a, b = gaps.pop(0)
+                    if b - a + 1 > self.gap_done:
+                        self.gap_done = b - a + 1
+            return ('LOSS', diff - 1) if diff > 1 else ('OK', 0)
+        k = -diff
+        if k < _SEQ_WINDOW:
+            bit = 1 << k
+            if self.bitmap & bit:
+                self.dup_same += 1
+                return 'DUP', 0
+            self.bitmap |= bit
+            if self.total_missing > 0:
+                self.total_missing -= 1
+            e = self.ext - k
+            gaps = self.gaps
+            for idx in range(len(gaps) - 1, -1, -1):
+                a, b = gaps[idx]
+                if a <= e <= b:
+                    if a == b:
+                        del gaps[idx]
+                    elif e == a:
+                        gaps[idx][0] = a + 1
+                    elif e == b:
+                        gaps[idx][1] = b - 1
+                    else:
+                        gaps[idx][1] = e - 1
+                        gaps.insert(idx + 1, [e + 1, b])
+                    break
+                if b < e:
+                    break
+        self.total_misorder += 1
+        return 'MISORDER', 0
 
 
 class PacketReceiver:
@@ -1302,8 +1371,12 @@ class PacketReceiver:
         self.mc_desc = describe_mcast_interfaces(self.interface, self.mc_ifaces)
         self._join_problems = set()
 
-        # streams: (source ip, sync port) -> Stream
+        # streams: unique key -> Stream; _alias: (source ip, port, stream id) -> Stream
         self.streams = {}
+        self._alias = {}
+        self._ep = {}                 # (source ip, port) -> [Stream, ...]
+        self._retired = set()         # stream ids replaced by a restart (stragglers are dropped)
+        self.stale_packets = 0
         self.multi = False            # True once a 2nd stream shows up
         self._recent = OrderedDict()  # duplicate detection (multi only)
 
@@ -1313,15 +1386,11 @@ class PacketReceiver:
         self.last_summary_time = self.start_time
 
         # CSV
+        self._dst_raw = b''           # destination address of the current packet (CSV)
         self.csv_file = None
         self.csv_writer = None
         if log_file:
-            self.csv_file = open(log_file, 'w', newline='', buffering=8192)
-            self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow([
-                'Timestamp', 'Seq', 'Delay_ms', 'DSCP', 'DSCP_Name', 'Status',
-                'Stream', 'Source_IP', 'Sync_Port', 'Port', 'Cast'
-            ])
+            self.start_csv(log_file)
 
         try:
             self._setup_sockets()
@@ -1333,6 +1402,24 @@ class PacketReceiver:
             self.live.rx = self
             for sk in self.socks:
                 sk.settimeout(0.2)
+
+    def start_csv(self, path):
+        """Start (or restart) the CSV log; OSError if the file cannot be created."""
+        f = open(str(path), 'w', newline='', buffering=8192)
+        self.stop_csv()
+        self.csv_file, self.log_file = f, path
+        self.csv_writer = csv.writer(f)
+        self.csv_writer.writerow([
+            'Timestamp', 'Seq', 'Delay_us', 'DSCP', 'DSCP_Name', 'Status',
+            'Stream', 'Source_IP', 'Sync_Port', 'Port', 'Cast', 'Dest_IP'
+        ])
+
+    def stop_csv(self):
+        w, f = self.csv_writer, self.csv_file
+        self.csv_writer = self.csv_file = None
+        self.log_file = None
+        if f:
+            f.close()
 
     @staticmethod
     def _get_own_ip():
@@ -1477,13 +1564,15 @@ class PacketReceiver:
         rx_ns = None
         cast = ''
         ovfl = None
+        self._dst_raw = b''
         for level, type_, data in ancillary:
             if level == socket.IPPROTO_IP:
                 if type_ in (socket.IP_TOS, _IP_RECVTOS):
                     tos = data[0] if isinstance(data, bytes) else data
                     dscp = (tos >> 2) & 0x3F
                 elif type_ == _DST_OPT:
-                    cast = self._classify_dest(bytes(data[_DST_OFFSET:_DST_OFFSET + 4]))
+                    self._dst_raw = bytes(data[_DST_OFFSET:_DST_OFFSET + 4])
+                    cast = self._classify_dest(self._dst_raw)
             elif _HAS_TIMESTAMPNS and level == socket.SOL_SOCKET and type_ == socket.SO_TIMESTAMPNS:
                 sec, nsec = _TIMESPEC_STRUCT.unpack_from(data, 0)
                 rx_ns = sec * 1_000_000_000 + nsec
@@ -1492,17 +1581,39 @@ class PacketReceiver:
         return dscp, rx_ns, cast, ovfl
 
     # -- streams -----------------------------------------------------------
-    def _stream_for(self, src_ip, sync_port, packet, port=0):
-        """Stream of a packet; a new one is created after a full check
-        (CRC + padding). None if the packet cannot be assigned."""
-        key = (src_ip, sync_port, port)
-        stream = self.streams.get(key)
+    def _stream_for(self, src_ip, sync_port, sid, packet, port=0):
+        """Stream of a packet; a new one is created (or a silent one taken over by
+        a restarted sender) after a full check (CRC + padding). None if the packet
+        cannot be assigned."""
+        key = (src_ip, port, sid)
+        stream = self._alias.get(key)
         if stream is not None:
             return stream
+        if key in self._retired:
+            self.stale_packets += 1
+            return None
 
         if not _verify_packet(packet):
             self.corrupt_packets += 1
             return None
+
+        now = time.monotonic()
+        cands = self._ep.get((src_ip, port), ())
+        for st in sorted(cands, key=lambda s: -s.last_rx):
+            silent, limit = st.silent_for(now)
+            if silent > limit:                     # the sender started it again
+                self._retired.add((src_ip, port, st.sid))
+                self._alias.pop((src_ip, port, st.sid), None)
+                st.rebind(sid)
+                self._alias[key] = st
+                if sync_port != st.sync_port:
+                    st.sync_port = sync_port
+                    st.sync = self.sync.slot_for(src_ip, sync_port)
+                who = f"stream {st.label}: " if self.multi else ""
+                print(f"{Colors.YELLOW}⚠ {who}Sender restart detected "
+                      f"(new stream id {sid:08x}) - sequence tracker starts over{Colors.ENDC}")
+                return st
+
         if len(self.streams) >= self.MAX_STREAMS:
             self.other_sender_packets += 1
             if not self._warned_cap:
@@ -1514,8 +1625,10 @@ class PacketReceiver:
         label = _STREAM_LABELS[len(self.streams)]
         sync_port_used = self.sync.override_port or sync_port
         slot = self.sync.slot_for(src_ip, sync_port)
-        stream = Stream(label, src_ip, sync_port, slot, port, self.port_col)
+        stream = Stream(label, src_ip, sync_port, slot, port, self.port_col, sid)
         self.streams[key] = stream
+        self._alias[key] = stream
+        self._ep.setdefault((src_ip, port), []).append(stream)
         self._announce_stream(stream, sync_port_used)
         return stream
 
@@ -1572,7 +1685,8 @@ class PacketReceiver:
             return None
 
         sync_port = _PORT_STRUCT.unpack_from(packet, _PORT_OFFSET)[0]
-        stream = self._stream_for(src_ip, sync_port, packet, port)
+        stream = self._stream_for(src_ip, sync_port, _ID_STRUCT.unpack_from(packet, _ID_OFFSET)[0],
+                                  packet, port)
         if stream is None:
             return None
 
@@ -1597,10 +1711,10 @@ class PacketReceiver:
         )
 
     def _note_duplicate(self, stream, pkt, rx_ns):
-        """Same packet (sync port, timestamp, seq) seen on two streams, e.g.
+        """Same packet (stream id, port, seq) seen on two streams, e.g.
         a multicast stream arriving over Ethernet and WLAN."""
         now_ns = rx_ns if rx_ns is not None else time.time_ns()
-        key = (stream.sync_port, stream.port, pkt.ts_us, pkt.seq)
+        key = (stream.sid, stream.port, pkt.seq)
         prev = self._recent.get(key)
         if prev is None:
             self._recent[key] = (stream, now_ns)
@@ -1618,7 +1732,7 @@ class PacketReceiver:
         time_str = datetime.now().strftime('%H:%M:%S')
         if status in ('OK', 'RESTART'):
             sc = Colors.GREEN
-        elif status == 'LOSS':
+        elif status in ('LOSS', 'DUP'):
             sc = Colors.YELLOW
         else:
             sc = Colors.RED
@@ -1833,6 +1947,10 @@ class PacketReceiver:
         OWD sync slots and the CSV file stay as they are."""
         now = time.monotonic()
         self.streams.clear()
+        self._alias.clear()
+        self._ep.clear()
+        self._retired.clear()
+        self.stale_packets = 0
         self.multi = False
         self._recent.clear()
         self.foreign_packets = self.corrupt_packets = self.other_sender_packets = 0
@@ -1851,6 +1969,8 @@ class PacketReceiver:
         if self.other_sender_packets:
             parts.append(f"{self.other_sender_packets} from streams beyond the "
                          f"limit of {self.MAX_STREAMS}")
+        if self.stale_packets:
+            parts.append(f"{self.stale_packets} of a replaced (restarted) stream")
         return ', '.join(parts)
 
     def _live_stop(self):
@@ -1903,9 +2023,12 @@ class PacketReceiver:
             print(f"{g}║  Delay: n/a (sync unavailable){Colors.ENDC}")
         print(f"{g}║  Loss: {s.loss_pct():.2f}% "
               f"({s.total_missing} packets){Colors.ENDC}")
+        print(f"{g}║  Max consecutive loss: {s.max_gap} packets{Colors.ENDC}")
         print(f"{g}║  Misorder: {s.total_misorder}{Colors.ENDC}")
         if s.restarts:
             print(f"{Colors.YELLOW}║  Sender restarts: {s.restarts}{Colors.ENDC}")
+        if s.dup_same:
+            print(f"{Colors.YELLOW}║  Duplicate packets: {s.dup_same:,}{Colors.ENDC}")
         if s.dup_count:
             d = s.dup_delta
             print(f"{Colors.YELLOW}║  Copies of stream {s.dup_of}: {s.dup_count:,} "
@@ -1914,7 +2037,17 @@ class PacketReceiver:
         print(f"{g}╚═════════════════════════════════════════════════════{Colors.ENDC}\n")
 
     def receive_loop(self):
-        """Main receive loop."""
+        """Main receive loop (only one receiver may run per program)."""
+        with _RX_LOCK:
+            _RX_ACTIVE.append(self)
+        try:
+            return self._receive_loop()
+        finally:
+            with _RX_LOCK:
+                if self in _RX_ACTIVE:
+                    _RX_ACTIVE.remove(self)
+
+    def _receive_loop(self):
         if self.unicast_mode:
             mode_text = f"Unicast only (local IP: {self.own_ip})"
         elif self.group:
@@ -2084,7 +2217,7 @@ class PacketReceiver:
         if (not self.verify_all and len(packet) >= _MIN_PACKET_SIZE
                 and packet[_MAGIC_OFFSET:_VERSION_OFFSET] == _MAGIC
                 and packet[_VERSION_OFFSET] == _FORMAT_VERSION):
-            stream = self.streams.get((src_ip, _RX_PORT(packet, _PORT_OFFSET)[0], port))
+            stream = self._alias.get((src_ip, port, _RX_ID(packet, _ID_OFFSET)[0]))
         if stream is not None:
             seq, ts_us = _RX_HDR(packet, 0)
             delay_ms = None
@@ -2107,13 +2240,10 @@ class PacketReceiver:
         if cast:
             s.cast = cast
         status, gap = s.check_order(seq)
-        if status == 'RESTART':
-            who = f"stream {s.label}: " if self.multi else ""
-            print(f"{Colors.YELLOW}⚠ {who}Sender restart detected "
-                  f"(seq {s.restart_from} → {seq}) — "
-                  f"resetting sequence tracker{Colors.ENDC}")
         if self.multi:
             self._note_duplicate(s, PacketInfo(seq, delay_ms, size, dscp, s, ts_us, cast), rx_ns)
+
+        s.last_rx = time.monotonic()
 
         # clamped (>=0) delay for on-screen stats/averages; the
         # raw, possibly-negative delay_ms still goes to CSV
@@ -2151,7 +2281,7 @@ class PacketReceiver:
             self.csv_writer.writerow([
                 datetime.now().isoformat(),
                 seq,
-                f"{delay_ms:.3f}" if delay_ms is not None else "",
+                str(int(round(delay_ms * 1000))) if delay_ms is not None else "",
                 dscp,
                 dscp_to_name(dscp),
                 status,
@@ -2160,6 +2290,7 @@ class PacketReceiver:
                 s.sync_port,
                 s.port,
                 cast,
+                socket.inet_ntoa(self._dst_raw) if len(self._dst_raw) == 4 else '',
             ])
 
         # display
@@ -2282,13 +2413,13 @@ def _open_send_socket(config, report=None):
         return None
 
 
-def _build_packet_buffer(wire_size, sync_port=0):
+def _build_packet_buffer(wire_size, sync_port=0, stream_id=None):
     """Pre-allocate mutable bytearray for packet construction.
 
     wire_size is the total IP packet size on the wire (as entered by user).
     UDP payload = wire_size - 28 (IP header 20 + UDP header 8).
     Layout: see "Data packet layout" above. Magic, format version, sync
-    port and padding are constant and written once here; only sequence,
+    port, stream id and padding are constant and written once here; only sequence,
     timestamp and CRC change per packet.
     """
     udp_payload = max(wire_size - _UDP_IP_OVERHEAD, _HEADER_SIZE)
@@ -2296,6 +2427,7 @@ def _build_packet_buffer(wire_size, sync_port=0):
     buf[_MAGIC_OFFSET:_MAGIC_OFFSET + len(_MAGIC)] = _MAGIC
     buf[_VERSION_OFFSET] = _FORMAT_VERSION
     _PORT_STRUCT.pack_into(buf, _PORT_OFFSET, sync_port)
+    _ID_STRUCT.pack_into(buf, _ID_OFFSET, _new_stream_id() if stream_id is None else stream_id)
     pad = _expected_padding(udp_payload - _HEADER_SIZE)
     buf[_PAD_OFFSET:_PAD_OFFSET + len(pad)] = pad
     return buf
@@ -2571,6 +2703,37 @@ def _tbl_row(groups, vals=None, colors=None):
     return ' ' + ' | '.join(out)
 
 
+def _streams_total(streams, rates):
+    """Sum over all receiver streams. rates: label -> (mbit, pps)."""
+    pk = miss = ord_ = cons = dup = 0
+    cnt = 0
+    tot = 0.0
+    mn = float('inf')
+    mx = float('-inf')
+    mbit = pps = 0.0
+    for s in streams:
+        pk += s.total_packets
+        miss += s.total_missing
+        ord_ += s.total_misorder
+        dup += s.dup_same
+        cons = max(cons, s.max_gap)
+        ds = s.delay_stats
+        if ds.count:
+            cnt += ds.count
+            tot += ds.total
+            mn = min(mn, ds.min_val)
+            mx = max(mx, ds.max_val)
+        r = rates.get(s.label)
+        if r:
+            mbit += r[0]
+            pps += r[1]
+    exp = pk - dup + miss
+    return {'n': len(streams), 'pk': pk, 'miss': miss, 'ord': ord_, 'cons': cons,
+            'loss': (miss / exp * 100) if exp > 0 else 0.0,
+            'avg': (tot / cnt) if cnt else None, 'min': mn if cnt else None,
+            'max': mx if cnt else None, 'mbit': mbit, 'pps': pps}
+
+
 class SendStream:
     """One send stream: its own socket and thread, own sequence numbers.
 
@@ -2589,6 +2752,7 @@ class SendStream:
         self.errors = 0
         self.notes = []
         self.seq = 0
+        self.sid = _new_stream_id()
         self.sent = 0
         self.bytes = 0
         self.rate_pps = 0.0
@@ -2620,6 +2784,7 @@ class SendStream:
         self._halt = False
         self.error = ''
         self.notes = []
+        self.sid = _new_stream_id()           # a new run of the stream = a new stream id
         self.state = 'running'
         self._samp = (self.sent, self.bytes, time.monotonic())
         self._thread = threading.Thread(target=self._run, daemon=True, name='send-stream')
@@ -2676,6 +2841,8 @@ class SendStream:
     def _fail(self, e):
         self.errors += 1
         self.error = str(e)
+        if getattr(e, 'errno', None) == errno.EMSGSIZE:
+            self.error += ' - size above the MTU (DF on) or the OS limit (macOS: net.inet.udp.maxdgram)'
         self.error_at = time.monotonic()
 
     _active = 0                   # stream threads running (class-wide)
@@ -2710,7 +2877,7 @@ class SendStream:
                     return
                 try:
                     buf = _build_packet_buffer(p['packet_size'],
-                                               _advertised_sync_port(self.sync_server))
+                                               _advertised_sync_port(self.sync_server), self.sid)
                     self._send_loop(p, gen, sock, dest, buf)
                 finally:
                     sock.close()
@@ -2856,14 +3023,102 @@ def parse_stream_spec(spec, defaults):
     return p
 
 
-def check_stream_params(p):
-    """'' if the stream parameters are usable, otherwise the problem."""
+_MTU_CACHE = {}
+
+
+def _mtu_from_ifconfig(local_ip):
+    """MTU of the interface that owns local_ip (parsed from `ifconfig`; macOS / BSD / Linux)."""
+    import subprocess
+    for cmd in (['ifconfig', '-a'], ['/sbin/ifconfig', '-a']):
+        try:
+            out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 universal_newlines=True, timeout=3).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for block in re.split(r'\n(?=\S)', out):
+            if re.search(r'\binet (?:addr:)?' + re.escape(local_ip) + r'\b', block):
+                mm = re.search(r'\bmtu[ :](\d+)', block, re.I)
+                if mm:
+                    nm = re.match(r'([^\s:]+)', block)
+                    return int(mm.group(1)), (nm.group(1) if nm else '')
+    return None, ''
+
+
+_MAXDGRAM = []
+
+
+def udp_max_dgram():
+    """Largest UDP payload the OS sends in one datagram: macOS / BSD limit it with
+    net.inet.udp.maxdgram (default 9216); None = no such limit (Linux)."""
+    if not _MAXDGRAM:
+        val = None
+        if sys.platform == 'darwin' or 'bsd' in sys.platform:
+            import subprocess
+            try:
+                out = subprocess.run(['sysctl', '-n', 'net.inet.udp.maxdgram'],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     universal_newlines=True, timeout=3).stdout.strip()
+                val = int(out)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                val = None
+        _MAXDGRAM.append(val)
+    return _MAXDGRAM[0]
+
+
+def egress_mtu(dest, src=''):
+    """(MTU, interface name) of the way to dest; (None, '') if it cannot be determined.
+    Linux: kernel route MTU (IP_MTU); otherwise the MTU of the interface owning the
+    local address."""
+    key = (str(dest).strip(), str(src or '').strip())
+    hit = _MTU_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < 5.0:
+        return hit[1]
+    res = (None, '')
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        if key[1]:
+            s.bind((key[1], 0))
+        s.connect((key[0], 9))
+        local = s.getsockname()[0]
+        mtu = None
+        try:
+            mtu = s.getsockopt(socket.IPPROTO_IP, 14)       # IP_MTU (Linux)
+        except (OSError, AttributeError):
+            pass
+        name = ''
+        if not mtu:
+            mtu, name = _mtu_from_ifconfig(local)
+        if mtu and mtu > 0:
+            res = (int(mtu), name)
+    except (OSError, ValueError, UnicodeError):
+        pass
+    finally:
+        if s is not None:
+            s.close()
+    _MTU_CACHE[key] = (time.monotonic(), res)
+    return res
+
+
+def check_stream_params(p, mtu=True):
+    """'' if the stream parameters are usable, otherwise the problem.
+    mtu: also limit the size to the MTU of the way to the destination."""
     if not str(p['destination_address']).strip():
         return 'destination required'
     if not 1 <= p['destination_port'] <= 65535:
         return 'destination port must be 1-65535'
-    if not _MIN_PACKET_SIZE + _UDP_IP_OVERHEAD <= p['packet_size'] <= 65507:
-        return f"size must be {_MIN_PACKET_SIZE + _UDP_IP_OVERHEAD}-65507"
+    lo = _MIN_PACKET_SIZE + _UDP_IP_OVERHEAD
+    if not lo <= p['packet_size'] <= 65507:
+        return f"size must be {lo}-65507"
+    md = udp_max_dgram() if mtu else None
+    if md and p['packet_size'] > md + _UDP_IP_OVERHEAD:
+        return (f"size must be {lo}-{md + _UDP_IP_OVERHEAD} (OS limit net.inet.udp.maxdgram={md}; "
+                f"raise: sudo sysctl -w net.inet.udp.maxdgram=65535)")
+    if mtu and p.get('df_bit'):             # DF off: larger packets are fragmented, allowed
+        lim, ifn = egress_mtu(p['destination_address'], p.get('source_address'))
+        if lim and p['packet_size'] > lim:
+            return f"size must be {lo}-{lim} (MTU{' of ' + ifn if ifn else ''})"
     if not p['burst_mode'] and not 0.01 <= p['packets_per_second'] <= 10_000_000:
         return 'pps must be 0.01-10000000'
     if not 0 <= p['dscp_value'] <= 63:
@@ -2874,6 +3129,22 @@ def check_stream_params(p):
         return 'source port must be 0-65535'
     if p['source_address'] and not _ip_usable(p['source_address']):
         return f"source address {p['source_address']} is not an address of this host"
+    return ''
+
+
+def _validate_stream(streams, params, ignore=None):
+    """'' if the parameters are usable next to the other streams, else the problem."""
+    problem = check_stream_params(params)
+    if problem:
+        return problem
+    for i, st in enumerate(streams):
+        if i == ignore:
+            continue
+        q = st.params()
+        if (q['destination_port'] == params['destination_port']
+                and q['source_address'] == params['source_address']):
+            return (f"Port {params['destination_port']} is already used by stream "
+                    f"{i + 1} - a receiver would merge the two")
     return ''
 
 
@@ -2920,6 +3191,7 @@ def run_senders_plain(plist, sync_server):
             else "none - receivers get no delay values")
     print(f"{Colors.GREEN}OWD sync: {sync}.  CTRL+C to stop{Colors.ENDC}\n")
     start = time.monotonic()
+    _WEB.attach_streams(streams, sync_server, None, None)
     try:
         for st in streams:
             st.start()
@@ -2927,6 +3199,8 @@ def run_senders_plain(plist, sync_server):
         while True:
             time.sleep(0.2)
             now = time.monotonic()
+            if _WEB.active:
+                _WEB.tx_poll(None)
             if now - last >= 5.0:
                 last = now
                 for i, st in enumerate(streams, 1):
@@ -2935,6 +3209,7 @@ def run_senders_plain(plist, sync_server):
     except KeyboardInterrupt:
         pass
     finally:
+        _WEB.detach_streams()
         for st in streams:
             st.stop(wait=False)
         for st in streams:
@@ -3250,29 +3525,38 @@ def default_log_name():
     return datetime.now().strftime(f'mautg-log_{fmt}.csv')
 
 
-def run_receiver(rc, live=False):
-    """Set up OWD sync + PacketReceiver from a recv settings dict and run
-    until Ctrl+C. Returns afterwards (the caller decides what's next)."""
+_RX_ACTIVE = []              # receivers whose loop is running in this program
+_RX_LOCK = threading.Lock()
+
+
+def _setup_receiver(rc, make_view, err, note):
+    """Check the recv settings, set up OWD sync + CSV log and build the
+    PacketReceiver. Returns it, or None after err(text). make_view() returns
+    the live view (or None)."""
+    with _RX_LOCK:
+        if any(r is not None for r in _RX_ACTIVE):
+            err("a receiver is already running in this program - stop it first")
+            return None
     try:
         parse_ports(rc['port'])
     except ValueError as e:
-        print(f"{Colors.RED}✗ Invalid port specification: {e}{Colors.ENDC}\n")
-        return
+        err(f"Invalid port specification: {e}")
+        return None
     if not rc['unicast']:
         try:
             parse_groups(rc['group'])
         except ValueError as e:
-            print(f"{Colors.RED}✗ Invalid multicast group specification: {e}{Colors.ENDC}\n")
-            return
+            err(f"Invalid multicast group specification: {e}")
+            return None
         try:
             resolve_mcast_interfaces(rc.get('interface'))
         except ValueError as e:
-            print(f"{Colors.RED}✗ Multicast interface: {e}{Colors.ENDC}\n")
-            return
+            err(f"Multicast interface: {e}")
+            return None
     ip = rc['sender_ip']
     if ip == 'none':
         sync = SyncController('off')
-        print(f"{Colors.YELLOW}⚠ OWD sync switched off — delay values disabled{Colors.ENDC}")
+        note("⚠ OWD sync switched off — delay values disabled", 'warn')
     elif ip:
         sync = SyncController('explicit', ip, rc['sender_sync_port'], rc['resync_interval'])
         sync.connect_blocking()
@@ -3288,25 +3572,55 @@ def run_receiver(rc, live=False):
         else:
             log_name = rc['log']
         log_file = Path.cwd() / log_name   # absolute names stay as given
-        print(f"{Colors.CYAN}CSV log: {log_file}{Colors.ENDC}")
+        note(f"CSV log: {log_file}")
 
-    view = None
-    if live:
-        cols, rows = shutil.get_terminal_size((80, 24))
-        ok, _why = tui_available()
-        if ok and cols >= 80 and rows >= 16:
-            view = LiveView()
-        elif ok or sys.stdout.isatty():
-            print(f"{Colors.YELLOW}⚠ Live view needs a terminal of at least 80x16 - "
-                  f"using the plain output{Colors.ENDC}")
-
+    view = make_view()
     try:
-        receiver = _make_receiver(rc, log_file, sync, view)
+        return _make_receiver(rc, log_file, sync, view)
     except OSError as e:
-        print(f"{Colors.RED}✗ Receiver cannot start: {e}{Colors.ENDC}\n")
+        err(f"Receiver cannot start: {e}")
         sync.stop()
+        return None
+
+
+def run_receiver(rc, live=False):
+    """Set up OWD sync + PacketReceiver from a recv settings dict and run
+    until Ctrl+C. Returns afterwards (the caller decides what's next)."""
+    def err(text):
+        print(f"{Colors.RED}✗ {text}{Colors.ENDC}\n")
+
+    def note(text, kind='info'):
+        print(f"{Colors.YELLOW if kind == 'warn' else Colors.CYAN}{text}{Colors.ENDC}")
+
+    def make_view():
+        view = None
+        if live:
+            cols, rows = shutil.get_terminal_size((80, 24))
+            ok, _why = tui_available()
+            if ok and cols >= 80 and rows >= 16:
+                view = LiveView()
+            elif ok or sys.stdout.isatty():
+                print(f"{Colors.YELLOW}⚠ Live view needs a terminal of at least 80x16 - "
+                      f"using the plain output{Colors.ENDC}")
+        if _WEB.active:
+            view = _WEB.live_for(view)
+        return view
+
+    if live and _CTX['cfg'] is not None:
+        cols, rows = shutil.get_terminal_size((80, 24))
+        if tui_available()[0] and cols >= 80 and rows >= 16:
+            problem = _run_dual('recv', rc=rc)
+            if problem:
+                err(problem)
+            return
+    receiver = _setup_receiver(rc, make_view, err, note)
+    if receiver is None:
         return
-    receiver.receive_loop()
+    _WEB.attach_receiver(receiver, rc)
+    try:
+        receiver.receive_loop()
+    finally:
+        _WEB.detach_receiver(receiver)
 
 
 def _make_receiver(rc, log_file, sync, view):
@@ -3602,7 +3916,7 @@ _STYLES = {
     'val':    (_ESC + '[96m',              ''),
     'choice': (_ESC + '[96m',              ''),
     'on':     (_ESC + '[92m',              ''),
-    'off':    (_ESC + '[90m',              ''),
+    'off':    (_ESC + '[37m',              ''),
     'btn':    (_ESC + '[1;92m',            ''),
 }
 
@@ -3691,7 +4005,7 @@ class LiveView:
         cols, rows = shutil.get_terminal_size((80, 24))
         self._size = (cols, rows)
         self.n_alloc = 2 if rows < 20 else 4 if rows < 30 else 8
-        self.log_top = self.n_alloc + 8
+        self.log_top = self.n_alloc + 9
         self.log_bottom = rows - 1
         _w(_ESC + '[?7l' + _ESC + '[2J' + _ESC + f'[{self.log_top};{self.log_bottom}r'
            + _ESC + f'[{self.log_bottom};1H')
@@ -3725,12 +4039,13 @@ class LiveView:
             g2 = [('pk', 'Packets', 8, '>'), ('loss', 'Loss%', 6, '>')]
             if missc:
                 g2.append(('miss', 'Miss', 5, '>'))
+                g2.append(('cons', 'Cons', 5, '>'))
             if ordc:
                 g2.append(('ord', 'Ord', 3, '>'))
             g3 = [('avg', 'Avg', 6, '>')] + ([('min', 'Min', 6, '>')] if mn else []) \
                 + [('max', 'Max', 6, '>')]
-            mb, sy = ('mbit', 'Mbit/s', 7, '>'), ('sync', 'Sync', 4, '<')
-            groups = [g1, g2, g3] + ([[mb], [sy]] if sep_sync else [[mb, sy]])
+            mb, sy = [('mbit', 'Mbit/s', 7, '>'), ('pps', 'Pkt/s', 7, '>')], ('sync', 'Sync', 4, '<')
+            groups = [g1, g2, g3] + ([mb, [sy]] if sep_sync else [mb + [sy]])
             if extra:
                 groups.append([('sport', 'SPort', 5, '>'), ('dscp', 'DSCP', 6, '>'),
                                ('size', 'Size', 6, '>')])
@@ -3762,6 +4077,7 @@ class LiveView:
             flags += "  [PAUSED]"
         if rx.summary_interval:
             flags += f"  summary {rx.summary_interval}s"
+        flags += _WEB.bar_tag()
         status = (f" mautg v{VERSION}  {where}  sync {rx.sync.mode}  "
                   f"streams {len(streams)}  {format_elapsed(now - rx.start_time)}{flags}")
         warn = rx.health_text(now)
@@ -3782,6 +4098,17 @@ class LiveView:
                _ESC + '[2;1H' + fr + rule + rs + _ESC + '[K',
                _ESC + '[3;1H' + _ESC + '[1m' + head[:width] + _RESET + _ESC + '[K',
                _ESC + '[4;1H' + fr + rule + rs + _ESC + '[K']
+        rates = {}
+        for s in streams:
+            prev = self._prev.get(s.label)
+            mbps = prev[2] if prev else 0.0
+            pps = prev[4] if prev else 0.0
+            if prev is None or dt >= 0.4:
+                if prev and dt > 0:
+                    mbps = (s.total_bytes - prev[0]) * 8 / (dt * 1e6)
+                    pps = (s.total_packets - prev[3]) / dt
+                self._prev[s.label] = (s.total_bytes, now, mbps, s.total_packets, pps)
+            rates[s.label] = (mbps, pps)
         for i in range(n):
             line = ''
             if i < len(streams):
@@ -3789,12 +4116,7 @@ class LiveView:
                     line = f" ... +{len(streams) - n + 1} more streams"
                 else:
                     s = streams[i]
-                    prev = self._prev.get(s.label)
-                    mbps = prev[2] if prev else 0.0
-                    if prev is None or dt >= 0.4:
-                        if prev and dt > 0:
-                            mbps = (s.total_bytes - prev[0]) * 8 / (dt * 1e6)
-                        self._prev[s.label] = (s.total_bytes, now, mbps)
+                    mbps, pps = rates[s.label]
                     sync = self._sync_text(s)
                     dname = dscp_to_name(s.last_dscp) + ('*' if len(s.dscp_stats) > 1 else '')
                     size = s.total_bytes // s.total_packets if s.total_packets else 0
@@ -3803,11 +4125,11 @@ class LiveView:
                         'st': s.label, 'src': s.ip, 'port': s.port, 'cast': s.cast or '--',
                         'pk': _short(s.total_packets, 8),
                         'loss': f"{loss:.2f}" if loss < 100 else "100",
-                        'miss': _short(s.total_missing, 5), 'ord': _short(s.total_misorder, 3),
+                        'miss': _short(s.total_missing, 5), 'cons': _short(s.max_gap, 5), 'ord': _short(s.total_misorder, 3),
                         'avg': self._fmt_dly(s.delay_stats, 'avg'),
                         'min': self._fmt_dly(s.delay_stats, 'min'),
                         'max': self._fmt_dly(s.delay_stats, 'max'),
-                        'mbit': f"{mbps:.2f}", 'sync': sync,
+                        'mbit': f"{mbps:.2f}", 'pps': f"{pps:.0f}", 'sync': sync,
                         'sport': s.sync_port, 'dscp': dname, 'size': f"{size}B"}
                     colors = {
                         'loss': Colors.YELLOW if s.total_missing else Colors.GREEN,
@@ -3818,9 +4140,23 @@ class LiveView:
             elif i == 0 and not streams:
                 line = Colors.GRAY + " waiting for traffic ..." + Colors.ENDC
             out.append(_ESC + f'[{5 + i};1H' + line + _ESC + '[K')
+        if streams:
+            t = _streams_total(streams, rates)
+            dl = lambda v: 'n/a' if v is None else f"{v:.2f}"
+            tv = {'st': '', 'src': f"SUM {t['n']} streams", 'port': '', 'cast': '',
+                  'pk': _short(t['pk'], 8),
+                  'loss': f"{t['loss']:.2f}" if t['loss'] < 100 else "100",
+                  'miss': _short(t['miss'], 5), 'cons': _short(t['cons'], 5),
+                  'ord': _short(t['ord'], 3), 'avg': dl(t['avg']), 'min': dl(t['min']),
+                  'max': dl(t['max']), 'mbit': f"{t['mbit']:.2f}", 'pps': f"{t['pps']:.0f}",
+                  'sync': '', 'sport': '', 'dscp': '', 'size': ''}
+            tline = _ESC + '[1m' + _tbl_row(groups, tv) + _RESET
+        else:
+            tline = ''
         out.append(_ESC + f'[{5 + n};1H' + fr + rule + rs + _ESC + '[K')
-        out.append(_ESC + f'[{6 + n};1H' + _ESC + '[1m' + rx.log_header()[:width] + _RESET + _ESC + '[K')
-        out.append(_ESC + f'[{7 + n};1H' + fr + rule + rs + _ESC + '[K')
+        out.append(_ESC + f'[{6 + n};1H' + tline + _ESC + '[K')
+        out.append(_ESC + f'[{7 + n};1H' + _ESC + '[1m' + rx.log_header()[:width] + _RESET + _ESC + '[K')
+        out.append(_ESC + f'[{8 + n};1H' + fr + rule + rs + _ESC + '[K')
         out.append(_ESC + f'[{rows};1H' + _keybar(self.HELP, width) + _ESC + '[K')
         out.append(_ESC + '8')
         _w(''.join(out))
@@ -4766,19 +5102,114 @@ class StreamEditor(TUI):
                 return r
 
 
+class ReceiverEditor(TUI):
+    """The receiver form, opened from the receiver live view (key e) while the
+    receiver runs. Uses the key reader of the view; 'apply' / 'cancel'."""
+
+    multi_form = False
+
+    def __init__(self, keys, rc, sync_port=0):
+        self.cfg = {'send': {}, 'sync_port': sync_port, 'recv': dict(rc)}
+        self.sync_server = None
+        self.keys = keys
+        self.tab = 0
+        self.tab_names = ('Receiver settings',)
+        self.edit = None
+        self.dialog = None
+        self.popup = None
+        self.msg = ''
+        self.err = False
+        self.dirty = True
+        self.full = True
+        self._size = None
+        self.utf = _utf8_terminal()
+        self._init_virtual()
+        drop = ('[ Start receiver ]', '[ Save settings ]', '', 'Local OWD sync port', 'Live view')
+        page = [f for f in self._receiver_page() if f.label not in drop]
+        page += [_Field('', 'sep'),
+                 _Field('[ Apply and restart receiver ]', 'button', action='apply'),
+                 _Field('[ Cancel ]', 'button', action='cancel')]
+        self.pages = [page]
+        self.sel = [self._first(page)]
+        self.off = [0]
+
+    @property
+    def modified(self):
+        return False
+
+    def n_streams(self):
+        return 1
+
+    def _problem(self):
+        rc = self.cfg['recv']
+        if rc['_sync_mode'] == 'sender IP' and not rc['_ip'].strip():
+            self._select('Sender IP')
+            return 'Sender IP required (or set OWD sync to auto / off)'
+        if rc['_log_mode'] == 'file' and not rc['_log_file'].strip():
+            self._select('Log file name')
+            return 'Log file name required'
+        return ''
+
+    def result(self):
+        """The edited settings (a copy without the form-only keys)."""
+        self._apply_virtual()
+        return {k: v for k, v in self.cfg['recv'].items() if not k.startswith('_')}
+
+    def _help_pairs(self):
+        base = super()._help_pairs()
+        if self.dialog is not None or self.popup is not None or self.edit is not None:
+            return base
+        f = self.pages[0][self.sel[0]]
+        what = {'bool': ('Space', 'Toggle'), 'choice': ('Space', 'Change'),
+                'button': ('Enter', 'Run'),
+                'pick': ('Enter', 'Choose from list')}.get(f.kind, ('Enter', 'Edit'))
+        return (('Up/Down', 'Select'), what, ('Esc/q', 'Cancel'))
+
+    def _on_key(self, k):
+        if self.dialog is not None or self.popup is not None or self.edit is not None:
+            return super()._on_key(k)
+        f = self.pages[0][self.sel[0]]
+        if k in ('esc', 'q'):
+            return 'cancel'
+        if f.kind == 'button' and k in ('enter', ' '):
+            if f.action == 'cancel':
+                return 'cancel'
+            problem = self._problem()
+            if problem:
+                self._say(problem, True)
+                return None
+            return 'apply'
+        return super()._on_key(k)
+
+    def run_embedded(self):
+        while True:
+            if self.dirty or shutil.get_terminal_size((80, 24)) != self._size:
+                self.draw()
+            try:
+                k = self.keys.read(0.2)
+            except EOFError:
+                return 'cancel'
+            if k is None:
+                continue
+            r = self._on_key(k)
+            if r in ('apply', 'cancel'):
+                return r
+
+
 # --- Sender live view ----------------------------------------------------------
 
 class SenderView:
     """Full-screen sender: table of the streams (up to SEND_MAX_STREAMS), start
     / stop / edit / add / delete while they are running."""
 
-    HELP = (('q', 'Quit'), ('Space', 'Toggle'), ('e', 'Edit'), ('n', 'New'),
+    HELP = (('q', 'Quit'), ('r', 'Receiver'), ('Space', 'Toggle'), ('e', 'Edit'), ('n', 'New'),
             ('d', 'Del'), ('s/x', 'All'), ('w', 'Save'))
 
     def __init__(self, streams, sync_server, on_save=None):
         self.streams = streams
         self.sync_server = sync_server
         self.on_save = on_save
+        self.switch = None            # set by DualHost: switch('recv')
         self.keys = _Keys()
         self.sel = 0
         self.off = 0
@@ -4810,6 +5241,8 @@ class SenderView:
                     break
                 if k is not None and self._handle(k):
                     break
+                if _WEB.active and _WEB.tx_poll(self):
+                    self.dirty = True
                 now = time.monotonic()
                 if shutil.get_terminal_size((80, 24)) != self._size:
                     self._layout()
@@ -4849,8 +5282,10 @@ class SenderView:
                       [('dscp', 'DSCP', 7, '<')]]
             if ttl:
                 groups.append([('ttl', 'TTL', 3, '>')])
+                groups.append([('df', 'DF', 3, '<')])
             sm, mb = ('sent', 'Sent', sent, '>'), ('mbit', 'Mbit/s', 6, '>')
-            groups += [[sm, mb]] if merge else [[sm], [mb]]
+            pn = ('ppsn', 'Pps now', 7, '>')
+            groups += [[sm, mb, pn]] if merge else [[sm], [mb], [pn]]
             return groups
         return _tbl_pick([build(True, False, False, True), build(False, False, False, True),
                           build(True, False, False), build(False, False, False),
@@ -4879,7 +5314,7 @@ class SenderView:
                 else "sync off")
         running = sum(1 for st in self.streams if st.running)
         status = (f" mautg v{VERSION}  send  {sync}  streams {n}/{SEND_MAX_STREAMS}"
-                  f" ({running} running)  {format_elapsed(now - self.start_time)}")
+                  f" ({running} running)  {format_elapsed(now - self.start_time)}" + _WEB.bar_tag())
         width = cols            # autowrap is off in this view
         groups = self._columns(width)
         head = _tbl_row(groups)
@@ -4905,8 +5340,8 @@ class SenderView:
                         'port': p['destination_port'], 'size': p['packet_size'],
                         'rate': st.rate_text(),
                         'dscp': f"{p['dscp_value']} {dscp_to_name(p['dscp_value'])}",
-                        'ttl': p['ttl'], 'sent': _short(st.sent, sent_w),
-                        'mbit': f"{st.rate_mbps:.2f}"}
+                        'ttl': p['ttl'], 'df': 'on' if p.get('df_bit') else 'off', 'sent': _short(st.sent, sent_w),
+                        'mbit': f"{st.rate_mbps:.2f}", 'ppsn': f"{st.rate_pps:.0f}"}
                 if idx == self.sel:
                     line = (_sty('sel') + _tbl_row(groups, vals)[:width].ljust(width) + _RESET)
                 else:
@@ -4948,18 +5383,7 @@ class SenderView:
 
     # -- actions -------------------------------------------------------------------
     def _validate(self, params, ignore=None):
-        problem = check_stream_params(params)
-        if problem:
-            return problem
-        for i, st in enumerate(self.streams):
-            if i == ignore:
-                continue
-            q = st.params()
-            if (q['destination_port'] == params['destination_port']
-                    and q['source_address'] == params['source_address']):
-                return (f"Port {params['destination_port']} is already used by stream "
-                        f"{i + 1} - a receiver would merge the two")
-        return ''
+        return _validate_stream(self.streams, params, ignore)
 
     def _new_params(self):
         if self.streams:
@@ -5057,6 +5481,8 @@ class SenderView:
         elif k == 'w':
             if self.on_save:
                 self.say(self.on_save([st.params() for st in self.streams]))
+        elif k in ('r', 'R') and self.switch is not None:
+            self.switch('recv')
         elif k == 'ctrl-l':
             self._layout()
         return False
@@ -5070,22 +5496,15 @@ def run_sender(cfg, sync_server, plist, live=True, autostart=True):
     ok, _why = tui_available()
     cols, rows = shutil.get_terminal_size((80, 24))
     if live and ok and cols >= 80 and rows >= 16:
-        def on_save(pl):
-            store_streams(cfg, pl)
-            save_config(cfg)
-            return f"Saved to {CONFIG_DIR / 'config.json'}"
-        streams = [SendStream(x, sync_server) for x in plist]
-        view = SenderView(streams, sync_server, on_save=on_save)
-        started = time.monotonic()
-        try:
-            view.run(autostart)
-        finally:
-            store_streams(cfg, [st.params() for st in streams])
-        _print_stream_totals(streams, time.monotonic() - started)
+        _CTX.update(cfg=cfg, sync=sync_server)
+        _run_dual('send', plist=plist, autostart=autostart)
         return
     if live and (ok or sys.stdout.isatty()):
         print(f"{Colors.YELLOW}⚠ Sender view needs a terminal of at least 80x16 - "
               f"using the plain output{Colors.ENDC}")
+    if _WEB.active:
+        run_senders_plain(plist, sync_server)       # streams are shown in the browser
+        return
     if len(plist) == 1:
         sc = dict(cfg['send'])
         sc.update(plist[0])
@@ -5095,6 +5514,2208 @@ def run_sender(cfg, sync_server, plist, live=True, autostart=True):
             send_packets(sc, sync_server)
     else:
         run_senders_plain(plist, sync_server)
+
+
+# --- Sender and receiver in one session ---------------------------------------
+# The receiver runs in its own thread, the terminal shows either the receiver
+# view or the sender view (key r / s); streams and receiver keep running in the
+# background of the other view.
+
+_CTX = {'cfg': None, 'sync': None}
+
+
+class _FgGate:
+    """sys.stdout while a DualHost runs: what the receiver thread prints appears
+    only while the receiver view is in front. Once the receiver is stopping,
+    its output (final statistics) is held and printed when the session ends."""
+
+    def __init__(self, real, host):
+        self._real = real
+        self._host = host
+
+    def write(self, s):
+        h = self._host
+        if threading.current_thread() is h.rx_thread and (h.fg != 'recv' or h.rx_stopping):
+            if h.rx_stopping:
+                h.held.append(s)
+            if isinstance(self._real, _LogTee):
+                self._real.write(s, show=False)        # the web log still gets it
+            return len(s)
+        return self._real.write(s)
+
+    def flush(self):
+        self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class DualLive(LiveView):
+    """Receiver view inside a DualHost: draws only while in front, keys come
+    from the host."""
+    HELP = (('q', 'Stop'), ('s', 'Sender'), ('e', 'Edit'), ('p', 'Pause'), ('r', 'Reset'),
+            ('i', 'IP'), ('d', 'Packets/Summary'), ('+/-', 'Interval'))
+
+    def __init__(self, host):
+        LiveView.__init__(self)
+        self.host = host
+        self.keys = host.keys
+
+    def start(self):
+        self.active = True
+
+    def stop(self):
+        self.active = False
+
+    def _front(self):
+        return self.host.fg == 'recv' and hasattr(self, 'n_alloc') and self.rx is not None
+
+    def _layout(self):
+        if self.host.fg == 'recv':
+            LiveView._layout(self)
+
+    def draw(self):
+        if self._front():
+            LiveView.draw(self)
+
+    def tick(self, now):
+        if self.host.rx_stop:
+            raise KeyboardInterrupt
+        if now - self.last_draw >= 0.5:
+            self.draw()
+
+    def _handle(self, key, now):
+        if (key.lower() if len(key) == 1 else key) == 's':
+            self.host.switch('send')
+            return False
+        if (key.lower() if len(key) == 1 else key) == 'e':
+            self.host.edit_receiver()
+            return False
+        return LiveView._handle(self, key, now)
+
+
+class DualHost:
+    def __init__(self, cfg, sync_server, streams, on_save):
+        self.cfg, self.sync_server, self.streams, self.on_save = cfg, sync_server, streams, on_save
+        self.keys = _Keys()
+        self.sv = SenderView(streams, sync_server, on_save=on_save)
+        self.sv.keys = self.keys
+        self.sv.switch = self.switch
+        self.rv = None
+        self.receiver = None
+        self.rx_thread = None
+        self.rx_stop = False
+        self.rx_stopping = False
+        self.fg = 'send'
+        self.held = []
+        self.sender_used = False
+        self.keep_open = False        # the browser stopped the receiver: the session goes on
+        self.rc = {}
+
+    def make_live(self):
+        self.rv = DualLive(self)
+        return _WEB.live_for(self.rv) if _WEB.active else self.rv
+
+    def rx_alive(self):
+        return self.rx_thread is not None and self.rx_thread.is_alive()
+
+    # -- receiver ----------------------------------------------------------------
+    def start_receiver(self, rc):
+        """'' on success, otherwise the problem."""
+        errs = []
+
+        def err(text):
+            errs.append(text)
+
+        def note(text, kind='info'):
+            print(f"{Colors.YELLOW if kind == 'warn' else Colors.CYAN}{text}{Colors.ENDC}")
+
+        if _WEB.active and _WEB.rx_thread is not None and _WEB.rx_thread.is_alive():
+            e = _WEB._stop_rx()           # started in the browser: replace it
+            if e:
+                return e
+        rx = _setup_receiver(dict(rc), self.make_live, err, note)
+        if rx is None:
+            return errs[-1] if errs else 'Receiver could not start'
+        self.receiver, self.rx_stop, self.rx_stopping = rx, False, False
+        _WEB.attach_receiver(rx, rc)
+        self.rc = dict(rc)
+
+        def work():
+            try:
+                rx.receive_loop()
+            except Exception as e:
+                self.held.append(f"Receiver error: {type(e).__name__}: {e}\n")
+            finally:
+                _WEB.detach_receiver(rx)
+        self.rx_thread = threading.Thread(target=work, daemon=True, name='dual-recv')
+        self.rx_thread.start()
+        return ''
+
+    def edit_receiver(self):
+        """Key e in the receiver view: edit the settings, then restart the receiver."""
+        old = dict(self.rc)
+        self.fg = 'edit'
+        try:
+            ed = ReceiverEditor(self.keys, old, self.cfg.get('sync_port', 0))
+            r = ed.run_embedded()
+            new = ed.result() if r == 'apply' else None
+        finally:
+            self.fg = 'recv'
+        if new is not None:
+            self.stop_receiver(wait=True)
+            self.held = []
+            self.receiver = None
+            problem = self.start_receiver(new)
+            if problem:
+                self.start_receiver(old)
+                self.sv.say(problem, True)
+        _w(_ESC + '[2J')
+        self.rv._layout()
+
+    def stop_receiver(self, wait=False):
+        self.rx_stopping = True
+        self.rx_stop = True
+        if wait and self.rx_thread is not None:
+            self.rx_thread.join(6.0)
+
+    # -- views -------------------------------------------------------------------
+    def switch(self, to):
+        if to == self.fg:
+            return
+        if to == 'recv':
+            if not self.rx_alive():
+                problem = self.start_receiver(self.cfg['recv'])
+                if problem:
+                    self.sv.say(problem, True)
+                    return
+            self.fg = 'recv'
+            _w(_ESC + '[2J')
+            self.rv._layout()
+        else:
+            self.fg = 'send'
+            self.sender_used = True
+            _w(_ESC + '[r')
+            self.sv._layout()
+
+    def _running_streams(self):
+        return any(st.running for st in self.streams)
+
+    def run(self, first, rc=None, autostart=True):
+        """'' when the session ran, otherwise the problem that stopped it."""
+        problem = ''
+        gate = _FgGate(sys.stdout, self)
+        sys.stdout = gate
+        _WEB.attach_streams(self.streams, self.sync_server, self.on_save, self.sv)
+        _WEB.dual = self
+        self.keys.start()
+        try:
+            if first == 'send':
+                if autostart:
+                    for st in self.streams:
+                        st.start()
+                self.fg = 'send'
+                self.sender_used = True
+                self.sv._layout()
+            else:
+                problem = self.start_receiver(rc)
+                if problem:
+                    return problem
+                self.fg = 'recv'
+                self.rv._layout()
+            while True:
+                try:
+                    k = self.keys.read(0.1)
+                except EOFError:
+                    break
+                now = time.monotonic()
+                if k is not None:
+                    if self.fg == 'recv':
+                        if self.rv._handle(k, now):
+                            self.stop_receiver()
+                    elif self.sv._handle(k):
+                        break
+                if _WEB.active and _WEB.tx_poll(self.sv):
+                    self.sv.dirty = True
+                if self.receiver is not None and not self.rx_alive():
+                    self.receiver = None
+                    if self.fg == 'recv':
+                        if self._running_streams() or self.keep_open:
+                            self.keep_open = False
+                            self.switch('send')
+                        else:
+                            break
+                    else:
+                        self.sv.say('Receiver stopped')
+                size = shutil.get_terminal_size((80, 24))
+                if self.fg == 'send':
+                    if size != self.sv._size:
+                        self.sv._layout()
+                    elif self.sv.dirty or now - self.sv.last_draw >= 0.25:
+                        self.sv.draw()
+                elif self.rv is not None and size != self.rv._size:
+                    self.rv._layout()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            for st in self.streams:
+                st.stop(wait=False)
+            for st in self.streams:
+                st.stop()
+            if self.rx_alive():
+                self.stop_receiver(wait=True)
+            try:
+                rows = shutil.get_terminal_size((80, 24))[1]
+                _w(_RESET + _ESC + '[?25h' + _ESC + '[?7h' + _ESC + '[r' + _ESC + f'[{rows};1H'
+                   + _ESC + '[K\n')
+            except (OSError, ValueError):
+                pass
+            self.keys.stop()
+            if sys.stdout is gate:
+                sys.stdout = gate._real
+            _WEB.detach_streams()
+            _WEB.dual = None
+            if self.held:
+                sys.stdout.write(''.join(self.held))
+                sys.stdout.flush()
+        return problem
+
+
+def _run_dual(first, rc=None, plist=None, autostart=True):
+    """Terminal session with sender and receiver views. '' or the start problem."""
+    cfg, sync_server = _CTX['cfg'], _CTX['sync']
+    plist = streams_from_config(cfg) if plist is None else plist
+
+    def on_save(pl):
+        store_streams(cfg, pl)
+        save_config(cfg)
+        return f"Saved to {CONFIG_DIR / 'config.json'}"
+
+    streams = [SendStream(x, sync_server) for x in plist][:SEND_MAX_STREAMS]
+    host = DualHost(cfg, sync_server, streams, on_save)
+    started = time.monotonic()
+    problem = host.run(first, rc, autostart)
+    if host.sender_used:
+        store_streams(cfg, [st.params() for st in streams])
+        _print_stream_totals(streams, time.monotonic() - started)
+    return problem
+
+
+# --- Web GUI ------------------------------------------------------------------
+# -web: browser instead of terminal.  -wv / -wvc: the normal terminal run plus a
+# read-only (-wv) or controlling (-wvc) web view of the same run.  Commands from
+# the browser are queued and executed by the thread that owns the receiver / the
+# streams, so no state is changed from the HTTP threads.
+
+_DRAW_RE = re.compile('\x1b\\[\\d*(?:;\\d*)?[Hf]|\x1b\\[2J|\x1b[78]')
+_CSI_RE = re.compile('\x1b\\[[0-9;?]*[@-ln-~]')     # every CSI except SGR (colors)
+
+
+class _LogTee:
+    """sys.stdout while the web GUI is active: complete lines go to the web log
+    (colors kept, screen drawing dropped); passthrough keeps the terminal output."""
+
+    def __init__(self, real, hub, passthrough):
+        self._real = real
+        self._hub = hub
+        self._pass = passthrough
+        self._buf = ''
+        self._lock = threading.Lock()
+
+    def write(self, s, show=True):
+        if self._pass and show and threading.current_thread().name != 'web-recv':
+            self._real.write(s)       # (the web-started receiver is not for the terminal)
+        if not isinstance(s, str) or _DRAW_RE.search(s):
+            return len(s)
+        with self._lock:
+            self._buf += s
+            if '\n' not in self._buf and len(self._buf) < 8192:
+                return len(s)
+            *lines, self._buf = self._buf.split('\n')
+        for line in lines:
+            self._hub.add_log(_CSI_RE.sub('', line.rsplit('\r', 1)[-1]))
+        return len(s)
+
+    def flush(self):
+        if self._pass:
+            self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class WebLive(LiveView):
+    """Receiver hook of the web GUI. Stands in for the terminal live view (or
+    wraps it with -wv / -wvc): called by the receive loop for every packet and
+    idle tick, forwards to the terminal view and runs the browser commands."""
+
+    def __init__(self, term=None):
+        self.term = term
+        self.active = False
+        self.keys = term.keys if term else None
+        self.last_poll = 0.0
+        self.last_draw = 0.0
+        self._prev = term._prev if term else {}
+        self._h = 0.0
+        self._own_rx = None
+
+    @property
+    def rx(self):
+        return self.term.rx if self.term else self._own_rx
+
+    @rx.setter
+    def rx(self, value):
+        self._own_rx = value
+        if self.term:
+            self.term.rx = value
+
+    @property
+    def paused(self):
+        return self.term.paused if self.term else False
+
+    @paused.setter
+    def paused(self, value):
+        if self.term:
+            self.term.paused = value
+
+    @property
+    def _size(self):
+        return self.term._size if self.term else (200, 24)
+
+    def start(self):
+        if self.term:
+            self.term.start()
+        self.active = True
+
+    def stop(self):
+        if self.term:
+            self.term.stop()
+        self.active = False
+
+    def tick(self, now):
+        if self.term:
+            self.term.tick(now)             # may raise KeyboardInterrupt ('q')
+        elif now - self._h >= 1.0:
+            self._h = now
+            self.rx.health(now)             # overload bookkeeping (the terminal view does it in draw)
+        if now - self.last_poll >= 0.1:
+            self.last_poll = now
+            _WEB.rx_poll(self, now)
+
+
+class _WebServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    hub = None
+
+
+class _WebHandler(http.server.BaseHTTPRequestHandler):
+    server_version = 'mautg'
+    timeout = 15
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body, ctype, headers=None):
+        if isinstance(body, str):
+            body = body.encode('utf-8')
+        gz = False
+        if (len(body) > 512 and 'gzip' in self.headers.get('Accept-Encoding', '')
+                and ctype.split(';')[0] in ('text/html', 'application/json')):
+            body, gz = gzip.compress(body, 5), True
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            if gz:
+                self.send_header('Content-Encoding', 'gzip')
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+        except (OSError, ValueError):
+            pass
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj, default=str), 'application/json; charset=utf-8')
+
+    def do_GET(self):
+        hub = self.server.hub
+        url = urllib.parse.urlsplit(self.path)
+        if url.path in ('/', '/index.html'):
+            self._send(200, WEB_INDEX_HTML, 'text/html; charset=utf-8')
+        elif url.path == '/api/status':
+            try:
+                ls = int(urllib.parse.parse_qs(url.query).get('ls', ['0'])[0])
+            except ValueError:
+                ls = 0
+            self._json(200, hub.status(ls))
+        elif url.path == '/api/download/log':
+            hub.send_csv(self)
+        elif url.path == '/api/download/config':
+            hub.send_config(self)
+        elif url.path == '/api/files':
+            self._json(200, {'files': hub.list_files()})
+        elif url.path == '/api/download/files':
+            q = urllib.parse.parse_qs(url.query)
+            hub.send_files(self, q.get('name') or [], bool(q.get('nozip')))
+        else:
+            self._send(404, 'not found', 'text/plain; charset=utf-8')
+
+    def _body(self, limit):
+        try:
+            n = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            return None
+        if not 0 <= n <= limit:
+            return None
+        return self.rfile.read(n)
+
+    def do_POST(self):
+        hub = self.server.hub
+        url = urllib.parse.urlsplit(self.path)
+        if url.path not in ('/api/command', '/api/upload_file', '/api/delete_files',
+                            '/api/upload_config', '/api/load_config'):
+            self._send(404, 'not found', 'text/plain; charset=utf-8')
+            return
+        if self.headers.get('X-Requested-With') != 'mautg':
+            self._json(403, {'ok': False, 'error': 'forbidden'})
+            return
+        if not hub.control:
+            self._json(403, {'ok': False, 'error': 'read only'})
+            return
+        if url.path == '/api/upload_file':
+            name = (urllib.parse.parse_qs(url.query).get('name') or [''])[0]
+            raw = self._body(UPLOAD_MAX)
+            if raw is None:
+                self._json(413, {'ok': False, 'error': 'file too large (max 16 MB)'})
+            else:
+                self._json(200, hub.save_upload(name, raw))
+            return
+        raw = self._body(UPLOAD_MAX if url.path == '/api/upload_config' else 65536)
+        if raw is None:
+            self._json(400, {'ok': False, 'error': 'bad request'})
+            return
+        try:
+            req = json.loads(raw.decode('utf-8') or '{}')
+            if not isinstance(req, dict):
+                raise ValueError
+        except ValueError:
+            self._json(400, {'ok': False, 'error': 'not valid JSON'})
+            return
+        if url.path == '/api/delete_files':
+            self._json(200, hub.delete_files(req.get('names')))
+        elif url.path == '/api/upload_config':
+            run = (urllib.parse.parse_qs(url.query).get('run') or [''])[0] == '1'
+            self._json(200, hub.command('cfg_apply', '', {'config': req, 'run': run}, wait=40.0))
+        elif url.path == '/api/load_config':
+            self._json(200, hub.load_config_file(req.get('name'), bool(req.get('run'))))
+        else:
+            data = req.get('data')
+            self._json(200, hub.command(str(req.get('cmd', '')), req.get('value', ''),
+                                        data if isinstance(data, dict) else {}))
+
+
+FILE_EXTS = ('.csv', '.txt', '.html', '.json')
+UPLOAD_MAX = 16 * 1024 * 1024
+
+
+def _safe_name(name, exts=FILE_EXTS):
+    """A plain file name of the working directory with one of the extensions."""
+    return (isinstance(name, str) and name == os.path.basename(name)
+            and name not in ('', '.', '..') and not name.startswith('.')
+            and '\\' not in name and '\x00' not in name and name.lower().endswith(exts))
+
+
+def _num(v, kind, name, lo=None, hi=None):
+    """Number from a form value; ValueError with the problem."""
+    try:
+        x = float(v)
+        if x != x or x in (float('inf'), float('-inf')):
+            raise ValueError
+        x = int(x) if kind is int else x
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name}: number expected")
+    if (lo is not None and x < lo) or (hi is not None and x > hi):
+        raise ValueError(f"{name}: must be {lo} - {hi}")
+    return x
+
+
+class _WebHub:
+    LOG_MAX = 3000
+
+    def __init__(self):
+        self.active = False
+        self.control = False
+        self.headless = False
+        self.exit_requested = False
+        self.dual = None           # running DualHost (terminal session with both views)
+        self.owns = False          # the hub itself owns the streams (-web, or side-car beside the menu)
+        self.own = None
+        self.port = 0
+        self.cfg = None
+        self.sync_server = None
+        self.server = None
+        self.tee = None
+        self._stdout = None
+        self.lock = threading.RLock()
+        self.cmds = []
+        self.log = deque(maxlen=self.LOG_MAX)
+        self.seq = 0
+        self.rx = None
+        self.rc = {}
+        self.live = None
+        self.rx_thread = None
+        self.rx_stop_req = False
+        self._rx_last = None
+        self._prev = {}
+        self.streams = None
+        self.on_save = None
+        self.view = None
+        self.message = ('', False, 0.0)
+        self.stopped = False
+        self.exit_ev = threading.Event()
+        self.last_poll = 0.0
+        self._ifaces = ([], 0.0)
+
+    # -- start / stop ------------------------------------------------------------
+    def start(self, cfg, sync_server, bind, port, control, headless=False, side=False):
+        self.cfg, self.sync_server = cfg, sync_server
+        self.control, self.headless, self.port = control, headless, port
+        self.side = side
+        self.owns = headless or (side and control)
+        try:
+            srv = _WebServer((bind, port), _WebHandler)
+        except (OSError, OverflowError) as e:
+            print(f"{Colors.RED}✗ Web server cannot listen on {bind}:{port}: {e}{Colors.ENDC}")
+            sys.exit(2)
+        srv.hub = self
+        self.server = srv
+        threading.Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.3},
+                         daemon=True, name='web').start()
+        if bind in ('0.0.0.0', ''):
+            hosts = [ip for ip, _n in local_ipv4_addresses() if not ip.startswith('127.')] or ['127.0.0.1']
+        else:
+            hosts = [bind]
+        kind = ('Web GUI' if headless else 'Web view (read only)' if not control
+                else 'Web view + control')
+        print(f"{Colors.GREEN}{kind}: " + '   '.join(f"http://{h}:{port}/" for h in hosts)
+              + f"{Colors.ENDC}")
+        if control:
+            print(f"{Colors.YELLOW}No authentication - anyone who can reach the port can "
+                  f"control mautg (-bind 127.0.0.1 limits it to this host){Colors.ENDC}")
+        if headless:
+            print(f"{Colors.GREEN}CTRL+C to stop{Colors.ENDC}\n")
+        self._stdout = sys.stdout
+        self.tee = _LogTee(sys.stdout, self, passthrough=not headless)
+        sys.stdout = self.tee
+        self.active = True
+        if side and control:
+            def on_save(pl):
+                store_streams(cfg, pl)
+                save_config(cfg)
+                return f"Saved to {CONFIG_DIR / 'config.json'}"
+            ss = [SendStream(p, sync_server) for p in streams_from_config(cfg)][:SEND_MAX_STREAMS]
+            self.own = (ss, on_save)
+            self.streams, self.on_save = ss, on_save
+            threading.Thread(target=self._side_loop, daemon=True, name='web-ctl').start()
+
+    def _side_loop(self):
+        while self.active:
+            time.sleep(0.1)
+            if self.cmds:
+                for c in self._take(('rxc',)):
+                    self._run(c, self._rxc_cmd)
+                if self.view is None:
+                    self.tx_poll(None)
+
+    def shutdown(self):
+        if not self.active:
+            return
+        if self.side and self.own:
+            self.active = False
+            self._stop_rx()
+            for st in self.own[0]:
+                st.stop(wait=False)
+            for st in self.own[0]:
+                st.stop()
+            self.active = True
+        self.stopped = True
+        if time.time() - self.last_poll < 5.0:
+            time.sleep(1.3)                 # let open pages see "stopped"
+        self.active = False
+        if sys.stdout is self.tee:
+            sys.stdout = self._stdout
+        try:
+            self.server.shutdown()
+            self.server.server_close()
+        except OSError:
+            pass
+
+    def bar_tag(self):
+        """Marker for the terminal status bars."""
+        if not self.active or self.headless:
+            return ''
+        return f"  web :{self.port}" + ('' if self.control else ' ro')
+
+    # -- log ---------------------------------------------------------------------
+    def add_log(self, line):
+        with self.lock:
+            self.seq += 1
+            self.log.append((self.seq, line))
+
+    def say(self, text, err=False):
+        self.message = (text, err, time.time())
+        if self.view is not None:
+            self.view.say(text, err)
+
+    # -- attach / detach (called by the run functions) -----------------------------
+    def live_for(self, term):
+        self.live = WebLive(term)
+        return self.live
+
+    def attach_receiver(self, receiver, rc):
+        if not self.active:
+            return
+        self.rx, self.rc = receiver, dict(rc)
+        self._rx_last = None
+        self._prev.clear()
+
+    def detach_receiver(self, receiver):
+        if not self.active or self.rx is not receiver:
+            return
+        try:
+            self._rx_last = self._rx_status(receiver, False)
+        except Exception:
+            self._rx_last = None
+        self.rx = None
+        self.live = None
+        self._flush(('rx',), 'receiver stopped')
+
+    def attach_streams(self, streams, sync_server, on_save, view):
+        if not self.active:
+            return
+        self.streams, self.on_save, self.view = streams, on_save, view
+        if sync_server is not None:
+            self.sync_server = sync_server
+
+    def detach_streams(self):
+        if not self.active:
+            return
+        self._flush(('tx',), 'sender stopped')
+        self.streams, self.on_save, self.view = None, None, None
+        if self.own:
+            self.streams, self.on_save = self.own
+
+    @property
+    def controllable(self):
+        return bool(self.control and self.streams is not None
+                    and (self.view is not None or self.owns))
+
+    # -- command queue -------------------------------------------------------------
+    def command(self, cmd, value, data, wait=5.0):
+        """Called from an HTTP thread: queue the command, wait for the owner."""
+        if not self.control:
+            return {'ok': False, 'error': 'read only'}
+        if cmd == 'cfg_save':
+            try:
+                return self._cfg_save(value)
+            except (ValueError, OSError) as e:
+                return {'ok': False, 'error': str(e)}
+        if cmd == 'exit':
+            if self.headless:
+                self.exit_ev.set()
+            elif self.side and hasattr(signal, 'SIGTERM') and sys.platform != 'win32':
+                self.exit_requested = True          # ends the menu too: unwind like SIGTERM
+                os.kill(os.getpid(), signal.SIGTERM)
+            elif self.side or self.rx is not None or self.streams is not None:
+                _thread.interrupt_main()
+            else:
+                return {'ok': False, 'error': 'nothing is running in the terminal'}
+            return {'ok': True}
+        if cmd in ('rx_start', 'rx_save', 'cfg_apply'):
+            if not self.owns:
+                return {'ok': False, 'error': 'the receiver is controlled from the terminal'}
+            kind = 'rxc'
+        elif cmd in ('rx_stop', 'rx_reset', 'rx_show_ip', 'rx_view', 'rx_interval', 'rx_log_start', 'rx_log_stop'):
+            if self.rx is None:
+                return {'ok': False, 'error': 'receiver not running'}
+            kind = 'rx'
+        elif cmd in ('tx_add', 'tx_set', 'tx_start', 'tx_stop', 'tx_del'):
+            if not self.controllable:
+                return {'ok': False, 'error': 'the sender cannot be controlled from the browser'}
+            kind = 'tx'
+        else:
+            return {'ok': False, 'error': 'unknown command'}
+        c = {'cmd': cmd, 'value': value, 'data': data, 'kind': kind,
+             'ev': threading.Event(), 'res': None, 'cancel': False}
+        with self.lock:
+            self.cmds.append(c)
+        if not c['ev'].wait(wait):
+            with self.lock:
+                if c['res'] is None:
+                    c['cancel'] = True
+                    return {'ok': False, 'error': 'timeout - the terminal is busy'}
+        return c['res']
+
+    def _take(self, kinds):
+        if not self.cmds:
+            return []
+        with self.lock:
+            out = [c for c in self.cmds if c['kind'] in kinds and not c['cancel']]
+            gone = set(id(c) for c in out)
+            self.cmds = [c for c in self.cmds if id(c) not in gone and not c['cancel']]
+        return out
+
+    def _flush(self, kinds, error):
+        for c in self._take(kinds):
+            self._finish(c, error)
+
+    @staticmethod
+    def _finish(c, error=''):
+        c['res'] = {'ok': not error, 'error': error}
+        c['ev'].set()
+
+    def _run(self, c, fn):
+        try:
+            err = fn(c) or ''
+        except (ValueError, OSError) as e:
+            err = str(e)
+        except Exception as e:                   # never kill the owning thread
+            err = f"{type(e).__name__}: {e}"
+        self._finish(c, err)
+
+    # -- receiver commands (receiver thread) -------------------------------------------
+    def rx_poll(self, live, now):
+        if self.rx_stop_req:
+            raise KeyboardInterrupt
+        if not self.cmds:
+            return
+        for c in self._take(('rx',)):
+            if c['cmd'] == 'rx_stop':
+                if self.dual is not None:
+                    self.dual.keep_open = True
+                self.say('Receiver stopped')
+                self._finish(c)
+                raise KeyboardInterrupt
+            self._run(c, lambda cc: self._rx_cmd(cc, live, now))
+            if live.term is not None:
+                try:
+                    live.term.draw()
+                except (OSError, ValueError):
+                    pass
+
+    def _rx_cmd(self, c, live, now):
+        rx, cmd, v = self.rx, c['cmd'], c['value']
+        if rx is None:
+            return 'receiver not running'
+        if cmd == 'rx_reset':
+            rx.reset()
+            live._prev.clear()
+            self._prev.clear()
+            if live.term is not None:
+                live.term._layout()
+            self.say('Statistics reset')
+        elif cmd == 'rx_show_ip':
+            rx.show_ip = not rx.show_ip
+        elif cmd == 'rx_log_start':
+            name = str(c['data'].get('name', '')).strip() or default_log_name()
+            path = Path.cwd() / name
+            try:
+                rx.start_csv(path)
+            except OSError as e:
+                return f"cannot write {path}: {e}"
+            self.say(f"CSV log: {path}")
+        elif cmd == 'rx_log_stop':
+            rx.stop_csv()
+            self.say('CSV log stopped')
+        elif cmd == 'rx_view':
+            if v == 'summary':
+                if not rx.summary_interval:
+                    rx.summary_interval = rx.summary_last
+                    rx.reset_interval(now)
+            elif v == 'packets':
+                if rx.summary_interval:
+                    rx.summary_last = rx.summary_interval
+                    rx.summary_interval = None
+                    rx.reset_interval(now)
+            else:
+                return 'bad view'
+        elif cmd == 'rx_interval':
+            iv = _num(v, int, 'interval')
+            if iv not in LiveView.INTERVALS:
+                return 'interval must be one of ' + ', '.join(str(x) for x in LiveView.INTERVALS)
+            rx.summary_interval = rx.summary_last = iv
+            rx.reset_interval(now)
+        return ''
+
+    # -- controller (web mode: the main thread) ------------------------------------------
+    def run_headless(self):
+        while not self.exit_ev.is_set():
+            time.sleep(0.1)
+            if self.cmds:
+                for c in self._take(('rxc',)):
+                    self._run(c, self._rxc_cmd)
+                self.tx_poll(None)
+
+    def _rc_from_form(self, d):
+        rc = dict(self.cfg['recv'])
+        rc['unicast'] = bool(d.get('unicast'))
+        rc['group'] = str(d.get('group', '')).strip()
+        rc['interface'] = str(d.get('interface') or 'all').strip()
+        rc['port'] = str(d.get('port', '')).strip()
+        mode = d.get('sync_mode', 'auto')
+        ip = str(d.get('sender_ip', '')).strip()
+        if mode == 'off':
+            rc['sender_ip'] = 'none'
+        elif mode == 'ip':
+            if not ip:
+                raise ValueError('Sender IP required')
+            rc['sender_ip'] = ip
+        else:
+            rc['sender_ip'] = ''
+        rc['sender_sync_port'] = _num(d.get('sender_sync_port') or 0, int, 'Sender sync port', 0, 65535)
+        rc['resync_interval'] = _num(d.get('resync_interval') or OWD_RESYNC_INTERVAL, float,
+                                     'Resync interval', 0.5, 3600)
+        rc['summary'] = _num(d.get('summary') or 0, float, 'Summary interval', 0, 3600)
+        if rc['summary'] == int(rc['summary']):
+            rc['summary'] = int(rc['summary'])
+        rc['compact'] = bool(d.get('compact'))
+        rc['show_ip'] = bool(d.get('show_ip'))
+        rc['verify'] = bool(d.get('verify'))
+        rc['print_limit'] = _num(d.get('print_limit') or 0, int, 'Per-packet lines per second', 0)
+        lm = d.get('log_mode', 'off')
+        name = str(d.get('log_name', '')).strip()
+        if lm == 'file' and not name:
+            raise ValueError('Log file name required')
+        rc['log'] = 'auto' if lm == 'auto' else name if lm == 'file' else ''
+        try:
+            parse_ports(rc['port'])
+        except ValueError as e:
+            raise ValueError(f"Data port(s): {e}")
+        if not rc['unicast']:
+            try:
+                parse_groups(rc['group'])
+            except ValueError as e:
+                raise ValueError(f"Multicast group(s): {e}")
+            try:
+                resolve_mcast_interfaces(rc['interface'])
+            except ValueError as e:
+                raise ValueError(f"Multicast interface: {e}")
+        return rc
+
+    def _rxc_cmd(self, c):
+        if c['cmd'] == 'cfg_apply':
+            return self._cfg_apply(c['data'].get('config'), bool(c['data'].get('run')))
+        rc = self._rc_from_form(c['data'])
+        if c['cmd'] == 'rx_save':
+            self.cfg['recv'].update(rc)
+            save_config(self.cfg)
+            self.say('Receiver settings saved')
+            return ''
+        return self._restart_rx(rc)
+
+    def _stop_any_rx(self):
+        """Stop the receiver wherever it runs; '' or the problem."""
+        if self.rx is not None and not (self.rx_thread is not None and self.rx_thread.is_alive()):
+            # running in the terminal: stop it from here (its own thread ends it)
+            c2 = {'cmd': 'rx_stop', 'value': '', 'data': {}, 'kind': 'rx',
+                  'ev': threading.Event(), 'res': None, 'cancel': False}
+            with self.lock:
+                self.cmds.append(c2)
+            c2['ev'].wait(5.0)
+            end = time.time() + 6.0
+            while self.rx is not None and time.time() < end:
+                time.sleep(0.05)
+            if self.rx is not None:
+                return 'the receiver in the terminal does not stop'
+        return self._stop_rx()
+
+    def _restart_rx(self, rc):
+        err = self._stop_any_rx()
+        return err or self._start_rx(rc)
+
+    def _start_rx(self, rc):
+        self.rx_stop_req = False
+        rc = dict(rc)
+
+        def work():
+            try:
+                run_receiver(rc, live=False)
+            except Exception as e:
+                print(f"{Colors.RED}✗ Receiver: {type(e).__name__}: {e}{Colors.ENDC}")
+        t = threading.Thread(target=work, daemon=True, name='web-recv')
+        self.rx_thread = t
+        t.start()
+        end = time.time() + 3.0
+        while time.time() < end and t.is_alive() and self.rx is None:
+            time.sleep(0.05)
+        if self.rx is None and not t.is_alive():
+            return 'Receiver could not start - see the log'
+        self.say('Receiver started')
+        return ''
+
+    def _stop_rx(self):
+        t = self.rx_thread
+        if t is not None and t.is_alive():
+            self.rx_stop_req = True
+            t.join(6.0)
+            if t.is_alive():
+                return 'receiver does not stop'
+        self.rx_thread = None
+        return ''
+
+    # -- sender commands (SenderView loop / controller) ---------------------------------------
+    def tx_poll(self, view):
+        """True if a command was executed (the view redraws)."""
+        if not self.cmds or (view is None and not self.owns):
+            return False
+        cs = self._take(('tx',))
+        for c in cs:
+            self._run(c, self._tx_cmd)
+        return bool(cs)
+
+    @staticmethod
+    def _coerce_stream(d):
+        ints = ('destination_port', 'packet_size', 'dscp_value', 'ttl', 'source_port')
+        floats = ('packets_per_second', 'burst_mbps')
+        bools = ('df_bit', 'burst_mode')
+        q = {}
+        for k in _STREAM_KEYS:
+            if k not in d:
+                continue
+            val = d[k]
+            if k in ints or k in floats:
+                if val in ('', None):
+                    continue
+                q[k] = _num(val, int if k in ints else float, k.replace('_', ' '))
+            elif k in bools:
+                q[k] = bool(val)
+            else:
+                q[k] = '' if val is None else str(val).strip()
+        return _stream_params(q)
+
+    def _index(self, v):
+        try:
+            i = int(v)
+        except (TypeError, ValueError):
+            raise ValueError('bad stream number')
+        if not 0 <= i < len(self.streams):
+            raise ValueError('no such stream')
+        return i
+
+    def _tx_cmd(self, c):
+        cmd, v, ss, view = c['cmd'], c['value'], self.streams, self.view
+        if ss is None:
+            return 'no sender'
+        if cmd == 'tx_add':
+            if len(ss) >= SEND_MAX_STREAMS:
+                return f"Maximum of {SEND_MAX_STREAMS} streams"
+            p = self._coerce_stream(c['data'])
+            err = _validate_stream(ss, p)
+            if err:
+                return err
+            st = SendStream(p, self.sync_server)
+            ss.append(st)
+            st.start()
+            if view is not None:
+                view.sel = len(ss) - 1
+            self.say(f"Stream {len(ss)} added and started")
+        elif cmd == 'tx_set':
+            i = self._index(v)
+            p = self._coerce_stream(c['data'])
+            err = _validate_stream(ss, p, ignore=i)
+            if err:
+                return err
+            ss[i].apply(p)
+            self.say(f"Stream {i + 1} updated")
+        elif cmd in ('tx_start', 'tx_stop'):
+            start = cmd == 'tx_start'
+            if v == 'all':
+                for st in ss:
+                    st.start() if start else st.stop(wait=False)
+                if not start:
+                    for st in ss:
+                        st.stop()
+                self.say('All streams ' + ('started' if start else 'stopped'))
+            else:
+                i = self._index(v)
+                ss[i].start() if start else ss[i].stop()
+                self.say(f"Stream {i + 1} " + ('started' if start else 'stopped'))
+        elif cmd == 'tx_del':
+            i = self._index(v)
+            ss[i].stop()
+            del ss[i]
+            if view is not None:
+                view.sel = max(0, min(view.sel, len(ss) - 1))
+            self.say(f"Stream {i + 1} deleted")
+        elif cmd == 'tx_save':
+            plist = [st.params() for st in ss]
+            if self.on_save:
+                self.say(self.on_save(plist))
+            else:
+                store_streams(self.cfg, plist)
+                save_config(self.cfg)
+                self.say(f"Saved to {CONFIG_DIR / 'config.json'}")
+        return ''
+
+    # -- status (HTTP threads, read only) -----------------------------------------------------
+    def _local_ifaces(self):
+        lst, at = self._ifaces
+        if not lst or time.time() - at > 30:
+            try:
+                lst = [[ip, name] for ip, name in local_ipv4_addresses()]
+            except Exception:
+                lst = []
+            self._ifaces = (lst, time.time())
+        return lst
+
+    def _rx_status(self, rx, running):
+        now = time.monotonic()
+        rows = []
+        tot_pk = 0
+        tot_mbit = 0.0
+        rates = {}
+        allst = list(rx.streams.values())
+        for s in allst:
+            prev = self._prev.get(s.label)
+            mbit = prev[2] if prev else 0.0
+            pps = prev[4] if prev else 0.0
+            if running:
+                dt = now - prev[1] if prev else 0.0
+                if prev is None or dt >= 0.4:
+                    if prev and dt > 0:
+                        mbit = max(0.0, (s.total_bytes - prev[0]) * 8 / (dt * 1e6))
+                        pps = max(0.0, (s.total_packets - prev[3]) / dt)
+                    self._prev[s.label] = (s.total_bytes, now, mbit, s.total_packets, pps)
+            else:
+                mbit = 0.0
+                pps = 0.0
+            ds = s.delay_stats
+            have = ds.count > 0
+            tot_pk += s.total_packets
+            tot_mbit += mbit
+            rates[s.label] = (mbit, pps)
+            rows.append({
+                'st': s.label, 'src': s.ip, 'port': s.port, 'cast': s.cast or '--',
+                'pk': s.total_packets, 'loss': round(s.loss_pct(), 3), 'miss': s.total_missing, 'cons': s.max_gap,
+                'ord': s.total_misorder,
+                'avg': round(ds.avg, 3) if have else None,
+                'min': round(ds.minimum, 3) if have else None,
+                'max': round(ds.maximum, 3) if have else None,
+                'mbit': round(mbit, 3), 'pps': round(pps),
+                'dscp': dscp_to_name(s.last_dscp) + ('*' if len(s.dscp_stats) > 1 else ''),
+                'size': s.total_bytes // s.total_packets if s.total_packets else 0,
+                'sport': s.sync_port, 'sync': self.live._sync_text(s) if self.live else '-'})
+        where = (f"unicast {format_ports(rx.ports)}" if rx.unicast_mode
+                 else f"{rx.group or 'any'}:{format_ports(rx.ports)}")
+        health = ''
+        if running:
+            parts = []
+            if now - rx._kd_at < 10.0 and rx._kd_recent:
+                parts.append(f"RX OVERLOAD: {rx.kdrops_total_seen} DROPPED LOCALLY")
+            elif now - rx.last_empty > 1.0:
+                parts.append("RX AT LIMIT")
+            if rx.skipped_lines and now - rx._skip_at < 2.0:
+                parts.append(f"DISPLAY LIMITED {rx.print_limit}/S")
+            health = '!! ' + ' | '.join(parts) if parts else ''
+        return {
+            'running': running, 'rc': self.rc, 'rows': rows,
+            'total': (lambda t: {k: (round(v, 3) if isinstance(v, float) else v) for k, v in t.items()})(
+                _streams_total(allst, rates)) if allst else None,
+            'port_col': rx.port_col,
+            'elapsed': format_elapsed(now - rx.start_time), 'packets': tot_pk,
+            'mbit': round(tot_mbit, 3), 'sync_mode': rx.sync.mode,
+            'summary': rx.summary_interval or 0,
+            'logfile': str(rx.log_file) if rx.log_file else '',
+            'health': health, 'header': rx.log_header(), 'show_ip': rx.show_ip,
+            'where': where, 'join': (rx.mc_desc if (not rx.unicast_mode and rx.groups) else ''),
+            'rcvbuf_kb': rx.rcvbuf // 1024, 'ignored': rx._ignored_text()}
+
+    def _tx_status(self, now):
+        sync = self.sync_server
+        out = {'max': SEND_MAX_STREAMS, 'streams': [],
+               'sync_active': bool(sync and sync.active), 'sync_port': sync.port if sync else 0,
+               'controllable': self.controllable, 'attached': self.streams is not None}
+        for st in list(self.streams or []):
+            st.sample(now)
+            p = st.params()
+            out['streams'].append({
+                'state': st.state_text(), 'params': p, 'rate': st.rate_text(),
+                'dscp': dscp_to_name(p['dscp_value']), 'sent': st.sent,
+                'mbps': round(st.rate_mbps, 3), 'pps': round(st.rate_pps, 1),
+                'error': st.error, 'seq': st.seq})
+        return out
+
+    def status(self, ls):
+        self.last_poll = time.time()
+        now = time.monotonic()
+        rx = self.rx
+        try:
+            if rx is not None:
+                rxs = self._rx_status(rx, True)
+            else:
+                rxs = self._rx_last or {'running': False}
+                rxs['rc'] = self.rc
+        except Exception as e:                   # a half-built receiver / stream list
+            rxs = {'running': rx is not None, 'rows': [], 'error': str(e)}
+        with self.lock:
+            seq = self.seq
+            lines = [l for n, l in self.log if n > ls] if ls <= seq else [l for _n, l in self.log]
+        text, err, at = self.message
+        send_defaults = _stream_params(self.cfg['send'])
+        return {
+            'version': VERSION,
+            'datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'readonly': not self.control,
+            'mode': 'web' if self.headless else ('control' if self.control else 'view'),
+            'can_start': self.owns,
+            'default_log': default_log_name(),
+            'stopped': self.stopped,
+            'message': text if time.time() - at < 6.0 else '', 'message_err': err,
+            'ifaces': self._local_ifaces(),
+            'dscp': [[v, n, m] for v, n, m in DSCP_TABLE],
+            'defaults': {'recv': {k: v for k, v in self.cfg['recv'].items()
+                                  if isinstance(v, (str, int, float, bool))},
+                         'send': send_defaults},
+            'rx': rxs, 'tx': self._tx_status(now),
+            'log': {'seq': seq, 'lines': lines[-1500:]}}
+
+    def send_csv(self, h):
+        rx = self.rx
+        path = getattr(rx, 'log_file', None) if rx is not None else None
+        if not path or not Path(str(path)).exists():
+            h._send(404, 'no active CSV log', 'text/plain; charset=utf-8')
+            return
+        try:
+            if rx.csv_file:
+                rx.csv_file.flush()
+            with open(str(path), 'rb') as f:
+                body = f.read()
+        except (OSError, ValueError) as e:
+            h._send(500, str(e), 'text/plain; charset=utf-8')
+            return
+        h._send(200, body, 'text/csv; charset=utf-8',
+                {'Content-Disposition': f'attachment; filename="{Path(str(path)).name}"'})
+
+
+    # -- files / configuration ---------------------------------------------------------------
+    def _active_log(self):
+        rx = self.rx
+        path = getattr(rx, 'log_file', None) if rx is not None else None
+        return os.path.basename(str(path)) if path else ''
+
+    def load_config_file(self, name, run=False):
+        """Activate a .json file of the working directory like an uploaded configuration."""
+        if not _safe_name(name, ('.json',)) or not os.path.isfile(name):
+            return {'ok': False, 'error': 'invalid file name'}
+        try:
+            with open(name, 'r', encoding='utf-8') as f:
+                obj = json.load(f)
+        except (OSError, ValueError) as e:
+            return {'ok': False, 'error': '%s: %s' % (name, e)}
+        if not isinstance(obj, dict):
+            return {'ok': False, 'error': 'not a configuration'}
+        return self.command('cfg_apply', '', {'config': obj, 'run': run}, wait=40.0)
+
+    def list_files(self):
+        active = self._active_log()
+        out = []
+        try:
+            names = os.listdir('.')
+        except OSError:
+            names = []
+        for n in names:
+            if _safe_name(n) and os.path.isfile(n):
+                try:
+                    st = os.stat(n)
+                except OSError:
+                    continue
+                out.append({'name': n, 'size': st.st_size, 'mtime': st.st_mtime,
+                            'active': n == active})
+        return out
+
+    def send_config(self, h):
+        path = CONFIG_DIR / 'config.json'
+        try:
+            body = path.read_bytes()
+        except OSError:
+            clean = {k: ({kk: vv for kk, vv in v.items() if not kk.startswith('_')}
+                         if isinstance(v, dict) else v) for k, v in self.cfg.items()}
+            body = json.dumps(clean, indent=2).encode('utf-8')
+        h._send(200, body, 'application/json; charset=utf-8',
+                {'Content-Disposition': 'attachment; filename="mautg-config.json"'})
+
+    def send_files(self, h, names, nozip):
+        if not names:
+            h._send(400, 'no filename given', 'text/plain; charset=utf-8')
+            return
+        for n in names:
+            if not _safe_name(n):
+                h._send(400, 'invalid filename: ' + n, 'text/plain; charset=utf-8')
+                return
+            if not os.path.isfile(n):
+                h._send(404, 'file not found: ' + n, 'text/plain; charset=utf-8')
+                return
+        rx = self.rx
+        if rx is not None and getattr(rx, 'csv_file', None):
+            try:
+                rx.csv_file.flush()
+            except (OSError, ValueError):
+                pass
+        try:
+            if nozip and len(names) == 1:
+                with open(names[0], 'rb') as f:
+                    body = f.read()
+                h._send(200, body, 'application/octet-stream',
+                        {'Content-Disposition': f'attachment; filename="{names[0]}"'})
+                return
+            tmp = tempfile.TemporaryFile()
+            with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_STORED if nozip else zipfile.ZIP_DEFLATED) as z:
+                for n in names:
+                    z.write(n, n)
+            size = tmp.tell()
+            tmp.seek(0)
+            zname = (names[0] + '.zip' if len(names) == 1 else
+                     f"mautg-files_{len(names)}_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.zip")
+            h.send_response(200)
+            h.send_header('Content-Type', 'application/zip')
+            h.send_header('Content-Length', str(size))
+            h.send_header('Content-Disposition', f'attachment; filename="{zname}"')
+            h.end_headers()
+            while True:
+                chunk = tmp.read(65536)
+                if not chunk:
+                    break
+                h.wfile.write(chunk)
+            tmp.close()
+        except (OSError, ValueError):
+            pass
+
+    def save_upload(self, name, raw):
+        name = os.path.basename(str(name))
+        if not _safe_name(name):
+            return {'ok': False, 'error': 'invalid file name - must be *.csv, *.txt, *.html or *.json'}
+        base, ext = os.path.splitext(name)
+        save, i = name, 1
+        while os.path.exists(save):
+            save = f"{base}-{i}{ext}"
+            i += 1
+        try:
+            with open(save, 'wb') as f:
+                f.write(raw)
+        except OSError as e:
+            return {'ok': False, 'error': str(e)}
+        self.say(f"Uploaded {save}")
+        return {'ok': True, 'name': save}
+
+    def delete_files(self, names):
+        if not isinstance(names, list) or not names:
+            return {'ok': False, 'error': 'no filenames given'}
+        active = self._active_log()
+        deleted, errors = [], []
+        for n in names:
+            if not _safe_name(n) or n == active or not os.path.isfile(n):
+                errors.append(str(n))
+                continue
+            try:
+                os.remove(n)
+                deleted.append(n)
+            except OSError:
+                errors.append(n)
+        if deleted:
+            self.say(f"Deleted {len(deleted)} file(s)")
+        return {'ok': not errors, 'deleted': deleted, 'errors': errors}
+
+    def _cfg_save(self, name):
+        """Streams + receiver settings -> default config file, or NAME.json in the working directory."""
+        if self.streams is not None:
+            store_streams(self.cfg, [st.params() for st in self.streams])
+        if self.rx is not None:
+            self.cfg['recv'].update({k: v for k, v in self.rc.items() if not str(k).startswith('_')})
+        name = str(name or '').strip()
+        if not name:
+            save_config(self.cfg)
+            self.say(f"Saved to {CONFIG_DIR / 'config.json'}")
+            return {'ok': True, 'file': str(CONFIG_DIR / 'config.json')}
+        if not name.lower().endswith('.json'):
+            name += '.json'
+        if not _safe_name(name, ('.json',)):
+            raise ValueError('invalid file name')
+        clean = {k: ({kk: vv for kk, vv in v.items() if not kk.startswith('_')}
+                     if isinstance(v, dict) else v) for k, v in self.cfg.items()}
+        path = Path.cwd() / name
+        with open(str(path), 'w') as f:
+            json.dump(clean, f, indent=2)
+        self.say(f"Saved to {path}")
+        return {'ok': True, 'file': str(path)}
+
+    def _cfg_validate(self, obj):
+        """The uploaded JSON merged over the defaults like load_config(); ValueError with the problem."""
+        if not isinstance(obj, dict):
+            raise ValueError('not a mautg configuration')
+        new = _default_config()
+        for key, val in obj.items():
+            if isinstance(val, dict) and isinstance(new.get(key), dict):
+                new[key].update(val)
+            elif key in new:
+                new[key] = val
+        if not any(k in obj for k in ('send', 'recv', 'sync_port')):
+            raise ValueError('not a mautg configuration (no send / recv / sync_port)')
+        new['sync_port'] = _num(new['sync_port'], int, 'sync_port', 1, 65535)
+        sc, rc = new['send'], new['recv']
+        if not isinstance(sc.get('extra_streams', []), list):
+            raise ValueError('send.extra_streams: list expected')
+        sp = self._coerce_stream(sc)
+        problem = check_stream_params(sp, mtu=False)
+        if problem:
+            raise ValueError(f"send: {problem}")
+        for i, x in enumerate(sc.get('extra_streams') or [], 2):
+            if not isinstance(x, dict):
+                raise ValueError(f"send.extra_streams: stream {i} is not an object")
+            problem = check_stream_params(self._coerce_stream(x), mtu=False)
+            if problem:
+                raise ValueError(f"stream {i}: {problem}")
+        for k in ('port', 'group', 'interface', 'sender_ip', 'log'):
+            rc[k] = '' if rc.get(k) is None else str(rc[k])
+        try:
+            parse_ports(rc['port'])
+            if not rc.get('unicast'):
+                parse_groups(rc['group'])
+                resolve_mcast_interfaces(rc['interface'])
+        except ValueError as e:
+            raise ValueError(f"recv: {e}")
+        return new
+
+    def _cfg_apply(self, obj, run=False):
+        """Activate an uploaded configuration: store it, restart sender streams and receiver."""
+        new = self._cfg_validate(obj)
+        rx_was = self.rx is not None
+        err = self._stop_any_rx()
+        if err:
+            return err
+        self.cfg.clear()
+        self.cfg.update(new)
+        save_config(self.cfg)
+        ss = self.streams
+        if ss is not None:
+            was = any(st.running for st in ss)
+            for st in ss:
+                st.stop(wait=False)
+            for st in ss:
+                st.stop()
+            ss[:] = [SendStream(p, self.sync_server) for p in streams_from_config(new)][:SEND_MAX_STREAMS]
+            if was or run:
+                for st in ss:
+                    st.start()
+            if self.view is not None:
+                self.view.sel = 0
+        if rx_was or run:
+            err = self._start_rx(self.cfg['recv'])
+            if err:
+                return err
+        note = ''
+        if self.sync_server is not None and new['sync_port'] != self.sync_server.port:
+            note = ' (sync port applies after the next start)'
+        self.say('Configuration loaded - sender and receiver ' + ('started' if run else 'restarted') + note)
+        return ''
+
+
+_WEB = _WebHub()
+
+
+def run_web_gui(cfg, sync_server, bind, port, plist=None, rc=None):
+    """-web: no terminal view; the browser starts / stops / edits everything.
+    plist / rc (from the command line) start sender streams / the receiver at once."""
+    def on_save(pl):
+        store_streams(cfg, pl)
+        save_config(cfg)
+        return f"Saved to {CONFIG_DIR / 'config.json'}"
+
+    _WEB.start(cfg, sync_server, bind, port, control=True, headless=True)
+    streams = [SendStream(p, sync_server)
+               for p in (plist or streams_from_config(cfg))][:SEND_MAX_STREAMS]
+    _WEB.attach_streams(streams, sync_server, on_save, None)
+    try:
+        if plist:
+            for st in streams:
+                st.start()
+        if rc:
+            _WEB._start_rx(rc)
+        _WEB.run_headless()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _WEB._stop_rx()
+        for st in streams:
+            st.stop(wait=False)
+        for st in streams:
+            st.stop()
+        _WEB.detach_streams()
+        _WEB.shutdown()
+
+
+WEB_INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mautg.py</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzRhM2IzNCI+CiAgPGVsbGlwc2UgY3g9IjEyIiBjeT0iMTYuNSIgcng9IjUuNCIgcnk9IjQuMyIvPgogIDxlbGxpcHNlIGN4PSI1LjIiIGN5PSIxMC41IiByeD0iMi41IiByeT0iMy4xIi8+CiAgPGVsbGlwc2UgY3g9IjE4LjgiIGN5PSIxMC41IiByeD0iMi41IiByeT0iMy4xIi8+CiAgPGVsbGlwc2UgY3g9IjguOSIgY3k9IjUuNiIgcng9IjIuNCIgcnk9IjMuMSIvPgogIDxlbGxpcHNlIGN4PSIxNS4xIiBjeT0iNS42IiByeD0iMi40IiByeT0iMy4xIi8+Cjwvc3ZnPg==">
+<style>
+  :root{
+    --bg:#0b0f0b; --fg:#c8d6c8; --dim:#5d6b5d; --line:#1e2a1e;
+    --up:#3ddc60; --down:#ff4b4b; --warn:#e5c07b; --acc:#7fd1ff; --panel:#101610;
+    --fs:14px; --ctrl-line:#42593f;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);overflow:hidden;
+       font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;font-size:13px}
+  header{padding:6px 12px;border-bottom:1px solid var(--line);
+         display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between}
+  .title{display:flex;align-items:center;gap:8px;font-weight:700;letter-spacing:.5px}
+  .title svg{flex:none;color:var(--dim)}
+  .title small{color:var(--dim);font-weight:400}
+  .title a{color:inherit;text-decoration:underline;text-decoration-color:var(--line)}
+  .title a:hover{color:var(--acc);text-decoration-color:currentColor}
+  .clock{color:var(--dim)}
+  .bar{display:flex;flex-wrap:wrap;gap:6px;padding:6px 12px;border-bottom:1px solid var(--line);align-items:center}
+  .row{display:inline-flex;flex-wrap:wrap;gap:6px;align-items:center;flex-basis:100%}
+  button{background:var(--panel);color:var(--fg);border:1px solid var(--ctrl-line);
+         padding:4px 10px;cursor:pointer;font:inherit;border-radius:3px}
+  button:hover{border-color:var(--acc);color:var(--acc)}
+  button.on{border-color:var(--up);color:var(--up)}
+  button.danger:hover{border-color:var(--down);color:var(--down)}
+  button:disabled{opacity:.4;cursor:default;border-color:var(--ctrl-line);color:var(--fg)}
+  .fsbox{display:flex;align-items:center;gap:4px;margin-left:auto;color:var(--dim)}
+  input[type=text],input[type=number]{background:var(--panel);color:var(--fg);border:1px solid var(--ctrl-line);
+                   padding:4px 8px;font:inherit;border-radius:3px;min-width:200px}
+  input[type=text]:focus,input[type=number]:focus,select:focus{outline:none;border-color:var(--acc)}
+  input.bad,select.bad{border-color:var(--down)}
+  select{background:var(--panel) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%235d6b5d' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 9px center;
+         background-size:9px 5px;color:var(--fg);border:1px solid var(--ctrl-line);
+         padding:4px 22px 4px 8px;font:inherit;border-radius:3px;
+         -webkit-appearance:none;-moz-appearance:none;appearance:none}
+  select:hover{border-color:var(--acc)}
+  select:disabled,input:disabled{opacity:.45}
+  input[type=range]{width:110px;accent-color:var(--acc)}
+  .grp{display:inline-flex;align-items:center;gap:6px}
+  .sep{color:var(--dim);user-select:none}
+  .stats{display:flex;flex-wrap:wrap;gap:16px;padding:5px 12px;border-bottom:1px solid var(--line);color:var(--dim)}
+  .stats b{color:var(--fg);font-weight:600}
+  .stats .u b{color:var(--up)} .stats .d b{color:var(--down)} .stats .w b{color:var(--warn)}
+  .stats #warn{color:var(--down);font-weight:700;margin-left:auto}
+  .msg{color:var(--acc)} .msg.err{color:var(--down)}
+  .banner{padding:6px 12px;background:#2a1414;color:var(--down);border-bottom:1px solid var(--line)}
+  #ro{color:var(--acc)}
+  .layout{display:flex;flex-direction:column;height:100%}
+  .body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+  #grid{flex:0 0 auto;max-height:46%;overflow:auto;padding:4px 0 0 8px;font-size:var(--fs);line-height:1.35}
+  table.t{border-collapse:collapse;border-left:1px solid var(--line);border-right:1px solid var(--line)}
+  table.t th,table.t td{padding:0 1ch;white-space:nowrap;border-bottom:1px solid #131b13}
+  table.t tfoot td{font-weight:700;border-top:1px solid var(--dim);border-bottom:0;background:var(--panel);position:sticky;bottom:0}
+  table.t th{color:var(--dim);font-weight:600;text-align:left;border-bottom:1px solid var(--line);user-select:none}
+  table.t .r{text-align:right} .c{text-align:center}
+  table.t tr.sel td{background:#182418}
+  table.t tr.clk{cursor:pointer}
+  table.t tr.clk:hover td{background:#142014}
+  .ok{color:var(--up)} .bad{color:var(--down)} .warnc{color:var(--warn)} .dim{color:var(--dim)} .acc{color:var(--acc)}
+  .empty{padding:14px;color:var(--dim)}
+  #logwrap{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;border-top:1px solid var(--line);margin-top:6px}
+  #loghead{flex:0 0 auto;min-height:calc(var(--fs) * 1.35 + 5px);padding:2px 8px;font-size:var(--fs);line-height:1.35;color:var(--fg);font-weight:700;
+           border-bottom:1px solid var(--line);white-space:pre;overflow:hidden}
+  #log{flex:1 1 auto;margin:0;padding:2px 8px;overflow:auto;font-size:var(--fs);line-height:1.35;white-space:pre}
+  .a91{color:var(--down)} .a92{color:var(--up)} .a93{color:var(--warn)} .a96{color:var(--acc)} .a90{color:var(--dim)} .a97{color:#fff;font-weight:700}
+  footer{border-top:1px solid var(--line);padding:5px 12px 8px;color:#a9baa9;font-size:13px;line-height:1.45;
+         white-space:normal;word-break:break-word;flex:none}
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:50}
+  .modal-box{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:16px 20px;
+             min-width:300px;max-width:92vw;max-height:90vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  .modal-box h3{margin:0 0 10px;font-size:18px;letter-spacing:.5px}
+  .modal-box p{margin:0 0 14px;color:#b4c4b4;font-size:14px;line-height:1.5}
+  .modal-box.wide{width:900px;max-width:92vw;max-height:82vh;overflow-y:auto}
+  .modal-box.wide table{width:100%;border-collapse:collapse}
+  .fpick{width:100%;max-height:220px;overflow-y:auto;margin:0 0 14px;border:1px solid var(--ctrl-line);border-radius:4px;padding:6px 10px;box-sizing:border-box}
+  .fpick th{font-size:13px;color:var(--dim);cursor:pointer;user-select:none;text-align:center;padding:2px 10px 4px 0}
+  .fpick td{font-size:14px;padding:4px 10px 4px 0;white-space:nowrap}
+  .fpick tr.fr{cursor:pointer} .fpick tr.fr.off{opacity:.45;cursor:not-allowed}
+  .modal-buttons{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  .modal-buttons button{flex:1 1 auto;white-space:nowrap}
+  .frow{display:flex;flex-direction:column;gap:4px;margin:0 0 13px}
+  .modal-box input,.modal-box select,.modal-box button{font-size:15px}
+  .frow label{font-size:15px;font-weight:700;letter-spacing:.2px;color:var(--fg)}
+  .frow label small{color:#a9baa9;font-weight:400;font-size:13px}
+  .frow input[type=text],.frow input[type=number],.frow select{width:100%;min-width:0}
+  .frow.chk{flex-direction:row;align-items:center;gap:8px}
+  .ferr{color:var(--down);min-height:1.3em;font-size:14px}
+  body.compact .bar button{padding:3px 6px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="layout">
+  <div id="banner" class="banner" style="display:none"></div>
+  <div id="modalHost"></div>
+  <div id="stoppedModal" class="modal-overlay" style="display:none">
+    <div class="modal-box">
+      <h3 style="color:var(--down)">MAUTG.PY STOPPED</h3>
+      <p>The process is no longer running.</p>
+      <div class="modal-buttons"><button id="btnReload">RELOAD PAGE</button><button id="btnCloseStopped">CLOSE</button></div>
+    </div>
+  </div>
+  <header>
+    <div class="title">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><ellipse cx="12" cy="16.5" rx="5.4" ry="4.3"/><ellipse cx="5.2" cy="10.5" rx="2.5" ry="3.1"/><ellipse cx="18.8" cy="10.5" rx="2.5" ry="3.1"/><ellipse cx="8.9" cy="5.6" rx="2.4" ry="3.1"/><ellipse cx="15.1" cy="5.6" rx="2.4" ry="3.1"/></svg>
+      <span>mautg.py <small id="ver"></small> &nbsp;&middot;&nbsp;
+      &copy; Ewald Jeitler &nbsp;&middot;&nbsp;
+      supervised by <a href="https://jeitler.cc/nelly/" target="_blank" rel="noopener">Nelly</a> &nbsp;&middot;&nbsp;
+      <a href="https://tools.jeitler.cc" target="_blank" rel="noopener">tools.jeitler.cc</a> &nbsp;&middot;&nbsp;
+      <a href="https://www.jeitler.cc" target="_blank" rel="noopener">www.jeitler.cc</a></span>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><ellipse cx="12" cy="16.5" rx="5.4" ry="4.3"/><ellipse cx="5.2" cy="10.5" rx="2.5" ry="3.1"/><ellipse cx="18.8" cy="10.5" rx="2.5" ry="3.1"/><ellipse cx="8.9" cy="5.6" rx="2.4" ry="3.1"/><ellipse cx="15.1" cy="5.6" rx="2.4" ry="3.1"/></svg>
+      <small id="ro"></small></div>
+    <div class="clock" id="clock"></div>
+  </header>
+
+  <div class="bar">
+    <span class="row" id="rowTabs">
+      <button id="tabRx" class="on">RECEIVER</button>
+      <button id="tabTx">SENDER</button>
+      <span class="sep">&nbsp;|&nbsp;</span>
+      <span id="ctrlRx" class="grp" style="flex-wrap:wrap">
+        <button id="btnRxStart" title="receiver settings - start or restart the receiver">START RECEIVER</button>
+        <button id="btnRxStop" class="danger" title="stop the receiver (final statistics follow in the log)">STOP RECEIVER</button>
+        <select id="selView" title="log: one line per packet or interval summaries">
+          <option value="summary">SUMMARY</option><option value="packets">PER PACKET</option>
+        </select>
+        <select id="selInt" title="summary interval">
+          <option value="1">1 s</option><option value="2">2 s</option><option value="3">3 s</option><option value="5">5 s</option>
+          <option value="10">10 s</option><option value="20">20 s</option><option value="30">30 s</option><option value="60">60 s</option>
+        </select>
+        <button id="btnIp" title="show the sender IP in every log line">SHOW IP</button>
+        <button id="btnRxReset" title="forget all streams and counters (sync and CSV log keep running)">RESET</button>
+        <button id="btnLog" title="start / stop writing the received packets to a CSV file">START LOG</button>
+        <button id="btnClearLog" title="clear the log display">CLEAR LOG</button>
+      </span>
+      <span id="ctrlTx" class="grp" style="flex-wrap:wrap;display:none">
+        <button id="btnTxAdd" title="add a stream (starts right away)">ADD STREAM</button>
+        <button id="btnTxToggle" title="start / stop the selected stream">START / STOP</button>
+        <button id="btnTxEdit" title="edit the selected stream - also while it is running">EDIT</button>
+        <button id="btnTxDel" class="danger" title="delete the selected stream">DELETE</button>
+        <button id="btnTxStartAll">START ALL</button>
+        <button id="btnTxStopAll">STOP ALL</button>
+      </span>
+      <select id="selFile" title="download / upload / delete files in the working directory of mautg.py, download or upload the configuration">
+        <option value="" selected disabled hidden>FILE OPERATIONS</option>
+        <option value="save_config">SAVE CONFIG</option>
+        <option value="config">DOWNLOAD CONFIG</option>
+        <option value="txt">DOWNLOAD LOG TEXT</option>
+        <option value="csv">DOWNLOAD ACTIVE CSV LOG</option>
+        <option value="files">DOWNLOAD SELECTED FILES</option>
+        <option value="upload_config">UPLOAD CONFIG FILE</option>
+        <option value="upload">UPLOAD FILE TO SERVER</option>
+        <option value="load_config">LOAD CONFIG FROM SERVER</option>
+        <option value="delete">DELETE FILES FROM SERVER</option>
+      </select>
+      <input type="file" id="uploadFileInput" accept=".csv,.txt,.html,.json" multiple style="display:none">
+      <input type="file" id="uploadCfgInput" accept=".json,application/json" style="display:none">
+      <button id="btnExit" class="danger" title="stop mautg.py">EXIT</button>
+      <span class="fsbox">
+        <button id="fsMinus" title="smaller">A&minus;</button>
+        <input type="range" id="fsRange" min="6" max="28" step="1">
+        <button id="fsPlus" title="bigger">A+</button>
+      </span>
+    </span>
+    </span>
+  </div>
+
+  <div class="stats" id="statsRx">
+    <span>STREAMS: <b id="sStreams">0</b></span>
+    <span>RUNTIME: <b id="sRun">00:00:00</b></span>
+    <span>PACKETS: <b id="sPk">0</b></span>
+    <span>RATE: <b id="sRate">0.00</b> Mbit/s</span>
+    <span>SYNC: <b id="sSync">-</b></span>
+    <span>VIEW: <b id="sView">-</b></span>
+    <span id="sLog"></span>
+    <span class="msg" id="msg"></span>
+    <span id="warn"></span>
+  </div>
+  <div class="stats" id="statsTx" style="display:none">
+    <span>STREAMS: <b id="tStreams">0</b></span>
+    <span class="u">RUNNING: <b id="tRun">0</b></span>
+    <span>SENT: <b id="tSent">0</b></span>
+    <span>RATE: <b id="tRate">0.00</b> Mbit/s</span>
+    <span>SYNC SERVER: <b id="tSync">-</b></span>
+    <span class="msg" id="msg2"></span>
+  </div>
+
+  <div class="body">
+    <div id="grid"></div>
+    <div id="logwrap"><div id="loghead"></div><pre id="log"></pre></div>
+  </div>
+  <footer id="foot">connecting ...</footer>
+</div>
+
+<script>
+var prevRows = 0, S = null, tab = 'receiver', selRow = 0, logSeq = 0, logAll = [], endUntil = 0,
+    fontSize = 13, down = false, giveUp = false, fails = 0, lastMsgAt = '';
+var $ = function(id){ return document.getElementById(id); };
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function store(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+function load(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+function num(n){ return (n==null)?'':Number(n).toLocaleString('en-US'); }
+function f2(n){ return (n==null)?'n/a':Number(n).toFixed(2); }
+
+/* ---------- font size ---------- */
+function setFont(px, save){
+  fontSize = Math.max(6, Math.min(28, px|0));
+  document.documentElement.style.setProperty('--fs', fontSize + 'px');
+  $('fsRange').value = fontSize;
+  if(save !== false) store('mautg_fs', fontSize);
+}
+$('fsMinus').onclick = function(){ setFont(fontSize-1); };
+$('fsPlus').onclick  = function(){ setFont(fontSize+1); };
+$('fsRange').oninput = function(){ setFont(parseInt(this.value,10)); };
+(function(){ var f = parseInt(load('mautg_fs'),10); setFont(f>=6 && f<=28 ? f : 13, false); })();
+
+/* ---------- ANSI -> html (log lines come with the terminal colors) ---------- */
+function ansi(line){
+  var out = '', open = false, re = /\x1b\[([0-9;]*)m/g, last = 0, m;
+  while((m = re.exec(line))){
+    out += esc(line.slice(last, m.index)); last = re.lastIndex;
+    if(open){ out += '</span>'; open = false; }
+    var codes = m[1].split(';'), cls = '';
+    for(var i=0;i<codes.length;i++){
+      var c = codes[i];
+      if(c==='91'||c==='92'||c==='93'||c==='96'||c==='90') cls = 'a'+c;
+      else if(c==='97') cls = 'a97';
+    }
+    if(cls){ out += '<span class="'+cls+'">'; open = true; }
+  }
+  out += esc(line.slice(last));
+  if(open) out += '</span>';
+  return out;
+}
+function plain(line){ return line.replace(/\x1b\[[0-9;]*m/g, ''); }
+
+/* ---------- commands ---------- */
+function post(cmd, value, data, cb){
+  fetch('api/command', {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'mautg'},
+        body: JSON.stringify({cmd:cmd, value:value==null?'':String(value), data:data||{}})})
+    .then(function(r){ return r.json().catch(function(){ return {ok:false,error:'bad response'}; }); })
+    .then(function(j){ if(j.ok && String(cmd).indexOf('rx_')===0) stick(); if(cb) cb(j); else if(!j.ok) note(j.error||'rejected', true); })
+    .catch(function(){ if(cb) cb({ok:false,error:'no connection'}); else note('no connection', true); });
+}
+function scrollEnd(){ var el = $('log'); el.scrollTop = el.scrollHeight; }
+function stick(){ endUntil = Date.now() + 3500; scrollEnd(); }
+function note(t, err){ var e = tab==='receiver' ? $('msg') : $('msg2'); e.textContent = t; e.className = 'msg'+(err?' err':''); }
+
+/* ---------- generic form modal ---------- */
+function openForm(title, intro, fields, values, buttons){
+  var host = $('modalHost'), v = {}, k;
+  for(k in values) v[k] = values[k];
+  var h = '<div class="modal-overlay"><div class="modal-box" style="width:600px"><h3>'+esc(title)+'</h3>'+(intro?'<p>'+esc(intro)+'</p>':'');
+  fields.forEach(function(f){
+    var id = 'f_'+f.k, val = v[f.k];
+    if(f.type==='check'){
+      h += '<div class="frow chk"><input type="checkbox" id="'+id+'"'+(val?' checked':'')+'><label for="'+id+'">'+esc(f.label)+(f.hint?' <small>'+esc(f.hint)+'</small>':'')+'</label></div>';
+    } else if(f.type==='select'){
+      h += '<div class="frow"><label>'+esc(f.label)+(f.hint?' <small>'+esc(f.hint)+'</small>':'')+'</label><select id="'+id+'">'
+        + f.options.map(function(o){ return '<option value="'+esc(o[0])+'"'+(String(o[0])===String(val)?' selected':'')+'>'+esc(o[1])+'</option>'; }).join('')+'</select></div>';
+    } else {
+      h += '<div class="frow"><label>'+esc(f.label)+(f.hint?' <small>'+esc(f.hint)+'</small>':'')+'</label><input type="'+(f.type==='number'?'number':'text')+'" id="'+id+'"'
+        + (f.type==='number'?' step="any"':'')+' value="'+esc(val==null?'':val)+'" autocomplete="off"></div>';
+    }
+  });
+  h += '<div class="ferr" id="formErr"></div><div class="modal-buttons">'
+    + buttons.map(function(b,i){ return '<button data-b="'+i+'" class="'+(b.cls||'')+'">'+esc(b.label)+'</button>'; }).join('')+'</div></div></div>';
+  host.innerHTML = h;
+  function read(){
+    var o = {};
+    fields.forEach(function(f){
+      var el = $('f_'+f.k);
+      o[f.k] = f.type==='check' ? el.checked : (f.type==='number' ? (el.value===''? '' : Number(el.value)) : el.value);
+    });
+    return o;
+  }
+  function refresh(){
+    var o = read();
+    fields.forEach(function(f){
+      if(f.enabled){ var el = $('f_'+f.k); if(el) el.disabled = !f.enabled(o); }
+    });
+  }
+  fields.forEach(function(f){ var el = $('f_'+f.k); if(el){ el.onchange = refresh; el.oninput = refresh; } });
+  refresh();
+  var close = function(){ host.innerHTML = ''; };
+  Array.prototype.forEach.call(host.querySelectorAll('button[data-b]'), function(btn){
+    btn.onclick = function(){
+      var b = buttons[parseInt(btn.getAttribute('data-b'),10)];
+      if(!b.fn){ close(); return; }
+      $('formErr').textContent = '';
+      b.fn(read(), function(err){ if(err) $('formErr').textContent = err; else close(); });
+    };
+  });
+  var first = host.querySelector('input[type=text],input[type=number],select');
+  if(first && !first.disabled) first.focus();
+}
+document.addEventListener('keydown', function(e){
+  if(e.ctrlKey || e.metaKey || e.altKey) return;
+  var host = $('modalHost'), k = e.key, t = e.target, tg = t && t.tagName;
+  if(host.innerHTML){
+    if(k==='Escape'){ host.innerHTML = ''; }
+    else if(k==='Enter' && tg!=='BUTTON'){ var b = host.querySelector('button[data-b="0"]'); if(b){ e.preventDefault(); b.click(); } }
+    return;
+  }
+  if(tg==='INPUT' || tg==='SELECT' || tg==='TEXTAREA' || !S) return;
+  var ro = !!S.readonly, kl = k.length===1 ? k.toLowerCase() : k;
+  if(kl==='Tab'){ e.preventDefault(); setTab(tab==='receiver' ? 'sender' : 'receiver'); return; }
+  if(document.activeElement && document.activeElement.blur && tg==='BUTTON') document.activeElement.blur();
+  var click = function(id){ var el = $(id); if(el && !el.disabled && el.offsetParent !== null){ e.preventDefault(); el.click(); } };
+  if(tab==='sender'){
+    var n = (S.tx.streams||[]).length;
+    if(kl==='ArrowUp'){ e.preventDefault(); selRow = Math.max(0, selRow-1); render(); }
+    else if(kl==='ArrowDown'){ e.preventDefault(); selRow = Math.max(0, Math.min(n-1, selRow+1)); render(); }
+    else if(kl==='Home'){ e.preventDefault(); selRow = 0; render(); }
+    else if(kl==='End'){ e.preventDefault(); selRow = Math.max(0, n-1); render(); }
+    else if(ro) return;
+    else if(kl===' ') click('btnTxToggle');
+    else if(kl==='e' || kl==='Enter') click('btnTxEdit');
+    else if(kl==='n') click('btnTxAdd');
+    else if(kl==='d' || kl==='Delete') click('btnTxDel');
+    else if(kl==='s') click('btnTxStartAll');
+    else if(kl==='x') click('btnTxStopAll');
+  } else if(!ro){
+    var rx = S.rx || {};
+    if(kl==='s') click('btnRxStart');
+    else if(kl==='q') click('btnRxStop');
+    else if(kl==='i') click('btnIp');
+    else if(kl==='r') click('btnRxReset');
+    else if(kl==='l') click('btnLog');
+    else if(kl==='d' && rx.running) { e.preventDefault(); post('rx_view', rx.summary ? 'packets' : 'summary'); }
+    else if((kl==='+' || kl==='=' || kl==='-' || kl==='_') && rx.running){
+      var st = [1,2,3,5,10,20,30,60], cur = rx.summary || 2, i = st.indexOf(cur); if(i<0) i = 1;
+      i = (kl==='+' || kl==='=') ? Math.min(st.length-1, i+1) : Math.max(0, i-1);
+      e.preventDefault(); post('rx_interval', st[i]);
+    }
+  }
+});
+
+/* ---------- receiver settings ---------- */
+function rxFields(){
+  var ifs = [['all','all - every interface'],['auto','auto - kernel decides']].concat(
+    (S.ifaces||[]).filter(function(x){ return x[0].indexOf('127.')!==0; }).map(function(x){ return [x[0], x[0]+'  '+x[1]]; }));
+  return [
+    {k:'unicast', label:'Unicast only', type:'check', hint:'(no multicast join)'},
+    {k:'group', label:'Multicast group(s)', hint:'239.1.1.1 | a,b | a-b | a-10', type:'text', enabled:function(o){ return !o.unicast; }},
+    {k:'interface', label:'Multicast interface', type:'select', options:ifs, enabled:function(o){ return !o.unicast; }},
+    {k:'port', label:'Data port(s)', hint:'5001 | 5001-5008 | 5001,6000-6003', type:'text'},
+    {k:'sync_mode', label:'OWD sync', type:'select', options:[['auto','auto - detect every sender'],['ip','sender IP'],['off','off - no delay values']]},
+    {k:'sender_ip', label:'Sender IP', type:'text', enabled:function(o){ return o.sync_mode==='ip'; }},
+    {k:'sender_sync_port', label:'Sender sync port', hint:'0 = from the packets', type:'number', enabled:function(o){ return o.sync_mode!=='off'; }},
+    {k:'resync_interval', label:'Resync interval (s)', type:'number', enabled:function(o){ return o.sync_mode!=='off'; }},
+    {k:'summary', label:'Summary interval (s)', hint:'0 = per-packet display', type:'number'},
+    {k:'compact', label:'Compact summary', type:'check'},
+    {k:'show_ip', label:'Show sender IP', type:'check'},
+    {k:'verify', label:'Verify every packet', hint:'(CRC + padding)', type:'check'},
+    {k:'print_limit', label:'Per-packet lines per second', hint:'0 = unlimited', type:'number'},
+    {k:'log_mode', label:'CSV log', type:'select', options:[['off','off'],['auto','automatic file name'],['file','file name']]},
+    {k:'log_name', label:'Log file name', type:'text', enabled:function(o){ return o.log_mode==='file'; }}
+  ];
+}
+function rxValues(rc){
+  rc = rc || {};
+  return {unicast: !!rc.unicast, group: rc.group||'239.1.1.1', interface: rc.interface||'all', port: rc.port||'5001-5008',
+    sync_mode: rc.sender_ip==='none' ? 'off' : (rc.sender_ip ? 'ip' : 'auto'), sender_ip: (rc.sender_ip&&rc.sender_ip!=='none')?rc.sender_ip:'',
+    sender_sync_port: rc.sender_sync_port||0, resync_interval: rc.resync_interval||3, summary: rc.summary==null?2:rc.summary,
+    compact: !!rc.compact, show_ip: !!rc.show_ip, verify: !!rc.verify, print_limit: rc.print_limit==null?500:rc.print_limit,
+    log_mode: !rc.log ? 'off' : (rc.log==='auto' ? 'auto' : 'file'), log_name: (rc.log&&rc.log!=='auto')?rc.log:''};
+}
+function openRxSettings(){
+  var running = S.rx && S.rx.running;
+  openForm('RECEIVER SETTINGS', running ? 'The receiver is running - START restarts it with these settings.' : '',
+    rxFields(), rxValues(running ? S.rx.rc : S.defaults.recv), [
+    {label: running ? 'RESTART' : 'START', cls:'on', fn:function(v, done){ post('rx_start','',v,function(j){ done(j.ok?null:(j.error||'rejected')); }); }},
+    {label:'SAVE AS DEFAULT', fn:function(v, done){ post('rx_save','',v,function(j){ done(j.ok?null:(j.error||'rejected')); }); }},
+    {label:'CANCEL'}]);
+}
+
+/* ---------- sender stream editor ---------- */
+function txFields(){
+  var src = [['','any - let the OS choose']].concat((S.ifaces||[]).map(function(x){ return [x[0], x[0]+'  '+x[1]]; }));
+  var dscp = (S.dscp||[]).map(function(d){ return [d[0], d[0]+'  '+d[1]+'  '+d[2]]; });
+  return [
+    {k:'destination_address', label:'Destination', hint:'IP or host name', type:'text'},
+    {k:'destination_port', label:'Destination port', type:'number'},
+    {k:'packet_size', label:'Packet size (bytes)', hint:'wire size, 55 up to the interface MTU (DF off: up to 65507, fragmented)', type:'number'},
+    {k:'burst_mode', label:'Burst mode', hint:'(as fast as the limit allows)', type:'check'},
+    {k:'packets_per_second', label:'Rate (pps)', type:'number', enabled:function(o){ return !o.burst_mode; }},
+    {k:'burst_mbps', label:'Burst limit (Mbit/s)', hint:'0 = unlimited', type:'number', enabled:function(o){ return o.burst_mode; }},
+    {k:'dscp_value', label:'DSCP', type:'select', options:dscp},
+    {k:'ttl', label:'TTL', type:'number'},
+    {k:'df_bit', label:'Don\'t fragment (DF)', hint:'(Linux)', type:'check'},
+    {k:'source_address', label:'Source address', type:'select', options:src},
+    {k:'source_port', label:'Source port', hint:'0 = any', type:'number'}
+  ];
+}
+function openTxEditor(idx){
+  var isNew = (idx==null), p;
+  if(isNew){
+    var base = (S.tx.streams.length ? S.tx.streams[Math.min(selRow, S.tx.streams.length-1)].params : S.defaults.send);
+    p = JSON.parse(JSON.stringify(base));
+    var used = {}; S.tx.streams.forEach(function(s){ used[s.params.destination_port] = 1; });
+    while(used[p.destination_port] && p.destination_port < 65535) p.destination_port++;
+  } else p = JSON.parse(JSON.stringify(S.tx.streams[idx].params));
+  var fields = txFields();
+  var hasDscp = fields[6].options.some(function(o){ return String(o[0])===String(p.dscp_value); });
+  if(!hasDscp) fields[6].options.push([p.dscp_value, p.dscp_value+'  custom']);
+  var hasSrc = fields[9].options.some(function(o){ return o[0]===p.source_address; });
+  if(!hasSrc) fields[9].options.push([p.source_address, p.source_address+'  (not on this host)']);
+  openForm(isNew ? 'ADD STREAM' : 'EDIT STREAM '+(idx+1), isNew ? '' : 'Changes take effect immediately; the sequence numbers continue.', fields, p,
+    [{label: isNew ? 'ADD AND START' : 'APPLY', cls:'on', fn:function(v, done){
+       v.dscp_value = parseInt(v.dscp_value,10);
+       post(isNew ? 'tx_add' : 'tx_set', isNew ? '' : idx, v, function(j){ done(j.ok?null:(j.error||'rejected')); });
+     }}, {label:'CANCEL'}]);
+}
+
+/* ---------- tables ---------- */
+function rxTable(rx){
+  var rows = rx.rows||[];
+  if(!rows.length) return '<div class="empty">'+(rx.running ? 'waiting for traffic ...' : 'receiver not running - START RECEIVER')+'</div>';
+  var pc = rx.port_col;
+  var h = '<table class="t"><thead><tr><th>ST</th><th>SOURCE</th>'+(pc?'<th class="r">PORT</th>':'')+'<th>CAST</th><th class="r">PACKETS</th><th class="r">LOSS%</th><th class="r">MISS</th><th class="r" title="most packets lost in a row">CONS</th><th class="r">ORD</th>'
+        + '<th class="r">AVG</th><th class="r">MIN</th><th class="r">MAX</th><th class="r">MBIT/S</th><th class="r">PKT/S</th><th>DSCP</th><th class="r">SIZE</th><th class="r">SPORT</th><th>SYNC</th></tr></thead><tbody>';
+  rows.forEach(function(s){
+    var sc = {ok:'ok', FAIL:'bad', wait:'warnc', off:'dim', none:'dim'}[s.sync] || '';
+    h += '<tr><td class="acc">'+esc(s.st)+'</td><td>'+esc(s.src)+'</td>'+(pc?'<td class="r">'+s.port+'</td>':'')+'<td>'+esc(s.cast)+'</td>'
+      + '<td class="r">'+num(s.pk)+'</td><td class="r '+(s.miss?'warnc':'ok')+'">'+f2(s.loss)+'</td><td class="r">'+num(s.miss)+'</td><td class="r">'+num(s.cons)+'</td><td class="r">'+num(s.ord)+'</td>'
+      + '<td class="r">'+f2(s.avg)+'</td><td class="r">'+f2(s.min)+'</td><td class="r">'+f2(s.max)+'</td><td class="r">'+f2(s.mbit)+'</td><td class="r">'+num(s.pps)+'</td>'
+      + '<td>'+esc(s.dscp)+'</td><td class="r">'+s.size+'B</td><td class="r">'+(s.sport||'-')+'</td><td class="'+sc+'">'+esc(s.sync)+'</td></tr>';
+  });
+  h += '</tbody>';
+  var t = rx.total;
+  if(t){
+    h += '<tfoot><tr><td class="acc">SUM</td><td>'+t.n+' streams</td>'+(pc?'<td></td>':'')+'<td></td>'
+      + '<td class="r">'+num(t.pk)+'</td><td class="r '+(t.miss?'warnc':'ok')+'">'+f2(t.loss)+'</td><td class="r">'+num(t.miss)+'</td><td class="r">'+num(t.cons)+'</td><td class="r">'+num(t.ord)+'</td>'
+      + '<td class="r">'+f2(t.avg)+'</td><td class="r">'+f2(t.min)+'</td><td class="r">'+f2(t.max)+'</td><td class="r">'+f2(t.mbit)+'</td><td class="r">'+num(t.pps)+'</td>'
+      + '<td></td><td></td><td></td><td></td></tr></tfoot>';
+  }
+  return h + '</table>';
+}
+function txTable(tx){
+  var rows = tx.streams||[];
+  if(!rows.length) return '<div class="empty">no streams - ADD STREAM</div>';
+  var h = '<table class="t"><thead><tr><th class="r">#</th><th>STATE</th><th>DESTINATION</th><th class="r">PORT</th><th class="r">SIZE</th><th>RATE</th><th>DSCP</th><th class="r">TTL</th><th>DF</th>'
+        + '<th>SOURCE</th><th class="r">SENT</th><th class="r">MBIT/S</th><th class="r">PPS NOW</th></tr></thead><tbody>';
+  rows.forEach(function(s, i){
+    var c = s.state==='running' ? 'ok' : (s.state==='ERROR' ? 'bad' : 'dim');
+    var p = s.params;
+    h += '<tr class="clk'+(i===selRow?' sel':'')+'" data-i="'+i+'"><td class="r">'+(i+1)+'</td><td class="'+c+'">'+esc(s.state)+'</td><td>'+esc(p.destination_address)+'</td>'
+      + '<td class="r">'+p.destination_port+'</td><td class="r">'+p.packet_size+'</td><td>'+esc(s.rate)+'</td><td>'+p.dscp_value+' '+esc(s.dscp)+'</td><td class="r">'+p.ttl+'</td><td class="'+(p.df_bit?'acc':'dim')+'">'+(p.df_bit?'on':'off')+'</td>'
+      + '<td>'+esc(p.source_address||'any')+(p.source_port?':'+p.source_port:'')+'</td><td class="r">'+num(s.sent)+'</td><td class="r">'+f2(s.mbps)+'</td><td class="r">'+(s.pps?Math.round(s.pps).toLocaleString('en-US'):'0')+'</td></tr>'
+      + (s.error ? '<tr><td></td><td colspan="12" class="bad">'+esc(s.error)+'</td></tr>' : '');
+  });
+  return h + '</tbody></table>';
+}
+
+/* ---------- tabs ---------- */
+function setTab(t){
+  tab = t; store('mautg_tab', t);
+  $('tabRx').className = (t==='receiver') ? 'on' : '';
+  $('tabTx').className = (t==='sender') ? 'on' : '';
+  var ro = S && S.readonly;
+  $('ctrlRx').style.display = (t==='receiver' && !ro) ? '' : 'none';
+  $('ctrlTx').style.display = (t==='sender' && !ro) ? '' : 'none';
+  $('statsRx').style.display = (t==='receiver') ? '' : 'none';
+  $('statsTx').style.display = (t==='sender') ? '' : 'none';
+  $('logwrap').style.display = (t==='receiver') ? '' : 'none';
+  $('grid').style.maxHeight = (t==='receiver') ? '46%' : 'none';
+  $('grid').style.flex = (t==='receiver') ? '0 0 auto' : '1 1 auto';
+  if(S) render();
+}
+$('tabRx').onclick = function(){ setTab('receiver'); };
+$('tabTx').onclick = function(){ setTab('sender'); };
+
+/* ---------- log ---------- */
+function logRender(){
+  var el = $('log'), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 30 || Date.now() < endUntil;
+  var lines = logAll;
+  el.innerHTML = lines.slice(-1500).map(ansi).join('\n');
+  if(atEnd) el.scrollTop = el.scrollHeight;
+}
+$('btnClearLog').onclick = function(){ logAll = []; $('log').innerHTML = ''; };
+
+/* ---------- render ---------- */
+function render(){
+  if(!S) return;
+  var rx = S.rx || {}, tx = S.tx || {streams:[]};
+  $('ver').textContent = 'v' + S.version;
+  $('clock').textContent = S.datetime;
+  var ro = !!S.readonly;
+  $('ro').textContent = ro ? '- read only, controlled from the terminal' : (S.mode==='control' ? '- terminal and browser control the same run' : '');
+  $('btnExit').style.display = ro ? 'none' : '';
+  $('ctrlRx').style.display = (tab==='receiver' && !ro) ? '' : 'none';
+  $('ctrlTx').style.display = (tab==='sender' && !ro) ? '' : 'none';
+  if(tab==='receiver'){
+    $('grid').innerHTML = rxTable(rx);
+    var nrows = (rx.rows||[]).length;
+    if(nrows > prevRows) stick();                      /* new stream detected: jump to the last log line */
+    prevRows = nrows;
+    $('sStreams').textContent = (rx.rows||[]).length;
+    $('sRun').textContent = rx.elapsed || '00:00:00';
+    $('sPk').textContent = num(rx.packets||0);
+    $('sRate').textContent = f2(rx.mbit||0);
+    $('sSync').textContent = rx.running ? (rx.sync_mode||'-') : '-';
+    $('sView').textContent = rx.running ? (rx.summary ? 'summary '+rx.summary+'s' : 'per packet') : (rx.rows ? 'stopped' : '-');
+    $('sLog').innerHTML = rx.logfile ? 'LOGGING-ON: <b>'+esc(rx.logfile)+'</b>' : 'LOGGING-OFF';
+    $('warn').textContent = (rx.health||'').replace(/^\s*!!\s*/, '!! ');
+    $('loghead').textContent = rx.header || '';
+    $('btnRxStart').style.display = S.can_start ? '' : 'none';
+    $('btnRxStart').textContent = rx.running ? 'RESTART RECEIVER' : 'START RECEIVER';
+    $('btnRxStop').disabled = !rx.running;
+    $('btnLog').disabled = !rx.running;
+    $('btnLog').textContent = rx.logfile ? 'STOP LOG' : 'START LOG';
+    $('btnLog').className = rx.logfile ? 'on' : '';
+    ['btnIp','btnRxReset','selView','selInt'].forEach(function(id){ $(id).disabled = !rx.running; });
+    $('btnIp').className = rx.show_ip ? 'on' : '';
+    if(document.activeElement !== $('selView')) $('selView').value = rx.summary ? 'summary' : 'packets';
+    if(document.activeElement !== $('selInt') && rx.summary) $('selInt').value = String(rx.summary);
+    $('foot').textContent = rx.running ? ('RECEIVING ' + (rx.where||'') + (rx.join ? '   |   JOIN: '+rx.join : '') + '   |   RECEIVE BUFFER: ' + (rx.rcvbuf_kb||0) + ' KB' + (rx.ignored ? '   |   IGNORED: '+rx.ignored : ''))
+                                  : 'receiver not running';
+    $('foot').textContent += (S.readonly ? '' : '   |   KEYS: TAB sender' + (S.can_start ? ' | S start' : '') + ' | Q stop | D view | +/- interval | I IP | R reset | L log');
+  } else {
+    $('grid').innerHTML = txTable(tx);
+    if(selRow >= (tx.streams||[]).length) selRow = Math.max(0, (tx.streams||[]).length-1);
+    var run = 0, sent = 0, mb = 0;
+    (tx.streams||[]).forEach(function(s){ if(s.state==='running') run++; sent += s.sent; mb += s.mbps; });
+    $('tStreams').textContent = (tx.streams||[]).length + '/' + (tx.max||32);
+    $('tRun').textContent = run; $('tSent').textContent = num(sent); $('tRate').textContent = f2(mb);
+    $('tSync').textContent = tx.sync_active ? 'port '+tx.sync_port : 'off';
+    var ctl = !!tx.controllable;
+    ['btnTxAdd','btnTxToggle','btnTxEdit','btnTxDel','btnTxStartAll','btnTxStopAll'].forEach(function(id){ $(id).disabled = !ctl; });
+    $('foot').textContent = ctl ? 'KEYS: TAB receiver | UP/DOWN select | SPACE start/stop | E edit | N new | D delete | S/X start/stop all' : (tx.attached ? 'sender running without live view - not controllable from the browser' : 'no sender running in this process');
+  }
+  (function(){
+    var ro = !!S.readonly, rx = S.rx || {};
+    Array.prototype.forEach.call($('selFile').options, function(op){
+      var off = false;
+      if(op.value==='csv') off = !rx.logfile;
+      else if(op.value==='txt') off = (tab!=='receiver');
+      else if(op.value==='upload' || op.value==='delete') off = ro;
+      else if(op.value==='upload_config' || op.value==='load_config') off = ro || !S.can_start;
+      else if(op.value==='save_config') off = ro;
+      var hid = off || op.value==='';
+      if(op.disabled !== off) op.disabled = off;
+      if(op.hidden !== hid) op.hidden = hid;
+    });
+  })();
+  var m = S.message || '';
+  if(m){ var e = tab==='receiver' ? $('msg') : $('msg2'); e.textContent = m; e.className = 'msg'+(S.message_err?' err':''); }
+  else { $('msg').textContent = ''; $('msg2').textContent = ''; }
+}
+
+/* ---------- polling ---------- */
+function poll(){
+  if(giveUp) return;
+  fetch('api/status?ls=' + logSeq).then(function(r){ return r.json(); }).then(function(s){
+    if(s.stopped){ down = true; $('stoppedModal').style.display = 'flex'; setTimeout(poll, 1000); return; }
+    fails = 0;
+    if(down){ location.reload(); return; }           /* mautg was restarted: load the new page */
+    S = s;
+    if(s.log){
+      if(s.log.seq < logSeq){ logAll = []; }
+      s.log.lines.forEach(function(l){ logAll.push(l); });
+      if(logAll.length > 3000) logAll = logAll.slice(-3000);
+      logSeq = s.log.seq;
+      if(s.log.lines.length) logRender();
+    }
+    render();
+    if(Date.now() < endUntil) scrollEnd();
+    setTimeout(poll, 1000);
+  }).catch(function(){
+    if(S){ if(++fails >= 3){ down = true; $('stoppedModal').style.display = 'flex'; } }   /* keep trying, quietly */
+    setTimeout(poll, 1000);
+  });
+}
+
+/* ---------- buttons ---------- */
+$('btnRxStart').onclick = function(){ if(S) openRxSettings(); };
+$('btnRxStop').onclick  = function(){ post('rx_stop'); };
+$('btnRxReset').onclick = function(){ post('rx_reset'); };
+$('btnIp').onclick      = function(){ post('rx_show_ip'); };
+$('selView').onchange   = function(){ post('rx_view', this.value); this.blur(); };
+$('selInt').onchange    = function(){ post('rx_interval', this.value); this.blur(); };
+/* ---------- FILE OPERATIONS ---------- */
+function humanBytes(n){ if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB'; if(n<1073741824) return (n/1048576).toFixed(1)+' MB'; return (n/1073741824).toFixed(2)+' GB'; }
+function fileDate(t){ var d = new Date(t*1000), p = function(x){ return (x<10?'0':'')+x; };
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds()); }
+function saveUrl(url){ var a = document.createElement('a'); a.href = url; a.download = ''; document.body.appendChild(a); a.click(); document.body.removeChild(a); }
+function filePicker(o){
+  var host = $('modalHost'), st = {exts:o.single?{json:true}:{csv:true,txt:true,html:true,json:true}, sort:{key:'mtime',dir:'desc'}, files:[]};
+  host.innerHTML = '<div class="modal-overlay"><div class="modal-box wide"><h3>'+esc(o.title)+'</h3><p>'+o.intro+'</p>'
+    + '<div style="display:'+(o.single?'none':'flex')+';gap:6px;align-items:center;margin-bottom:10px">'
+    + ['csv','txt','html','json'].map(function(e){ return '<button type="button" class="on" data-ext="'+e+'">.'+e.toUpperCase()+'</button>'; }).join('') + '</div>'
+    + '<div style="display:'+(o.single?'none':'flex')+';align-items:center;gap:18px;margin-bottom:8px">'
+    + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" id="fpAll"> select all</label>'
+    + (o.nozip ? '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer" title="skip ZIP compression"><input type="checkbox" id="fpNoZip"> no compression</label>' : '') + '</div>'
+    + '<div class="fpick"><table><thead><tr id="fpHead"><th style="width:20px"></th><th data-sort="name">NAME</th><th data-sort="size">SIZE</th><th data-sort="mtime">DATE</th></tr></thead><tbody id="fpList"></tbody></table></div>'
+    + '<div class="modal-buttons"><button id="fpGo" class="'+(o.danger?'danger':'')+'" disabled>'+esc(o.go)+'</button><button id="fpCancel">CANCEL</button></div></div></div>';
+  var list = $('fpList'), go = $('fpGo');
+  function checked(){ return Array.prototype.map.call(list.querySelectorAll('input.fpcb:checked'), function(c){ return c.value; }); }
+  function upd(){ go.disabled = checked().length === 0; }
+  function draw(){
+    var rows = st.files.filter(function(f){ return st.exts[f.name.split('.').pop().toLowerCase()]; });
+    var k = st.sort.key, dir = st.sort.dir === 'desc' ? -1 : 1;
+    rows.sort(function(a,b){ var x = a[k], y = b[k]; if(k==='name'){ x = x.toLowerCase(); y = y.toLowerCase(); } return (x<y?-1:x>y?1:0)*dir; });
+    $('fpAll').checked = false;
+    if(!rows.length){ list.innerHTML = '<tr><td style="color:var(--dim)">no matching files</td></tr>'; $('fpAll').disabled = true; upd(); return; }
+    $('fpAll').disabled = false;
+    list.innerHTML = rows.map(function(f){
+      var off = (o.noActive && f.active);
+      return '<tr class="fr'+(off?' off':'')+'"><td style="width:20px"><input type="checkbox" class="fpcb" value="'+esc(f.name)+'"'+(off?' disabled':'')+'></td><td>'+esc(f.name)+(off?'  (ACTIVE)':'')
+        + '</td><td style="text-align:right;color:var(--dim)">'+humanBytes(f.size)+'</td><td style="text-align:right;color:var(--dim)">'+fileDate(f.mtime)+'</td></tr>';
+    }).join('');
+    Array.prototype.forEach.call(list.querySelectorAll('tr.fr:not(.off)'), function(tr){
+      tr.onclick = function(e){ var cb = tr.querySelector('input'); if(o.single) Array.prototype.forEach.call(list.querySelectorAll('input.fpcb'), function(x){ x.checked = false; }); if(e.target !== cb || o.single) cb.checked = o.single ? true : !cb.checked; upd(); };
+    });
+    upd();
+  }
+  Array.prototype.forEach.call(host.querySelectorAll('button[data-ext]'), function(b){
+    b.onclick = function(){ var e = b.getAttribute('data-ext'); st.exts[e] = !st.exts[e]; b.className = st.exts[e] ? 'on' : ''; draw(); };
+  });
+  Array.prototype.forEach.call($('fpHead').querySelectorAll('th[data-sort]'), function(th){
+    th.onclick = function(){ var k = th.getAttribute('data-sort'); st.sort.dir = (st.sort.key===k) ? (st.sort.dir==='asc'?'desc':'asc') : (k==='name'?'asc':'desc'); st.sort.key = k; draw(); };
+  });
+  $('fpAll').onchange = function(){ var c = this.checked; Array.prototype.forEach.call(list.querySelectorAll('input.fpcb'), function(x){ if(!x.disabled) x.checked = c; }); upd(); };
+  $('fpCancel').onclick = function(){ host.innerHTML = ''; };
+  go.onclick = function(){ var names = checked(); if(names.length) o.onGo(names, o.nozip && $('fpNoZip').checked, function(){ host.innerHTML = ''; }, function(){ load(); }); };
+  list.innerHTML = '<tr><td style="color:var(--dim)">loading ...</td></tr>'; $('fpAll').disabled = true;
+  function load(){
+    fetch('api/files').then(function(r){ return r.json(); }).then(function(j){ st.files = j.files || []; draw(); })
+      .catch(function(){ list.innerHTML = '<tr><td style="color:var(--dim)">failed to list files</td></tr>'; });
+  }
+  load();
+}
+/* LOAD / LOAD&RUN / CANCEL buttons of the two "load config" dialogs; req(run) -> [url, body] */
+function cfgButtons(req){
+  function go(run){ return function(v, done){
+    var r = req(run);
+    fetch(r[0], {method:'POST', headers:{'X-Requested-With':'mautg','Content-Type':'application/json'}, body: r[1]})
+      .then(function(x){ return x.json(); }).then(function(j){ done(j.ok ? null : (j.error||'rejected')); if(j.ok) note(run ? 'configuration loaded - sender and receiver started' : 'configuration loaded'); })
+      .catch(function(){ done('no connection'); });
+  }; }
+  return [{label:'LOAD', cls:'danger', fn:go(false)}, {label:'LOAD&RUN', cls:'danger', fn:go(true)}, {label:'CANCEL'}];
+}
+function sendFiles(files, i, done){
+  if(i >= files.length){ done(); return; }
+  var f = files[i];
+  fetch('api/upload_file?name=' + encodeURIComponent(f.name), {method:'POST', headers:{'X-Requested-With':'mautg'}, body: f})
+    .then(function(r){ return r.json(); }).then(function(j){
+      if(!j.ok){ note(f.name + ': ' + (j.error||'rejected'), true); done(); return; }
+      note('uploaded ' + j.name); sendFiles(files, i+1, done);
+    }).catch(function(){ note('upload failed', true); done(); });
+}
+$('uploadFileInput').onchange = function(){ var fl = Array.prototype.slice.call(this.files); this.value = ''; if(fl.length) sendFiles(fl, 0, function(){}); };
+$('uploadCfgInput').onchange = function(){
+  var f = this.files[0]; this.value = ''; if(!f) return;
+  var rd = new FileReader();
+  rd.onload = function(){
+    var text = String(rd.result);
+    try{ JSON.parse(text); }catch(e){ note(f.name + ': not valid JSON', true); return; }
+    openForm('UPLOAD CONFIG FILE', f.name + ' replaces the saved configuration; sender streams and receiver are restarted with it.', [], {},
+      cfgButtons(function(run){ return ['api/upload_config'+(run?'?run=1':''), text]; }));
+  };
+  rd.readAsText(f);
+};
+$('selFile').onchange = function(){
+  var v = this.value; this.value = ''; this.blur();
+  if(v==='csv'){ saveUrl('api/download/log'); }
+  else if(v==='txt'){
+    var blob = new Blob([logAll.map(plain).join('\n') + '\n'], {type:'text/plain'});
+    var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'mautg-log.txt';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  }
+  else if(v==='config'){ saveUrl('api/download/config'); }
+  else if(v==='files'){
+    filePicker({title:'CHOOSE FILE', intro:"Pick one or more files in the working directory of mautg.py to download<br>- more than one are bundled into a single ZIP.", go:'DOWNLOAD', nozip:true,
+      onGo:function(names, nozip, close){ close(); saveUrl('api/download/files?' + names.map(function(n){ return 'name='+encodeURIComponent(n); }).join('&') + (nozip?'&nozip=1':'')); }});
+  }
+  else if(v==='upload'){ $('uploadFileInput').click(); }
+  else if(v==='delete'){
+    filePicker({title:'DELETE FILES', intro:"Pick one or more files in the working directory of mautg.py to delete<br>- this cannot be undone.", go:'DELETE', danger:true, noActive:true,
+      onGo:function(names, nozip, close, reload){
+        openForm('DELETE FILES', names.length + ' file(s) will be deleted. This cannot be undone.', [], {},
+          [{label:'DELETE', cls:'danger', fn:function(vv, done){
+              fetch('api/delete_files', {method:'POST', headers:{'X-Requested-With':'mautg','Content-Type':'application/json'}, body: JSON.stringify({names:names})})
+                .then(function(r){ return r.json(); }).then(function(j){
+                  var d = (j.deleted||[]).length; note(d + ' deleted' + ((j.errors&&j.errors.length) ? ', ' + j.errors.length + ' failed' : ''), !!(j.errors&&j.errors.length));
+                  done(null);
+                }).catch(function(){ done('no connection'); });
+            }}, {label:'CANCEL'}]);
+      }});
+  }
+  else if(v==='upload_config'){ $('uploadCfgInput').click(); }
+  else if(v==='load_config'){
+    filePicker({title:'LOAD CONFIG FROM SERVER', intro:"Pick a .json file in the working directory of mautg.py<br>- it replaces the saved configuration; sender streams and receiver are restarted with it.", go:'LOAD', single:true,
+      onGo:function(names, nozip, close){
+        close();
+        openForm('LOAD CONFIG FROM SERVER', names[0] + ' replaces the saved configuration; sender streams and receiver are restarted with it.', [], {},
+          cfgButtons(function(run){ return ['api/load_config', JSON.stringify({name:names[0], run:run})]; }));
+      }});
+  }
+  else if(v==='save_config'){
+    openForm('SAVE CONFIG', 'Saves the streams and the receiver settings. Enter = default file (~/.mau/config.json), or type a file name: NAME.json is written to the folder mautg was started from.',
+      [{k:'name', label:'File name', hint:'empty = default file', type:'text'}], {name:''},
+      [{label:'SAVE', cls:'on', fn:function(vv, done){ post('cfg_save', vv.name, {}, function(j){ if(j.ok) note(j.file ? 'saved ' + j.file : 'saved'); done(j.ok?null:(j.error||'rejected')); }); }},
+       {label:'CANCEL'}]);
+  }
+};
+var lastClick = {i:-1, t:0};
+$('grid').addEventListener('click', function(e){
+  var tr = e.target.closest ? e.target.closest('tr.clk') : null;
+  if(!tr || tab!=='sender') return;
+  var i = parseInt(tr.getAttribute('data-i'), 10), now = Date.now();
+  var dbl = (i === lastClick.i && now - lastClick.t < 500);
+  lastClick = {i:i, t: dbl ? 0 : now};
+  selRow = i; render();
+  if(dbl && S && S.tx.controllable && !S.readonly) openTxEditor(i);
+});
+$('btnLog').onclick = function(){
+  if(!S || !S.rx) return;
+  if(S.rx.logfile){ post('rx_log_stop'); return; }
+  openForm('START LOG', 'Packets are written to a CSV file in the working directory of mautg.py. Enter = default name.',
+    [{k:'name', label:'File name', type:'text'}], {name: S.default_log || ''},
+    [{label:'START', cls:'on', fn:function(v, done){ post('rx_log_start','',{name:v.name},function(j){ done(j.ok?null:(j.error||'rejected')); }); }},
+     {label:'CANCEL'}]);
+};
+$('btnTxAdd').onclick      = function(){ openTxEditor(null); };
+$('btnTxEdit').onclick     = function(){ if(S.tx.streams.length) openTxEditor(selRow); };
+$('btnTxToggle').onclick   = function(){ var s = S.tx.streams[selRow]; if(s) post(s.state==='running' ? 'tx_stop' : 'tx_start', selRow); };
+$('btnTxStartAll').onclick = function(){ post('tx_start', 'all'); };
+$('btnTxStopAll').onclick  = function(){ post('tx_stop', 'all'); };
+$('btnTxDel').onclick      = function(){
+  var s = S.tx.streams[selRow]; if(!s) return;
+  openForm('DELETE STREAM '+(selRow+1), s.params.destination_address+':'+s.params.destination_port+' will be stopped and removed.', [], {},
+    [{label:'DELETE', cls:'danger', fn:function(v, done){ post('tx_del', selRow, {}, function(j){ done(j.ok?null:(j.error||'rejected')); }); }}, {label:'CANCEL'}]);
+};
+$('btnReload').onclick = function(){            /* reload only if the server answers - never show the browser's error page */
+  fetch('api/status?ls=0', {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(s){
+    if(s && !s.stopped) location.reload();
+  }).catch(function(){});
+};
+$('btnCloseStopped').onclick = function(){ $('stoppedModal').style.display = 'none'; giveUp = true; };   /* closed: stop checking */
+$('btnExit').onclick = function(){
+  openForm('EXIT MAUTG.PY', 'Stop the program (sender, receiver and sync server)?', [], {},
+    [{label:'EXIT', cls:'danger', fn:function(v, done){ post('exit', '', {}, function(){ done(null); setTimeout(function(){ try{ window.close(); }catch(e){} }, 1500); }); }}, {label:'CANCEL'}]);
+};
+
+tab = (load('mautg_tab') === 'sender') ? 'sender' : 'receiver';
+setTab(tab);
+poll();
+</script>
+</body>
+</html>
+"""
 
 
 # --- Main ---------------------------------------------------------------------
@@ -5108,6 +7729,17 @@ def _ui_flags(p):
                    help='ASCII-only output (automatic when the locale is not UTF-8; also: MAUTG_ASCII=1)')
     p.add_argument('--no-tui', action='store_true', default=argparse.SUPPRESS,
                    help='Use the simple line menus instead of the full-screen UI')
+    p.add_argument('-web', '--web', action='store_true', default=argparse.SUPPRESS,
+                   help='Web GUI instead of the terminal UI (sender and receiver, '
+                        'controlled from the browser)')
+    p.add_argument('-wv', '--web-view', action='store_true', default=argparse.SUPPRESS,
+                   help='Terminal as usual plus a read-only web view on -port')
+    p.add_argument('-wvc', '--web-view-control', action='store_true', default=argparse.SUPPRESS,
+                   help='Like -wv, but the browser can also control the running sender / receiver')
+    p.add_argument('-port', '--web-port', default=argparse.SUPPRESS, metavar='N',
+                   help=f'HTTP port of the web GUI / web view (default: {WEB_DEFAULT_PORT})')
+    p.add_argument('-bind', '--web-bind', default=argparse.SUPPRESS, metavar='ADDR',
+                   help=f'Bind address of the web GUI / web view (default: {WEB_DEFAULT_BIND} = all interfaces)')
 
 
 def build_parser():
@@ -5201,6 +7833,75 @@ def _goodbye():
         pass
 
 
+def _apply_send_args(args, cfg):
+    """Command-line values of `send` into cfg['send']."""
+    sc = cfg['send']
+    for arg_name, key in (('destination', 'destination_address'),
+                          ('port', 'destination_port'),
+                          ('size', 'packet_size'),
+                          ('pps', 'packets_per_second'),
+                          ('dscp', 'dscp_value'),
+                          ('ttl', 'ttl'),
+                          ('burst_mbps', 'burst_mbps')):
+        val = getattr(args, arg_name)
+        if val is not None:
+            sc[key] = val
+    if args.source is not None:
+        sc['source_address'] = args.source
+    if args.source_port is not None:
+        sc['source_port'] = args.source_port
+    if args.df:
+        sc['df_bit'] = True
+
+
+def _send_plist(args, cfg):
+    """Stream parameter list of a command-line `send` (only the streams given on
+    the command line; the saved additional streams are not added).
+    ValueError with the problem."""
+    sc = cfg['send']
+    if args.burst:
+        sc['burst_mode'] = True
+    if len(args.stream) > SEND_MAX_STREAMS:
+        raise ValueError(f"At most {SEND_MAX_STREAMS} streams")
+    if args.stream:
+        plist = [parse_stream_spec(x, sc) for x in args.stream]
+        seen = {}
+        for i, q in enumerate(plist, 1):
+            key = (q['source_address'], q['destination_port'])
+            if key in seen:
+                raise ValueError(
+                    f"streams {seen[key]} and {i} use destination port "
+                    f"{q['destination_port']} - a receiver would merge them")
+            seen[key] = i
+        return plist
+    problem = check_stream_params(_stream_params(sc))
+    if problem:
+        raise ValueError(problem)
+    return [_stream_params(sc)]
+
+
+def _apply_recv_args(args, cfg):
+    """CLI receive runs on defaults + flags (not on the saved menu config), so a
+    command line behaves the same every time. Returns the settings dict."""
+    rc = cfg['recv']
+    rc.update({
+        'sender_ip': args.sender or '',
+        'sender_sync_port': args.sender_sync_port or 0,
+        'verify': args.verify,
+        'show_ip': args.show_ip,
+        'unicast': args.unicast,
+        'group': args.group,
+        'interface': args.interface,
+        'print_limit': args.print_limit,
+        'port': args.port,
+        'summary': args.compact or (2 if args.interval is None else max(0, args.interval)),
+        'compact': bool(args.compact),
+        'resync_interval': args.resync_interval,
+        'log': args.log or '',
+    })
+    return rc
+
+
 def main():
     args = build_parser().parse_args()
 
@@ -5224,30 +7925,48 @@ def main():
     if getattr(args, 'sync_port', None) is not None:
         cfg['sync_port'] = args.sync_port
 
+    web_mode = ('web' if getattr(args, 'web', False)
+                else 'wvc' if getattr(args, 'web_view_control', False)
+                else 'wv' if getattr(args, 'web_view', False) else None)
+    web_port = getattr(args, 'web_port', str(WEB_DEFAULT_PORT))
+    web_bind = getattr(args, 'web_bind', WEB_DEFAULT_BIND)
+    if web_mode:
+        try:
+            if not 1 <= int(web_port) <= 65535:
+                raise ValueError
+            web_port = int(web_port)
+        except ValueError:
+            print(f"{Colors.RED}✗ -port: must be between 1 and 65535{Colors.ENDC}")
+            sys.exit(2)
+
     sync_server = OWDSyncServer(port=cfg['sync_port'])
+    _CTX.update(cfg=cfg, sync=sync_server)
     if not no_server:
         sync_server.start()
 
     try:
-        if args.cmd == 'send':
-            sc = cfg['send']
-            for arg_name, key in (('destination', 'destination_address'),
-                                  ('port', 'destination_port'),
-                                  ('size', 'packet_size'),
-                                  ('pps', 'packets_per_second'),
-                                  ('dscp', 'dscp_value'),
-                                  ('ttl', 'ttl'),
-                                  ('burst_mbps', 'burst_mbps')):
-                val = getattr(args, arg_name)
-                if val is not None:
-                    sc[key] = val
-            if args.source is not None:
-                sc['source_address'] = args.source
-            if args.source_port is not None:
-                sc['source_port'] = args.source_port
-            if args.df:
-                sc['df_bit'] = True
+        if web_mode == 'web':
+            plist, rc = None, None
+            try:
+                if args.cmd == 'send':
+                    _apply_send_args(args, cfg)
+                    if args.destination or args.burst or args.stream:
+                        plist = _send_plist(args, cfg)
+                elif args.cmd == 'recv':
+                    rc = _apply_recv_args(args, cfg)
+            except ValueError as e:
+                print(f"{Colors.RED}✗ {e}{Colors.ENDC}")
+                sys.exit(2)
+            run_web_gui(cfg, sync_server, web_bind, web_port, plist, rc)
+            _goodbye()
+            return
 
+        if web_mode:
+            _WEB.start(cfg, sync_server, web_bind, web_port, control=(web_mode == 'wvc'),
+                       side=args.cmd not in ('send', 'recv') or bool(getattr(args, 'menu', False)))
+
+        if args.cmd == 'send':
+            _apply_send_args(args, cfg)
             print(f"\n{Colors.WHITE}mautg v{VERSION} - send   {CREDIT}{Colors.ENDC}\n")
             if args.menu or (not args.destination and not args.burst and not args.stream):
                 if use_tui:
@@ -5255,53 +7974,15 @@ def main():
                 else:
                     sender_menu_loop(cfg, sync_server)
             else:
-                # a command line is deterministic: only the streams given on it
-                # (the saved additional streams are not added)
-                if args.burst:
-                    sc['burst_mode'] = True
-                if len(args.stream) > SEND_MAX_STREAMS:
-                    print(f"{Colors.RED}✗ At most {SEND_MAX_STREAMS} streams{Colors.ENDC}")
-                    sys.exit(2)
                 try:
-                    if args.stream:
-                        plist = [parse_stream_spec(x, sc) for x in args.stream]
-                        seen = {}
-                        for i, q in enumerate(plist, 1):
-                            key = (q['source_address'], q['destination_port'])
-                            if key in seen:
-                                raise ValueError(
-                                    f"streams {seen[key]} and {i} use destination port "
-                                    f"{q['destination_port']} - a receiver would merge them")
-                            seen[key] = i
-                    else:
-                        problem = check_stream_params(_stream_params(sc))
-                        if problem:
-                            raise ValueError(problem)
-                        plist = [_stream_params(sc)]
+                    plist = _send_plist(args, cfg)
                 except ValueError as e:
                     print(f"{Colors.RED}✗ {e}{Colors.ENDC}")
                     sys.exit(2)
                 run_sender(cfg, sync_server, plist, live=not args.no_live)
 
         elif args.cmd == 'recv':
-            # CLI receive runs on defaults + flags (not on the saved menu
-            # config), so a command line behaves the same every time.
-            rc = cfg['recv']
-            rc.update({
-                'sender_ip': args.sender or '',
-                'sender_sync_port': args.sender_sync_port or 0,
-                'verify': args.verify,
-                'show_ip': args.show_ip,
-                'unicast': args.unicast,
-                'group': args.group,
-                'interface': args.interface,
-                'print_limit': args.print_limit,
-                'port': args.port,
-                'summary': args.compact or (2 if args.interval is None else max(0, args.interval)),
-                'compact': bool(args.compact),
-                'resync_interval': args.resync_interval,
-                'log': args.log or '',
-            })
+            rc = _apply_recv_args(args, cfg)
             print(f"\n{Colors.WHITE}mautg v{VERSION} - recv   {CREDIT}{Colors.ENDC}\n")
             if args.menu:
                 if use_tui:
@@ -5317,6 +7998,10 @@ def main():
             else:
                 main_menu(cfg, sync_server)
     except _Terminate as t:
+        if _WEB.exit_requested:               # Exit in the browser: a normal end
+            sync_server.stop()
+            _goodbye()
+            return
         # terminal closed / SIGTERM: everything has been unwound; end for real
         code = 128 + getattr(signal, t.signame, signal.SIGTERM)
         sync_server.stop()
@@ -5324,6 +8009,7 @@ def main():
     else:
         _goodbye()
     finally:
+        _WEB.shutdown()
         sync_server.stop()
 
 

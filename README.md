@@ -8,10 +8,12 @@ By Ewald Jeitler - https://www.jeitler.cc
 
 - Multicast, unicast and broadcast; up to 32 sender streams, up to 36 receiver streams
 - OWD via NTP-style 4-timestamp exchange, drift tracking, kernel RX timestamps (Linux)
-- Per stream: loss, misorder, restart detection, DSCP, MC/UC/BC, throughput, delay avg/min/max
+- Per stream: loss, most packets lost in a row (`Cons`), misorder, restart detection, DSCP, MC/UC/BC, throughput, delay avg/min/max
+- Receiver view (TUI and web) ends the stream table with a `SUM` row over all streams: packets, miss, ord and Mbit/s, pkt/s summed; Loss% overall; Cons = maximum; delay avg weighted over all samples, min/max overall
 - Burst mode, DSCP marking, TTL, DF bit, source address/port
 - Receiver overload detection (RX drops, display limit)
 - CSV log, Wireshark dissectors, full-screen text UI (plain ANSI) and line-menu fallback
+- Web GUI (`-web`) or web view of a terminal run (`-wv`, `-wvc`), standard library only
 - Python 3.6.1+, Linux, macOS, Raspberry Pi OS, Cisco IOS-XE Guest Shell
 
 ## Installation / Update
@@ -25,7 +27,7 @@ Installs `mautg.py` to `/usr/local/bin` as command `mautg`; running it again upd
 ### Python 3.6 / Cisco Guest Shell
 
 - Python 3.6.1 or newer. Per-packet receiver cost: 2.0 us (3.8), 1.3 us (3.11/3.13).
-- Python 3.6 is the Guest Shell interpreter: `python3 mautg.py`.
+- Python 3.6 is the Guest Shell interpreter: `python3 mautg.py`. Not yet run on a real 3.6.
 - The Guest Shell sees only its own interface (`eth0` or VirtualPortGroup / AppGigabitEthernet). Multicast needs PIM or an IGMP join towards that interface. Use low rates (up to a few thousand pps).
 
 ### Character set
@@ -100,7 +102,8 @@ Up to 32 streams, one thread and one socket each, sharing one sync server. The r
 | `n` | new stream (copy, next free port) |
 | `d` / Del | delete (y/n) |
 | `w` | save streams to config |
-| `q` / Ctrl+C | stop all |
+| `r` | receiver view (starts the receiver with the saved receiver settings if none runs); streams keep running |
+| `q` / Ctrl+C | stop all (also the receiver) |
 
 Per stream: destination, port, size, mode (pps or burst with Mbit/s limit, 0 = unlimited), DSCP, TTL, DF, source address/port. Rate column = measured over the last 0.5 s. Socket error: `ERROR` + reason; send errors are retried every 0.2 s. Form: Left/Right switch streams; streams 2-32 are stored as `extra_streams`.
 
@@ -133,6 +136,7 @@ Per stream: destination, port, size, mode (pps or burst with Mbit/s limit, 0 = u
 | `--no-live` | Plain output |
 | `-m`, `--menu` | Sender menu |
 | `--no-tui`, `--no-color`, `--color`, `--ascii` | Output options |
+| `-web`, `-wv`, `-wvc`, `-port`, `-bind` | Web GUI, see [Web GUI](#web-gui) |
 
 Unset values come from the saved config.
 
@@ -204,7 +208,9 @@ Burst max, 1500-byte packets (about 975 Mbit/s, 81k pps = line rate), receiver i
 
 | Key | Action |
 |---|---|
-| `q` | stop (final statistics follow) |
+| `s` | sender view (streams and receiver keep running in the background; `r` there returns) |
+| `q` | stop the receiver (final statistics follow at the end); with running streams the sender view comes up |
+| `e` | edit the receiver settings (same form as the receiver menu), Apply restarts the receiver with them; statistics start from zero |
 | `p` | pause log |
 | `i` | show/hide sender IP |
 | `r` | reset view (streams, counters, clock; sync and CSV keep running) |
@@ -256,6 +262,7 @@ Compact summary (`-c N`):
 | `--no-live` | Scrolling output instead of live view |
 | `-m`, `--menu` | Receiver menu |
 | `--no-tui`, `--no-color`, `--color`, `--ascii` | Output options |
+| `-web`, `-wv`, `-wvc`, `-port`, `-bind` | Web GUI, see [Web GUI](#web-gui) |
 
 ### Multicast interface
 
@@ -282,7 +289,7 @@ Default 5001-5008. One socket per port (max 512). Stream key = **sender IP + adv
 
 - **Auto-detect:** the first valid packet gives source IP and sync port; sync runs in a background thread. Delay shows `n/a` until it succeeds; failed sync is retried every 5 s, throughput and loss keep working.
 - **Own-traffic check:** magic `MAUT` + version on every packet; other packets are ignored and counted (`non-mautg`). CRC32 + padding are checked at lock-in, or per packet with `--verify`.
-- **Per stream:** own sequence tracker (loss, misorder, restart), statistics, DSCP, sync. With `--sender IP` only streams of that IP get delay values.
+- **Per stream:** key = source IP + destination port + stream id. Own sequence tracker, statistics, DSCP, sync. Tracker: highest sequence number plus a window of the last 2048; a gap counts as lost, a late arrival inside the window takes the loss back and counts as misorder, a repeated sequence number is `DUP` (not counted for loss). A new stream id on the same IP/port after the old one was silent (more than 4x the packet interval, at least 0.3 s) is a restart of the same stream (`Sender restart detected`, tracker starts over, no false loss); a new id while the old one still arrives is a second sender (own stream). Packets of the replaced id are dropped and counted. `Cons` = longest run of consecutive sequence numbers that never arrived (a late packet splits a run, so the value can also go down). An outage of the same running stream (e.g. a 60 s convergence) is not a restart: the id stays the same, the gap counts as loss and `Cons`. The silence rule only decides between restart and second sender when a new id appears. With `--sender IP` only streams of that IP get delay values.
 - **Copies:** the same packet (timestamp + sequence) on two streams is reported as `Copies of stream A: N` with arrival-time difference avg/min/max.
 - **Firewall / NAT:** UDP from receiver to the sender's sync port (5556) must be allowed. Without return path no delay is measurable (`--sender none`).
 
@@ -295,6 +302,31 @@ Default 5001-5008. One socket per port (max 512). Stream key = **sender IP + adv
 5. Linux: sync exchange and data packets use kernel RX timestamps (`SO_TIMESTAMPNS`); elsewhere `time.time_ns()`.
 
 Accuracy is limited by path symmetry: offset error ≈ half the asymmetry. Negative readings are floored to 0 on screen (`~`); CSV keeps the raw value.
+
+## Web GUI
+
+![Web receiver](screenshots/web-receiver.png)
+
+![Web sender](screenshots/web-sender.png)
+
+| Option | Effect |
+|---|---|
+| `-web` | Web GUI instead of the terminal UI: sender (up to 32 streams) and receiver are started, stopped and edited in the browser. `send ... -web` / `recv ... -web` start the streams / the receiver with the given options at once |
+| `-wv` | Terminal run as usual plus a read-only web view of the same run |
+| `-wvc` | Like `-wv`, the browser can also control the run (receiver: view, interval, IP, reset, stop; sender live view: start, stop, add, edit, delete, all streams) |
+| `-port N`, `--web-port N` | HTTP port (default 8081). `--port` / `-p` of `recv` is the data port |
+| `-bind ADDR` | Bind address (default `0.0.0.0`) |
+
+- Receiver tab: stream table, log (download as text; START LOG / STOP LOG writes a CSV file, Enter = default name), settings dialog (same fields as the receiver form); the log jumps to the last line after every change and when a new stream is detected. Sender tab: stream table, add/edit dialog (same fields as the sender form).
+- FILE OPERATIONS (both tabs, working directory of mautg.py): download active CSV log (only while logging), log text, config (`~/.mau/config.json`, downloaded as `mautg-config.json`); download selected `.csv`/`.txt`/`.html`/`.json` files (several = ZIP); upload files (max 16 MB); SAVE CONFIG (Enter = default file, or a name -> `NAME.json` in the working directory); delete files (not the active log); load a `.json` of the working directory as config (LOAD CONFIG FROM SERVER, one file, same as the upload); upload a config `.json` - it is validated, saved and activated; LOAD restarts what was running, LOAD & RUN starts all sender streams and the receiver (`-web` and `-wvc` without `send`/`recv`).
+- Keys: `Tab` receiver/sender. Receiver: `s` start, `q` stop, `d` summary/per packet, `+`/`-` interval, `i` IP, `r` reset, `l` log. Sender: Up/Down/Home/End select, `Space` start/stop, `e`/Enter edit, `n` new, `d`/Del delete, `s`/`x` all. Dialogs: Enter = first button, Esc = cancel.
+- Server gone / stopped: dialog MAUTG.PY STOPPED. The page reloads itself when mautg is back (as long as the dialog is open). RELOAD PAGE reloads only if the server answers (no browser error page). CLOSE ends the checking.
+- Only one receiver runs per program: a start from the terminal replaces a receiver started in the browser; a start while another one runs is refused ("a receiver is already running").
+- Page polls `/api/status` once per second; commands go to `POST /api/command` and are executed by the thread that owns the receiver / the streams.
+- `-wvc` without `send`/`recv`: text menu in the terminal, receiver and streams can also be started and edited in the browser.
+- `-wv`/`-wvc`: status bars of the terminal views show `web :PORT` (`ro` = read only).
+- Exit in the browser stops the program; `-wvc` exit and `q` in the terminal are equivalent.
+- No authentication, no TLS. `-bind 127.0.0.1` restricts the page to the local host (e.g. with an SSH tunnel).
 
 ## Protocol
 
@@ -313,6 +345,8 @@ Data packet (format version 1), all fields big-endian:
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 | Version (8)   |       Sender OWD Sync Port (16)               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                      Stream ID (32)                           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                      Padding (variable)                       |
 |   "mautg_trafficgen_www.jeitler.cc:" + 0x2A fill             |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -325,12 +359,13 @@ Data packet (format version 1), all fields big-endian:
 | Sequence | 0 | 4 | uint32 | Counter, starts at 0 |
 | Timestamp | 4 | 8 | uint64 | µs since Unix epoch |
 | Magic | 12 | 4 | ASCII | `MAUT` |
-| Version | 16 | 1 | uint8 | 1 |
+| Version | 16 | 1 | uint8 | 2 |
 | Sync port | 17 | 2 | uint16 | Sync server port of the sender (0 = none) |
-| Padding | 19 | variable | bytes | `mautg_trafficgen_www.jeitler.cc:` if it fits, then `0x2A` |
+| Stream ID | 19 | 4 | uint32 | Random, new at every start of a stream |
+| Padding | 23 | variable | bytes | `mautg_trafficgen_www.jeitler.cc:` if it fits, then `0x2A` |
 | CRC | last 4 | 4 | uint32 | CRC-32 (zlib) over all preceding bytes |
 
-Minimum UDP payload 23 bytes (51 on the wire). `--size` is the wire size (IP packet); UDP payload = size - 28 (1500 gives 1472).
+Minimum UDP payload 27 bytes (55 on the wire). `--size` is the wire size (IP packet); UDP payload = size - 28 (1500 gives 1472). Maximum with DF set = MTU of the way to the destination (Linux: kernel route MTU; macOS: MTU of the interface owning the local address, from `ifconfig`); if it cannot be determined, 65507. With DF off the maximum is 65507 (the packets are fragmented). macOS/BSD: additionally limited by `net.inet.udp.maxdgram` (default 9216 -> 9244 on the wire; `sudo sysctl -w net.inet.udp.maxdgram=65535` raises it), otherwise the send fails with `Errno 40 Message too long`. The sender table shows DF (on/off). Checked in the dialogs and with `-s`; a loaded config is not checked against the MTU.
 
 ### OWD time sync protocol
 
@@ -365,7 +400,7 @@ Each instance binds its own sync server. Give each its own `--sync-port` (and da
 
 - Menu settings: `~/.mau/config.json`.
 - CSV (`recv -l [name]`): current directory; default name `mautg-log_YYYY-MM-DD_HH:MM:SS.csv` (Windows: `-` instead of `:`); absolute paths as given.
-- CSV columns: `Timestamp, Seq, Delay_ms, DSCP, DSCP_Name, Status, Stream, Source_IP, Sync_Port, Port, Cast` (Delay_ms raw, unclamped).
+- CSV columns: `Timestamp, Seq, Delay_us, DSCP, DSCP_Name, Status, Stream, Source_IP, Sync_Port, Port, Cast, Dest_IP` (Delay_us = one-way delay in whole microseconds, raw, unclamped, no decimal separator; Dest_IP = destination address of the packet: multicast group, broadcast address or the unicast address it was received on; empty on Windows).
 
 ## Wireshark
 

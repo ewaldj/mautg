@@ -23,6 +23,8 @@ MAU uses UDP to transmit packets with embedded timestamps for one-way delay meas
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 | Version (8)   |       Sender OWD Sync Port (16)               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                      Stream ID (32)                           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                      Padding (variable)                       |
 |   "mautg_trafficgen_www.jeitler.cc:" + 0x2A fill             |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -35,12 +37,13 @@ MAU uses UDP to transmit packets with embedded timestamps for one-way delay meas
 | 0 | 4 bytes | uint32 BE | Sequence number (starts at 0) |
 | 4 | 8 bytes | uint64 BE | Timestamp in microseconds since Unix epoch |
 | 12 | 4 bytes | ASCII | Magic `MAUT` |
-| 16 | 1 byte | uint8 | Format version (1) |
+| 16 | 1 byte | uint8 | Format version (2) |
 | 17 | 2 bytes | uint16 BE | UDP port of the sender's OWD sync server (0 = none) |
-| 19 | variable | bytes | Padding: readable preamble `mautg_trafficgen_www.jeitler.cc:` (if it fits), then `0x2A` fill |
+| 19 | 4 bytes | uint32 BE | Stream ID (random, new at every start of a stream) |
+| 23 | variable | bytes | Padding: readable preamble `mautg_trafficgen_www.jeitler.cc:` (if it fits), then `0x2A` fill |
 | last 4 | 4 bytes | uint32 BE | CRC-32 (zlib) over all preceding bytes |
 
-All multi-byte fields are **big-endian** (network byte order). The minimum UDP payload is 23 bytes (header only, no padding). The user-configured "packet size" refers to the IP wire size; the UDP payload is 28 bytes smaller (20 IP + 8 UDP header).
+All multi-byte fields are **big-endian** (network byte order). The minimum UDP payload is 27 bytes (header only, no padding). The user-configured "packet size" refers to the IP wire size; the UDP payload is 28 bytes smaller (20 IP + 8 UDP header).
 
 Packets on the port that do not carry the magic are **not** dissected, so foreign UDP traffic stays untouched. This format is **not compatible** with mautg 1.04 and older (including the earlier mau-send/mau-recv scripts).
 

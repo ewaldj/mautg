@@ -13,13 +13,14 @@
 -- receive range).
 -- To use a different port: right-click a packet → Decode As → UDP port → MAU
 --
--- Packet format (UDP payload, mautg v1.05+):
+-- Packet format (UDP payload, mautg v1.83+, format version 2):
 --   [0:4]    Sequence Number   uint32 big-endian
 --   [4:12]   Timestamp (µs)    uint64 big-endian (CLOCK_REALTIME since epoch)
 --   [12:16]  Magic             "MAUT"
---   [16]     Format version    1
+--   [16]     Format version    2
 --   [17:19]  Sync port         uint16 big-endian (sender's OWD sync server, 0 = none)
---   [19:N-4] Padding           "mautg_trafficgen_www.jeitler.cc:" (if it fits), then 0x2A
+--   [19:23]  Stream ID         uint32 big-endian (random, new at every start of a stream)
+--   [23:N-4] Padding           "mautg_trafficgen_www.jeitler.cc:" (if it fits), then 0x2A
 --   [N-4:N]  CRC32             uint32 big-endian over bytes[0:N-4] (zlib CRC-32)
 --
 -- Packets without the magic are NOT dissected (returns 0), so foreign UDP
@@ -34,13 +35,14 @@ local f_delay     = ProtoField.string("mau.delay",      "Sender Timestamp (UTC)"
 local f_magic     = ProtoField.string("mau.magic",      "Magic")
 local f_version   = ProtoField.uint8 ("mau.version",    "Format Version",  base.DEC)
 local f_syncport  = ProtoField.uint16("mau.sync_port",  "Sender OWD Sync Port (0 = none)", base.DEC)
+local f_streamid  = ProtoField.uint32("mau.stream_id",  "Stream ID (random, new at every start)", base.HEX)
 local f_preamble  = ProtoField.string("mau.preamble",   "Padding Preamble")
 local f_payload   = ProtoField.bytes ("mau.payload",    "Padding")
 local f_crc       = ProtoField.uint32("mau.crc",        "CRC32",           base.HEX)
 local f_crc_valid = ProtoField.string("mau.crc_status", "CRC Status")
 local f_wire_size = ProtoField.uint32("mau.wire_size",  "Wire Size (bytes)", base.DEC)
 
-mau_proto.fields = { f_seq, f_ts, f_delay, f_magic, f_version, f_syncport,
+mau_proto.fields = { f_seq, f_ts, f_delay, f_magic, f_version, f_syncport, f_streamid,
                      f_preamble, f_payload, f_crc, f_crc_valid, f_wire_size }
 
 -- Expert info for CRC errors
@@ -75,9 +77,9 @@ end
 
 local MAGIC      = "MAUT"
 local PREAMBLE   = "mautg_trafficgen_www.jeitler.cc:"
--- Minimum packet size: 4(seq) + 8(ts) + 4(magic) + 1(ver) + 2(port) + 4(crc) = 23
-local MIN_LEN    = 23
-local PAD_OFFSET = 19
+-- Minimum packet size: 4(seq) + 8(ts) + 4(magic) + 1(ver) + 2(port) + 4(stream id) + 4(crc) = 27
+local MIN_LEN    = 27
+local PAD_OFFSET = 23
 
 function mau_proto.dissector(buffer, pinfo, tree)
     local buf_len = buffer:len()
@@ -105,13 +107,14 @@ function mau_proto.dissector(buffer, pinfo, tree)
         subtree:add(f_delay, buffer(4, 8), full_str)
     end
 
-    -- Magic, format version, sync port (bytes 12-18)
+    -- Magic, format version, sync port, stream id (bytes 12-22)
     subtree:add(f_magic, buffer(12, 4))
     subtree:add(f_version, buffer(16, 1))
     local sync_port = buffer(17, 2):uint()
     subtree:add(f_syncport, buffer(17, 2))
+    subtree:add(f_streamid, buffer(19, 4))
 
-    -- Padding (bytes 19 to N-4): readable preamble first, if present
+    -- Padding (bytes 23 to N-4): readable preamble first, if present
     local pad_len = buf_len - MIN_LEN
     if pad_len > 0 then
         if pad_len >= #PREAMBLE and buffer(PAD_OFFSET, #PREAMBLE):string() == PREAMBLE then

@@ -428,9 +428,26 @@ hostB$ ./mautg.py send -d 10.0.0.1 --pps 10 ; hostA$ ./mautg.py recv -u -i 10
 
 ```
 ├── mautg.py              # sender + receiver + OWD sync server
-├── e-install.sh          # installer / updater
+├── e-install.sh          # installer / updater (Linux/macOS, script only)
+├── mversions             # versions for the launcher update check
+├── Windows_Version/      # launcher + installer + portable zip (Windows)
+├── OSX_Version/          # launcher + installer + portable zip (macOS)
+├── src/                  # Go sources of launchers/installers, build.sh
 ├── screenshots/          # images for this README
 ├── wireshark/            # Lua dissectors + README
 ├── LICENSE
 └── README.md
 ```
+
+## Windows / macOS (launcher)
+
+Packages with launcher window, bundled Python and update check are in `Windows_Version/` and `OSX_Version/` (details: `README.md` there). The launcher starts `mautg.py -web -bind 127.0.0.1` in the background, opens the web GUI and offers Start / Stop / Restart, web port, Console log, Update, Admin / Admin setup, Exit. Extra mautg options: `mautg-args.txt`.
+
+| Platform | Installer | Portable |
+|---|---|---|
+| Windows 10/11 x64 | `Windows_Version/mautg-installer.exe` | `Windows_Version/mautg-windows.zip` |
+| macOS 10.13+ (arm64 / x86_64) | `OSX_Version/mautg-installer-mac.zip` | `OSX_Version/mautg-mac.zip` |
+
+Update: the launcher compares `mversions` on GitHub (`mautg.py`, `mautg-windows`, `mautg-mac`) at start and every 6 hours. Sources: `src/` (Go, `src/build.sh`).
+
+Windows limits: no kernel RX timestamps (delay is stamped in user space, a little less exact), no MC/UC/BC and RX-drop detection without `recvmsg`, lower maximum pps. DSCP is ignored by Windows unless mautg runs as administrator (QoS policy per stream, removed at exit); the launcher asks at start. macOS: the launcher can raise `net.inet.udp.maxdgram` and allow the bundled Python in the firewall (password prompt; mautg itself never runs as root). Apps are not signed/notarized: see `OSX_Version/README.md`.

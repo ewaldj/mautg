@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-VERSION = "1.87"
+VERSION = "1.89"
 AUTHOR = "Ewald Jeitler"
 URL = "https://www.jeitler.cc"
 CREDIT = f"by {AUTHOR} - {URL}"
@@ -2344,6 +2344,94 @@ def _is_broadcast(addr):
     return False
 
 
+class _WinQos:
+    """Windows ignores IP_TOS on sockets (since Vista); DSCP needs a QoS policy,
+    which only an administrator can create. One policy per destination ip + port
+    (UDP, this program only), kept in the ActiveStore (gone after a reboot) and
+    removed again at exit; leftovers of a killed run are removed at the next use."""
+    PREFIX = 'mautg-'
+
+    def __init__(self):
+        self.names = set()
+        self.admin = None
+        self.cleaned = False
+        self.lock = threading.Lock()
+        self.registered = False
+
+    def is_admin(self):
+        if self.admin is None:
+            try:
+                import ctypes
+                self.admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                self.admin = False
+        return self.admin
+
+    @staticmethod
+    def _ps(cmd, timeout=25):
+        import subprocess
+        r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                            '-Command', "$ErrorActionPreference='Stop'; " + cmd],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        return r.returncode, (r.stdout + r.stderr).decode('utf-8', 'replace').strip()
+
+    def apply(self, dest, port, dscp):
+        """Mark UDP to dest:port with dscp. None on success, else a text for the user."""
+        if not dscp and not self.names:
+            return None
+        if not self.is_admin():
+            return ("DSCP is not applied: Windows ignores it without a QoS policy "
+                    "- start mautg as administrator")
+        try:
+            ip = socket.gethostbyname(dest)
+            port, dscp = int(port), int(dscp)
+            name = f"{self.PREFIX}{ip}-{port}"
+            exe = os.path.basename(sys.executable) or 'python.exe'
+            with self.lock:
+                if not self.cleaned:
+                    self.cleaned = True
+                    self._ps(f"Get-NetQosPolicy -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object "
+                             f"{{ $_.Name -like '{self.PREFIX}*' }} | Remove-NetQosPolicy "
+                             f"-PolicyStore ActiveStore -Confirm:$false")
+                rm = (f"Get-NetQosPolicy -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -eq '{name}' }} "
+                      f"| Remove-NetQosPolicy -PolicyStore ActiveStore -Confirm:$false; ")
+                if dscp == 0:
+                    if name in self.names:
+                        self._ps(rm)
+                        self.names.discard(name)
+                    return None
+                code, out = self._ps(
+                    rm + f"New-NetQosPolicy -Name '{name}' -PolicyStore ActiveStore -NetworkProfile All "
+                    f"-IPProtocolMatchCondition UDP -IPDstPrefixMatchCondition '{ip}/32' "
+                    f"-IPDstPortStartMatchCondition {port} -IPDstPortEndMatchCondition {port} "
+                    f"-AppPathNameMatchCondition '{exe}' -DSCPAction {dscp} | Out-Null")
+                if code != 0:
+                    return "DSCP: QoS policy failed: " + (out.splitlines() or ['?'])[0][:160]
+                self.names.add(name)
+                if not self.registered:
+                    self.registered = True
+                    import atexit
+                    atexit.register(self.release_all)
+        except Exception as e:
+            return f"DSCP: QoS policy failed: {e}"
+        return None
+
+    def release_all(self):
+        with self.lock:
+            for name in list(self.names):
+                try:
+                    self._ps(f"Get-NetQosPolicy -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object "
+                             f"{{ $_.Name -eq '{name}' }} | Remove-NetQosPolicy "
+                             f"-PolicyStore ActiveStore -Confirm:$false", timeout=10)
+                except Exception:
+                    pass
+            self.names.clear()
+
+
+_WIN_QOS = _WinQos()
+
+
 def _create_send_socket(config, warn=None):
     """Create and configure UDP send socket. Non-fatal problems are printed,
     or handed to warn(text) (live view: the screen must not be written to)."""
@@ -2376,6 +2464,11 @@ def _create_send_socket(config, warn=None):
 
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, config['ttl'])
 
+    if sys.platform == 'win32':
+        err = _WIN_QOS.apply(config['destination_address'], config['destination_port'],
+                             config['dscp_value'] or 0)
+        if err:
+            note(err)
     if sys.platform != 'win32' and config['dscp_value']:
         try:
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS,
@@ -2390,8 +2483,18 @@ def _create_send_socket(config, warn=None):
                 sock.setsockopt(socket.IPPROTO_IP, 10, 2)
             except OSError as e:
                 note(f"Could not set DF bit: {e}")
+        elif sys.platform == 'win32':
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, 14, 1)     # IP_DONTFRAGMENT
+            except OSError as e:
+                note(f"Could not set DF bit: {e}")
+        elif sys.platform == 'darwin':
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, 28, 1)     # IP_DONTFRAG
+            except OSError as e:
+                note(f"Could not set DF bit: {e}")
         else:
-            note("DF bit not supported on this platform (Linux only)")
+            note("DF bit not supported on this platform")
 
     return sock
 

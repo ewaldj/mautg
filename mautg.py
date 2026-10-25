@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-VERSION = "1.89"
+VERSION = "2.27"
 AUTHOR = "Ewald Jeitler"
 URL = "https://www.jeitler.cc"
 CREDIT = f"by {AUTHOR} - {URL}"
@@ -115,22 +115,268 @@ else:
         sys.stdout.reconfigure(line_buffering=True)
 
 # macOS does not export IP_RECVTOS in Python's socket module (value=27 on Darwin)
-_IP_RECVTOS = getattr(socket, 'IP_RECVTOS', 27)
+_IP_RECVTOS = getattr(socket, 'IP_RECVTOS', 40 if sys.platform == 'win32' else 27)
 
 # Destination address of every datagram (to tell MC / UC / BC apart):
 # Linux IP_PKTINFO (in_pktinfo: ifindex, spec_dst, dst), BSD/macOS IP_RECVDSTADDR.
 if sys.platform.startswith('linux'):
     _DST_OPT = getattr(socket, 'IP_PKTINFO', 8)
 elif sys.platform == 'win32':
-    _DST_OPT = None
+    _DST_OPT = 19                # IP_PKTINFO (in_pktinfo: dst address first, then ifindex)
 else:
     _DST_OPT = getattr(socket, 'IP_RECVDSTADDR', 7)
 _DST_OFFSET = 8 if sys.platform.startswith('linux') else 0   # address inside the cmsg data
 _CAST_CACHE = {}               # raw destination address -> 'MC' | 'UC' | 'BC'
+_ANC_CACHE_OK = not sys.platform.startswith('linux')   # no RX timestamps / drop counter in ancillary data
 # Linux: the kernel counts datagrams it had to drop because the socket queue was
 # full (we were too slow) and reports the running total with every packet
 _SO_RXQ_OVFL = getattr(socket, 'SO_RXQ_OVFL', 40) if sys.platform.startswith('linux') else None
 PKT_LINE_LIMIT = 500           # per-packet display: at most this many lines per second
+
+
+# -- Windows: recvmsg() ---------------------------------------------------------
+# Python has no socket.recvmsg() on Windows. WSARecvMsg (ws2_32, via ctypes) gives
+# the same ancillary data: TOS/DSCP (IP_RECVTOS) and destination address (IP_PKTINFO).
+_WIN_RECV = None                 # None = not tried yet, False = unavailable
+
+
+def _win_parse_cmsgs(ctl, size_t=8):
+    """WSACMSGHDR list (size_t, level, type, data) -> [(level, type, data)]."""
+    hdr = struct.calcsize('<Q' if size_t == 8 else '<I') + 8
+    hdr_al = (hdr + size_t - 1) & ~(size_t - 1)
+    fmt = '<Qii' if size_t == 8 else '<Iii'
+    out, off = [], 0
+    while off + hdr <= len(ctl):
+        clen, level, typ = struct.unpack_from(fmt, ctl, off)
+        if clen < hdr_al or off + clen > len(ctl):
+            break
+        out.append((level, typ, bytes(ctl[off + hdr_al:off + clen])))
+        off += (clen + size_t - 1) & ~(size_t - 1)
+    return out
+
+
+def _win_recv_init():
+    global _WIN_RECV
+    if _WIN_RECV is not None:
+        return _WIN_RECV
+    _WIN_RECV = False
+    if sys.platform != 'win32':
+        return False
+    try:
+        import ctypes
+        ws2 = ctypes.WinDLL('ws2_32')
+
+        class WSABUF(ctypes.Structure):
+            _fields_ = [('len', ctypes.c_ulong), ('buf', ctypes.c_void_p)]
+
+        class WSAMSG(ctypes.Structure):
+            _fields_ = [('name', ctypes.c_void_p), ('namelen', ctypes.c_int),
+                        ('bufs', ctypes.POINTER(WSABUF)), ('nbufs', ctypes.c_ulong),
+                        ('ctl', WSABUF), ('flags', ctypes.c_ulong)]
+
+        ws2.WSAIoctl.argtypes = [ctypes.c_size_t, ctypes.c_ulong, ctypes.c_void_p,
+                                 ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong,
+                                 ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+                                 ctypes.c_void_p]
+        ws2.WSAIoctl.restype = ctypes.c_int
+        ws2.WSAGetLastError.restype = ctypes.c_int
+        guid = ctypes.create_string_buffer(
+            struct.pack('<IHH8s', 0xf689d7c8, 0x6f1f, 0x436b,
+                        bytes.fromhex('8a53e54fe351c322')), 16)
+        fnptr, ret = ctypes.c_void_p(), ctypes.c_ulong()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tmp:
+            rc = ws2.WSAIoctl(tmp.fileno(), 0xC8000006, guid, 16, ctypes.byref(fnptr),
+                              ctypes.sizeof(fnptr), ctypes.byref(ret), None, None)
+        if rc != 0 or not fnptr.value:
+            return False
+        proto = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_size_t,
+                                   ctypes.POINTER(WSAMSG), ctypes.POINTER(ctypes.c_ulong),
+                                   ctypes.c_void_p, ctypes.c_void_p)
+        _WIN_RECV = (ctypes, WSABUF, WSAMSG, proto(fnptr.value), ws2.WSAGetLastError)
+    except Exception:
+        _WIN_RECV = False
+    return _WIN_RECV
+
+
+class _WinRecvSocket(socket.socket):
+    """UDP socket with a working recvmsg() on Windows (WSARecvMsg)."""
+
+    def recvmsg(self, bufsize, ancbufsize=0, flags=0):
+        ct, WSABUF, WSAMSG, fn, last_error = _WIN_RECV
+        t = self.gettimeout()
+        if t:                                    # > 0: wait like a timeout socket
+            if not select.select([self], [], [], t)[0]:
+                raise socket.timeout('timed out')
+        st = self.__dict__.get('_wst')
+        if st is None or st[0] < bufsize:
+            st = (bufsize, ct.create_string_buffer(bufsize), ct.create_string_buffer(64),
+                  ct.create_string_buffer(max(ancbufsize, 256)), WSABUF(), WSAMSG())
+            self._wst = st
+        _sz, data, name, ctl, wbuf, msg = st
+        wbuf.len, wbuf.buf = len(data), ct.addressof(data)
+        msg.name, msg.namelen = ct.addressof(name), len(name)
+        msg.bufs, msg.nbufs = ct.pointer(wbuf), 1
+        msg.ctl.len, msg.ctl.buf = len(ctl), ct.addressof(ctl)
+        msg.flags = 0
+        n = ct.c_ulong()
+        if fn(self.fileno(), ct.byref(msg), ct.byref(n), None, None) != 0:
+            err = last_error()
+            if err == 10035:
+                raise BlockingIOError(err, 'would block')
+            if err == 10054:
+                raise ConnectionResetError(err, 'connection reset')
+            if err != 10040:                     # 10040 = datagram truncated: keep it
+                raise ct.WinError(err)
+        raw = name.raw
+        addr = (socket.inet_ntoa(raw[4:8]), struct.unpack('!H', raw[2:4])[0])
+        anc = _win_parse_cmsgs(ct.string_at(ct.addressof(ctl), msg.ctl.len),
+                               ct.sizeof(ct.c_size_t))
+        return ct.string_at(ct.addressof(data), n.value), anc, msg.flags, addr
+
+
+def _udp_socket():
+    """Receive socket: with recvmsg() on Windows, a plain socket elsewhere."""
+    if sys.platform == 'win32' and _win_recv_init():
+        return _WinRecvSocket(socket.AF_INET, socket.SOCK_DGRAM)
+    return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+# -- macOS: batched receive (recvmsg_x) -----------------------------------------
+# Under load a plain recvmsg() per packet costs ~70 us on macOS (socket lock contention
+# with the kernel delivering packets); recvmsg_x reads up to 32 datagrams per call
+# (measured: +42 % packets/s). Private but long-standing libSystem call; verified at
+# start with a loopback self-test, otherwise the normal recvmsg is used.
+# Disable: MAUTG_NO_RECVX=1.
+_RECVX_OK = None
+
+
+class _MacRecvX:
+    """recvmsg(size, ancsize)-compatible object on top of recvmsg_x batches."""
+    SLOT, CTL, NAME = 65536, 64, 32
+
+    def __init__(self, sock, batch=32):
+        import ctypes
+
+        class iovec(ctypes.Structure):
+            _fields_ = [('base', ctypes.c_void_p), ('len', ctypes.c_size_t)]
+
+        class msghdr_x(ctypes.Structure):
+            _fields_ = [('name', ctypes.c_void_p), ('namelen', ctypes.c_uint32),
+                        ('iov', ctypes.POINTER(iovec)), ('iovlen', ctypes.c_int),
+                        ('control', ctypes.c_void_p), ('controllen', ctypes.c_uint32),
+                        ('flags', ctypes.c_int), ('datalen', ctypes.c_size_t)]
+
+        self._ct = ctypes
+        self.fd = sock.fileno()
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.fn = libc.recvmsg_x
+        self.fn.argtypes = [ctypes.c_int, ctypes.POINTER(msghdr_x), ctypes.c_uint, ctypes.c_int]
+        self.fn.restype = ctypes.c_ssize_t
+        self.batch = batch
+        slot, ctl, name = self.SLOT, self.CTL, self.NAME
+        self.data = ctypes.create_string_buffer(slot * batch)
+        self.ctl = ctypes.create_string_buffer(ctl * batch)
+        self.name = ctypes.create_string_buffer(name * batch)
+        self.mv_d, self.mv_c, self.mv_n = (memoryview(self.data), memoryview(self.ctl),
+                                           memoryview(self.name))
+        self.iov = (iovec * batch)()
+        self.msgs = (msghdr_x * batch)()
+        da, ca, na = (ctypes.addressof(b) for b in (self.data, self.ctl, self.name))
+        isz = ctypes.sizeof(iovec)
+        for i in range(batch):
+            self.iov[i].base, self.iov[i].len = da + i * slot, slot
+            m = self.msgs[i]
+            m.name, m.namelen = na + i * name, name
+            m.iov = ctypes.cast(ctypes.addressof(self.iov) + i * isz, ctypes.POINTER(iovec))
+            m.iovlen = 1
+            m.control, m.controllen = ca + i * ctl, ctl
+        self.have = self.pos = 0
+        self.anc_cache = {}
+        self.addr_cache = {}
+
+    def __call__(self, _size, _anc):
+        if self.pos >= self.have:
+            n = self.fn(self.fd, self.msgs, self.batch, 0)
+            if n < 0:
+                e = self._ct.get_errno()
+                if e in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise BlockingIOError(e, 'would block')
+                raise OSError(e, os.strerror(e))
+            if n == 0:
+                raise BlockingIOError(errno.EAGAIN, 'would block')
+            self.have, self.pos = n, 0
+        i = self.pos
+        self.pos += 1
+        m = self.msgs[i]
+        o = i * self.SLOT
+        data = bytes(self.mv_d[o:o + m.datalen])
+        cl = m.controllen
+        ckey = bytes(self.mv_c[i * self.CTL:i * self.CTL + cl])
+        anc = self.anc_cache.get(ckey)
+        if anc is None:
+            anc = self.anc_cache[ckey] = _win_parse_cmsgs(ckey, 4)   # BSD cmsghdr: 12 bytes, 4-aligned
+        nkey = bytes(self.mv_n[i * self.NAME:i * self.NAME + 8])
+        addr = self.addr_cache.get(nkey)
+        if addr is None:
+            addr = self.addr_cache[nkey] = (socket.inet_ntoa(nkey[4:8]),
+                                            struct.unpack('!H', nkey[2:4])[0])
+        flags = m.flags
+        m.namelen = self.NAME          # reset the in/out fields of the consumed slot
+        m.controllen = self.CTL
+        return data, anc, flags, addr
+
+
+def _recvx_selftest():
+    """True if recvmsg_x works here: same data / ancillary data / address as recvmsg."""
+    global _RECVX_OK
+    if _RECVX_OK is not None:
+        return _RECVX_OK
+    _RECVX_OK = False
+    if sys.platform != 'darwin' or os.environ.get('MAUTG_NO_RECVX'):
+        return False
+    a = b = None
+    try:
+        a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        a.bind(('127.0.0.1', 0))
+        a.setsockopt(socket.IPPROTO_IP, _IP_RECVTOS, 1)
+        a.setsockopt(socket.IPPROTO_IP, 7, 1)             # IP_RECVDSTADDR
+        a.setblocking(False)
+        b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        b.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 46 << 2)
+        pk = bytes(range(256)) * 5 + b'selftest'
+        b.sendto(pk, a.getsockname())
+        time.sleep(0.02)
+        ref = a.recvmsg(65535, 256)
+        rx = _MacRecvX(a, 4)
+        b.sendto(pk, a.getsockname())
+        b.sendto(pk[:100], a.getsockname())
+        time.sleep(0.02)
+        got = rx(65535, 256)
+        got2 = rx(65535, 256)
+        try:
+            rx(65535, 256)
+            empty_ok = False
+        except BlockingIOError:
+            empty_ok = True
+        _RECVX_OK = (got[0] == ref[0] and got[1] == ref[1] and got[3] == ref[3]
+                     and len(ref[1]) >= 1 and got2[0] == pk[:100] and empty_ok)
+    except Exception:
+        _RECVX_OK = False
+    finally:
+        for sk in (a, b):
+            if sk is not None:
+                sk.close()
+    return _RECVX_OK
+
+
+def _fast_recvmsg(sock, batch=32):
+    """recvmsg for the receive loop: batched on macOS when it works, else sock.recvmsg."""
+    if sys.platform == 'darwin' and _recvx_selftest():
+        try:
+            return _MacRecvX(sock, batch)
+        except Exception:
+            pass
+    return sock.recvmsg
 
 
 
@@ -491,6 +737,8 @@ class OWDSyncClient:
         self._history = []  # [(monotonic_time, offset_us), ...] newest last
 
         self._lock = threading.Lock()
+        self._oc_until = 0.0         # per-packet path: extrapolated offset, valid until
+        self._oc_val = 0.0
         self._running = False
         self._thread = None
 
@@ -611,6 +859,7 @@ class OWDSyncClient:
             self.rtt_ms = rtt_ms
             self.offset_us = offset_us
             self._last_update_mono = now
+            self._oc_until = 0.0
             self.synced = True
 
             self._history.append((now, offset_us))
@@ -712,10 +961,18 @@ class OWDSyncClient:
           For a data packet:  receiver_now = sender_stamp - theta + delay
           Therefore:          delay = receiver_now - sender_stamp + theta
         """
-        with self._lock:
-            if not self.synced:
-                return None
-            offset = self._current_offset_us()
+        if not self.synced:
+            return None
+        now = time.monotonic()
+        if now >= self._oc_until:
+            # the extrapolated offset changes by nanoseconds per millisecond:
+            # recompute it at most every 2 ms (lock + extrapolation per packet cost ~1 us)
+            with self._lock:
+                if not self.synced:
+                    return None
+                self._oc_val = self._current_offset_us()
+            self._oc_until = now + 0.002
+        offset = self._oc_val
 
         if local_ts_us is None:
             local_ts_us = time.time_ns() / 1_000.0
@@ -953,6 +1210,158 @@ _UDP_IP_OVERHEAD = 28
 _MIN_PACKET_SIZE = _HEADER_SIZE  # 27 bytes
 
 
+# --- TCP mode -----------------------------------------------------------------
+# A TCP stream is a connection to the receiver's data port (TCP, same number as the
+# UDP port). After a 16-byte hello (message size, DSCP announced by the sender) the
+# sender writes messages of that size back to back. Each message is a normal data
+# packet (layout above: seq, timestamp, magic, stream id, CRC), so statistics, delay
+# (OWD sync) and the CRC check are shared with UDP. TCP repeats lost segments itself:
+# "loss" stays 0, a retransmission shows up as delay (and in the TCP statistics).
+_TCP_HELLO = struct.Struct('!4sBBHII')   # magic, version, dscp, flags, message size, reserved
+_TCP_MAGIC = b'MTCP'
+_TCP_VERSION = 1
+TCP_MAX_MSG = 1 << 20                    # largest message (bytes)
+TCP_MAX_CONN = 64                        # connections per sender stream
+_TCP_SAVE_SYN, _TCP_SAVED_SYN = 27, 28   # Linux: keep the SYN (the DSCP seen on the wire)
+_TCP_CONNECTION_INFO = 0x106             # macOS
+
+# Short descriptions of the congestion control algorithms (shown in the dialogs)
+_CC_INFO = {
+    'reno': 'classic: +1 segment per RTT, window halved on loss; slow on fast / long paths',
+    'cubic': 'Linux default: cubic window growth after a loss, loss-based; good on fast / long paths',
+    'bbr': 'models bandwidth and minimum RTT, keeps queues short, hardly reacts to random loss; can crowd out cubic',
+    'bbr2': 'BBR with ECN / loss awareness: fairer to loss-based flows than BBR',
+    'vegas': 'delay-based: slows down as soon as the RTT rises; loses against loss-based flows',
+    'htcp': 'H-TCP: for fast, long paths; grows faster the longer ago the last loss was',
+    'westwood': 'estimates the bandwidth from the ACKs; sets the window after a loss from that (lossy / wireless links)',
+    'illinois': 'loss + delay hybrid for fast networks: steep growth, gentle back-off',
+    'highspeed': 'HighSpeed TCP (RFC 3649): more aggressive growth for very large windows',
+    'scalable': 'Scalable TCP: fixed-ratio growth and back-off for very fast links',
+    'hybla': 'compensates a long RTT (satellite): grows as if the RTT were short',
+    'veno': 'Vegas + Reno: uses the delay to tell random loss from congestion loss',
+    'yeah': 'YeAH: delay + loss hybrid, fast growth with little queueing',
+    'lp': 'TCP-LP: low priority, yields to other flows (scavenger)',
+    'cdg': 'CAIA delay gradient: reacts to the RTT trend, tolerates random loss',
+    'dctcp': 'data centre TCP: reduces the window in proportion to ECN marks (needs ECN on the path)',
+    'bic': 'predecessor of cubic: binary search for the window size',
+    'nv': 'TCP-NV: delay-based, for data centres',
+}
+_CA_NAMES = ('Open', 'Disorder', 'CWR', 'Recovery', 'Loss')
+
+
+def _read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().split()
+    except OSError:
+        return []
+
+
+def tcp_cc_available():
+    """Congestion control algorithms a connection may select (Linux; [] elsewhere)."""
+    if not sys.platform.startswith('linux'):
+        return []
+    root = hasattr(os, 'geteuid') and os.geteuid() == 0
+    names = _read_text('/proc/sys/net/ipv4/tcp_available_congestion_control' if root
+                       else '/proc/sys/net/ipv4/tcp_allowed_congestion_control')
+    return names or ['cubic', 'reno']
+
+
+def tcp_cc_options():
+    """[[name, text], ...] for the dialogs; '' = system default."""
+    if not sys.platform.startswith('linux'):
+        return [['', 'system default - the algorithm can only be chosen per connection on Linux']]
+    cur = (_read_text('/proc/sys/net/ipv4/tcp_congestion_control') or ['?'])[0]
+    out = [['', f"system default ({cur})"]]
+    for n in tcp_cc_available():
+        out.append([n, f"{n} - {_CC_INFO.get(n, 'kernel module')}"])
+    return out
+
+
+def _tcp_info(sock):
+    """Kernel statistics of a connected TCP socket: dict with rtt_ms, rttvar_ms,
+    cwnd (bytes), retrans (segments), unacked, mss - or None (not available here)."""
+    u = struct.unpack_from
+    try:
+        if sys.platform.startswith('linux'):
+            raw = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
+            if len(raw) < 104:
+                return None
+            mss = u('=I', raw, 16)[0]
+            d = {'rtt_ms': u('=I', raw, 68)[0] / 1000.0, 'rttvar_ms': u('=I', raw, 72)[0] / 1000.0,
+                 'cwnd': u('=I', raw, 80)[0] * (mss or 1), 'retrans': u('=I', raw, 100)[0],
+                 'unacked': u('=I', raw, 24)[0], 'mss': mss}
+            if len(raw) >= 152:
+                d['notsent'] = u('=I', raw, 144)[0]              # bytes in the send queue, not yet sent
+                d['min_rtt_ms'] = u('=I', raw, 148)[0] / 1000.0
+            if len(raw) >= 232:
+                d['snd_wnd'] = u('=I', raw, 228)[0]              # window announced by the receiver
+            d['ca_state'] = raw[1]
+            d['opts'] = raw[5]
+            d['rto_ms'] = u('=I', raw, 8)[0] / 1000.0
+            d['sacked'] = u('=I', raw, 28)[0]
+            d['lost'] = u('=I', raw, 32)[0]
+            d['ssthresh'] = u('=I', raw, 76)[0] * (mss or 1)
+            d['reord'] = u('=I', raw, 88)[0]
+            if len(raw) >= 112:
+                d['pacing'] = u('=Q', raw, 104)[0]               # bytes / s
+            if len(raw) >= 168:
+                d['delivery'] = u('=Q', raw, 160)[0]             # bytes / s
+            try:
+                d['cc'] = sock.getsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_CONGESTION', 13), 16
+                                          ).split(b'\0')[0].decode()
+            except (OSError, UnicodeDecodeError):
+                pass
+            return d
+        if sys.platform == 'darwin':
+            raw = sock.getsockopt(socket.IPPROTO_TCP, _TCP_CONNECTION_INFO, 256)
+            if len(raw) < 56:
+                return None
+            srtt, var = u('=I', raw, 44)[0], u('=I', raw, 48)[0]
+            if srtt > 100000:                 # not the layout we know: better no value than a wrong one
+                return None
+            mss = u('=I', raw, 16)[0]
+            retr = u('=Q', raw, 104)[0] if len(raw) >= 112 else 0
+            return {'rtt_ms': float(srtt), 'rttvar_ms': float(var), 'cwnd': u('=I', raw, 24)[0],
+                    'retrans': retr, 'unacked': 0, 'mss': mss}
+        if sys.platform == 'win32':
+            return _tcp_info_win(sock)
+    except (OSError, struct.error, AttributeError):
+        pass
+    return None
+
+
+def _tcp_info_win(sock):
+    """Windows 10+ (SIO_TCP_INFO, TCP_INFO_v0): RTT, cwnd, windows, retransmits, connect time."""
+    import ctypes
+    from ctypes import wintypes
+    class V0(ctypes.Structure):
+        _fields_ = [('State', ctypes.c_int), ('Mss', wintypes.ULONG),
+                    ('ConnectionTimeMs', ctypes.c_uint64), ('TimestampsEnabled', ctypes.c_ubyte),
+                    ('RttUs', wintypes.ULONG), ('MinRttUs', wintypes.ULONG),
+                    ('BytesInFlight', wintypes.ULONG), ('Cwnd', wintypes.ULONG),
+                    ('SndWnd', wintypes.ULONG), ('RcvWnd', wintypes.ULONG),
+                    ('RcvBuf', wintypes.ULONG), ('BytesOut', ctypes.c_uint64),
+                    ('BytesIn', ctypes.c_uint64), ('BytesReordered', wintypes.ULONG),
+                    ('BytesRetrans', wintypes.ULONG), ('FastRetrans', wintypes.ULONG),
+                    ('DupAcksIn', wintypes.ULONG), ('TimeoutEpisodes', wintypes.ULONG),
+                    ('SynRetrans', ctypes.c_ubyte)]
+    ver = wintypes.DWORD(0)
+    info = V0()
+    ret = wintypes.DWORD(0)
+    ws2 = ctypes.WinDLL('ws2_32', use_last_error=True)
+    rc = ws2.WSAIoctl(ctypes.c_size_t(sock.fileno()), wintypes.DWORD(0xD8000027),
+                      ctypes.byref(ver), wintypes.DWORD(4), ctypes.byref(info),
+                      wintypes.DWORD(ctypes.sizeof(info)), ctypes.byref(ret), None, None)
+    if rc != 0:
+        return None
+    mss = info.Mss or 1
+    return {'rtt_ms': info.RttUs / 1000.0, 'rttvar_ms': 0.0, 'min_rtt_ms': info.MinRttUs / 1000.0,
+            'cwnd': info.Cwnd, 'retrans': max(info.BytesRetrans // mss, info.FastRetrans),
+            'unacked': info.BytesInFlight // mss, 'mss': info.Mss, 'snd_wnd': info.SndWnd,
+            'connect_ms': float(info.ConnectionTimeMs)}
+
+
 class PacketInfo(NamedTuple):
     """Parsed packet data."""
     seq: int
@@ -1040,6 +1449,34 @@ class RunningStats:
     @property
     def maximum(self):
         return self.max_val if self.count else 0.0
+
+
+class WinStats(RunningStats):
+    """RunningStats plus min/max of a window that the web history takes over once per second."""
+    __slots__ = ('w_min', 'w_max')
+
+    def __init__(self):
+        RunningStats.__init__(self)
+        self.w_min = float('inf')
+        self.w_max = float('-inf')
+
+    def add(self, value):
+        self.count += 1
+        self.total += value
+        if value < self.min_val:
+            self.min_val = value
+        if value > self.max_val:
+            self.max_val = value
+        if value < self.w_min:
+            self.w_min = value
+        if value > self.w_max:
+            self.w_max = value
+
+    def take_window(self):
+        lo, hi = self.w_min, self.w_max
+        self.w_min = float('inf')
+        self.w_max = float('-inf')
+        return lo, hi
 
 
 class DscpStats:
@@ -1187,10 +1624,11 @@ class Stream:
         # lifetime totals
         self.total_packets = 0
         self.total_bytes = 0
-        self.delay_stats = RunningStats()
+        self.delay_stats = WinStats()
         self.dscp_stats = defaultdict(DscpStats)
         self.last_dscp = 0                # DSCP of the most recent packet
         self.cast = ''                    # MC / UC / BC of the most recent packet
+        self.conn = None                  # TCP: the connection this stream arrives on
 
         # interval counters (reset after each summary)
         self.iv_packets = 0
@@ -1313,6 +1751,29 @@ class Stream:
         return 'MISORDER', 0
 
 
+class _TcpListener:
+    __slots__ = ('sock', 'port')
+
+    def __init__(self, sock, port):
+        self.sock, self.port = sock, port
+
+
+class _TcpConn:
+    """One TCP connection of a sender stream (receiver side)."""
+    __slots__ = ('sock', 'ip', 'peer_port', 'port', 'local_raw', 'dscp', 'size', 'rest',
+                 'since', 'msgs', 'syn_dscp')
+
+    def __init__(self, sock, ip, peer_port, port, local_raw, syn_dscp):
+        self.sock, self.ip, self.peer_port, self.port = sock, ip, peer_port, port
+        self.local_raw = local_raw
+        self.syn_dscp = syn_dscp          # DSCP of the SYN (Linux), else None
+        self.dscp = syn_dscp or 0
+        self.size = 0                     # message size, 0 = hello not received yet
+        self.rest = b''                   # incomplete message from the previous read
+        self.since = time.monotonic()
+        self.msgs = 0
+
+
 class PacketReceiver:
     MAX_STREAMS = len(_STREAM_LABELS)   # more distinct senders are counted, not tracked
     _DUP_WINDOW = 4096       # packets remembered for duplicate detection
@@ -1320,7 +1781,8 @@ class PacketReceiver:
     def __init__(self, group, port, interface=None, log_file=None,
                  summary_interval=None, sync=None, unicast_mode=False,
                  summary_compact=False, verify_all=False, show_ip=False,
-                 live=None, print_limit=PKT_LINE_LIMIT):
+                 live=None, print_limit=PKT_LINE_LIMIT, tcp=True, tcp_rcvbuf=0,
+                 tcp_read_rate=0.0, tcp_read_on=0.0, tcp_read_off=0.0):
         self.live = live          # LiveView or None
         self.show_ip = show_ip
         self.groups = parse_groups(group) if group else []
@@ -1357,7 +1819,15 @@ class PacketReceiver:
         self._warned_limit = False
         # receiver overload: kernel queue drops (Linux) / never caught up
         self.kdrops = {}              # port -> running drop counter of that socket
+        self._anc_cache = {}          # ancillary data -> decoded (non-Linux)
+        self._nd_val = None           # macOS/BSD: system-wide 'full socket buffers' counter
+        self._nd_base = None
+        self._nd_at = 0.0
+        self._nd_busy = False
         self._kd_seen = 0
+        self._kd_off = 0              # drops before the last reset (and drops of other programs, macOS)
+        self._sys_seen = 0            # system-wide counter value at the last check (macOS/BSD)
+        self._hk_pk = 0               # packets seen at the last check
         self._kd_at = 0.0             # when drops were last seen
         self._kd_recent = 0           # drops since the last report
         self.kdrops_total_seen = 0
@@ -1392,6 +1862,17 @@ class PacketReceiver:
         if log_file:
             self.start_csv(log_file)
 
+        self.tcp_enabled = bool(tcp)
+        self.tcp_rcvbuf = int(tcp_rcvbuf or 0)        # KB; 0 = system default (autotuning)
+        # slow reader: the TCP data is read at a limited rate and / or with pauses; the receive
+        # buffer fills, the window announced to the sender shrinks up to zero
+        self.tcp_read_rate = float(tcp_read_rate or 0)                 # Mbit/s, 0 = unlimited
+        self.tcp_read_on = float(tcp_read_on or 0)                     # read for N s ...
+        self.tcp_read_off = float(tcp_read_off or 0)                   # ... then do not read for N s
+        self._rd_lim = self.tcp_read_rate > 0 or (self.tcp_read_on > 0 and self.tcp_read_off > 0)
+        self._rd_blocked = set()                                       # sockets taken out of the select
+        self._rd_tok = 0.0
+        self._rd_last = self._rd_t0 = time.monotonic()
         try:
             self._setup_sockets()
         except OSError:
@@ -1406,6 +1887,7 @@ class PacketReceiver:
     def start_csv(self, path):
         """Start (or restart) the CSV log; OSError if the file cannot be created."""
         f = open(str(path), 'w', newline='', buffering=8192)
+        _give_back(path)
         self.stop_csv()
         self.csv_file, self.log_file = f, path
         self.csv_writer = csv.writer(f)
@@ -1437,6 +1919,13 @@ class PacketReceiver:
         and skipped as long as at least one works."""
         self.socks = {}
         failed = []
+        # TCP streams (listener on every data port, same number as the UDP port)
+        self._sel = selectors.DefaultSelector()
+        self.tcp_listeners = []
+        self.tcp_conns = {}               # socket -> _TcpConn
+        self.tcp_accepted = 0
+        self.tcp_foreign = 0              # connections that did not start with our hello
+        self.tcp_problems = []
         first_err = None
         for port in self.ports:
             try:
@@ -1453,10 +1942,12 @@ class PacketReceiver:
             print(f"{Colors.YELLOW}⚠ Could not open port(s) {format_ports(failed)}: "
                   f"{first_err} - continuing with {format_ports(self.ports)}{Colors.ENDC}")
         self.sock = next(iter(self.socks))   # first socket (single-port fast path)
+        if self.tcp_enabled:
+            self._setup_tcp()
 
 
     def _setup_socket(self, port):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock = _udp_socket()
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         # SO_REUSEPORT allows multiple processes to bind to the same port.
@@ -1558,8 +2049,24 @@ class PacketReceiver:
         """Pull DSCP, the kernel RX timestamp and the destination type out of
         one recvmsg() ancillary-data list. Returns (dscp, rx_ns, cast, ovfl) -
         rx_ns is None if SO_TIMESTAMPNS isn't available/enabled, cast is ''
-        if the destination address is not reported (Windows), ovfl is the
+        if the destination address is not reported, ovfl is the
         kernel's running count of datagrams dropped on this socket (Linux)."""
+        if _ANC_CACHE_OK:
+            # no timestamps / drop counters on this platform: the ancillary data of
+            # a stream is always the same (TOS + destination) - decode it once
+            key = tuple(ancillary)
+            hit = self._anc_cache.get(key)
+            if hit is not None:
+                self._dst_raw = hit[2]
+                return hit[0], None, hit[1], None
+            res = self._extract_ancillary_slow(ancillary)
+            if len(self._anc_cache) > 256:
+                self._anc_cache.clear()
+            self._anc_cache[key] = (res[0], res[2], self._dst_raw)
+            return res
+        return self._extract_ancillary_slow(ancillary)
+
+    def _extract_ancillary_slow(self, ancillary):
         dscp = 0
         rx_ns = None
         cast = ''
@@ -1581,6 +2088,8 @@ class PacketReceiver:
         return dscp, rx_ns, cast, ovfl
 
     # -- streams -----------------------------------------------------------
+    _cur_conn = None                      # TCP connection whose messages are being processed (None: UDP)
+
     def _stream_for(self, src_ip, sync_port, sid, packet, port=0):
         """Stream of a packet; a new one is created (or a silent one taken over by
         a restarted sender) after a full check (CRC + padding). None if the packet
@@ -1600,11 +2109,14 @@ class PacketReceiver:
         now = time.monotonic()
         cands = self._ep.get((src_ip, port), ())
         for st in sorted(cands, key=lambda s: -s.last_rx):
+            if st.conn is not None and st.conn.sock in self.tcp_conns:
+                continue                           # its TCP connection is still open: not a restarted sender
             silent, limit = st.silent_for(now)
             if silent > limit:                     # the sender started it again
                 self._retired.add((src_ip, port, st.sid))
                 self._alias.pop((src_ip, port, st.sid), None)
                 st.rebind(sid)
+                st.conn = self._cur_conn
                 self._alias[key] = st
                 if sync_port != st.sync_port:
                     st.sync_port = sync_port
@@ -1626,6 +2138,7 @@ class PacketReceiver:
         sync_port_used = self.sync.override_port or sync_port
         slot = self.sync.slot_for(src_ip, sync_port)
         stream = Stream(label, src_ip, sync_port, slot, port, self.port_col, sid)
+        stream.conn = self._cur_conn
         self.streams[key] = stream
         self._alias[key] = stream
         self._ep.setdefault((src_ip, port), []).append(stream)
@@ -1765,7 +2278,7 @@ class PacketReceiver:
         print(f"{time_str}{lab} | Seq:{pkt.seq:6d} | Size:{pkt.packet_size:5d} "
               f"| DSCP:{dscp_to_name(pkt.dscp):6s}| "
               f"{delay_str} | {sc}{status:5s}{Colors.ENDC} "
-              f"| Loss:{s.loss_pct():6.2f}%")
+              f"| Loss:{('-' if s.cast == 'TCP' else format(s.loss_pct(), '6.2f') + '%'):>7s}")      # TCP delivers everything: no loss
 
     # -- live view: pick the widest line format that fits the terminal ---------
     def _live_level(self, kind):
@@ -1900,7 +2413,7 @@ class PacketReceiver:
             dly = f"{s.iv_delay.avg:.2f}" if s.iv_delay.count > 0 else "n/a"
             print(f"{lab}{range_str[1:]} {iv_throughput:6.2f}M "
                   f"{dscp_to_name(top_dscp):<6s} {sc}{status:<5s}{Colors.ENDC} "
-                  f"P:{s.iv_packets:8d} L:{s.iv_missing:6d} Dly:{dly}")
+                  f"P:{s.iv_packets:8d} L:{'-' if s.cast == 'TCP' else s.iv_missing:>6} Dly:{dly}")
         elif lvl == 'compact':
             # compact: no timestamp, no size, short DSCP, short delay
             dly_str = f"Dly:{s.iv_delay.avg:.2f}" if s.iv_delay.count > 0 else "Dly:n/a"
@@ -1909,7 +2422,7 @@ class PacketReceiver:
                   f"| {dscp_to_name(top_dscp):6s}"
                   f"| {sc}{status:4s}{Colors.ENDC} "
                   f"| Pkt:{s.iv_packets:9d} "
-                  f"| LPkt:{s.iv_missing:7d} "
+                  f"| LPkt:{'-' if s.cast == 'TCP' else s.iv_missing:>7} "
                   f"| {dly_str}")
         else:
             print(f"{time_str} | {lab}{range_str} "
@@ -1918,7 +2431,7 @@ class PacketReceiver:
                   f"| DSCP:{dscp_to_name(top_dscp):6s}"
                   f"| {sc}{status:6s}{Colors.ENDC} "
                   f"| Pkt:{s.iv_packets:9d} "
-                  f"| Loss:{iv_loss_pct:5.2f}% Pkt:{s.iv_missing:6d} "
+                  f"| Loss:{('-' if s.cast == 'TCP' else format(iv_loss_pct, '5.2f') + '%'):>6s} Pkt:{'-' if s.cast == 'TCP' else s.iv_missing:>6} "
                   f"| {delay_str}")
 
         # reset interval counters
@@ -1959,6 +2472,14 @@ class PacketReceiver:
         self.iv_start_time = now
         self.last_summary_time = now
         self.sync.reset_assignment()
+        # RX OVERLOAD counter: start from zero as well
+        self._kd_off = sum(self.kdrops.values())
+        self._sys_seen = self.kdrops.get('sys', 0)
+        self._hk_pk = 0
+        self._kd_seen = 0
+        self._kd_recent = 0
+        self._kd_at = 0.0
+        self.kdrops_total_seen = 0
 
     def _ignored_text(self):
         parts = []
@@ -1990,6 +2511,8 @@ class PacketReceiver:
 
         for s in self.streams.values():
             self._print_stream_final(s, elapsed)
+        if _ANC_CACHE_OK and sys.platform != 'win32':
+            self._poll_sysdrops()                 # final, synchronous reading
         self.health()
         if self.kdrops_total_seen:
             print(f"{Colors.RED}⚠ Receiver overload: the local kernel dropped "
@@ -2036,6 +2559,193 @@ class PacketReceiver:
                   f"min {d.minimum:+.2f}ms, max {d.maximum:+.2f}ms){Colors.ENDC}")
         print(f"{g}╚═════════════════════════════════════════════════════{Colors.ENDC}\n")
 
+    # -- TCP -------------------------------------------------------------------
+    def _setup_tcp(self):
+        """Listening socket on every data port. A port that is taken is reported
+        (banner) and skipped, UDP keeps working."""
+        for port in self.ports:
+            ls = None
+            try:
+                ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                if sys.platform != 'win32':
+                    ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if self.tcp_rcvbuf:               # inherited by the accepted connections: limits the announced window
+                    try:
+                        ls.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.tcp_rcvbuf * 1024)
+                    except OSError as e:
+                        self.tcp_problems.append(f"TCP receive buffer: {e.strerror or e}")
+                if sys.platform.startswith('linux'):
+                    try:
+                        ls.setsockopt(socket.IPPROTO_TCP, _TCP_SAVE_SYN, 1)
+                    except OSError:
+                        pass
+                ls.bind((self.own_ip if self.unicast_mode else '', port))
+                ls.listen(64)
+                ls.setblocking(False)
+                self._sel.register(ls, selectors.EVENT_READ, _TcpListener(ls, port))
+                self.tcp_listeners.append(ls)
+            except OSError as e:
+                if ls is not None:
+                    ls.close()
+                self.tcp_problems.append(f"TCP port {port}: {e.strerror or e}")
+
+    def tcp_text(self):
+        """Short status for banners / status bars ('' = TCP not in use)."""
+        if not self.tcp_listeners:
+            return ''
+        return f"TCP {len(self.tcp_conns)} conn"
+
+    def _tcp_accept(self, lst):
+        for _ in range(16):
+            try:
+                c, addr = lst.sock.accept()
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                return
+            if len(self.tcp_conns) >= 256:
+                c.close()
+                continue
+            try:
+                c.setblocking(False)
+                c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                syn_dscp = None
+                if sys.platform.startswith('linux'):
+                    try:
+                        syn = c.getsockopt(socket.IPPROTO_TCP, _TCP_SAVED_SYN, 512)
+                        if len(syn) >= 20 and syn[0] >> 4 == 4:
+                            syn_dscp = syn[1] >> 2
+                    except OSError:
+                        pass
+                conn = _TcpConn(c, addr[0], addr[1], lst.port,
+                                socket.inet_aton(c.getsockname()[0]), syn_dscp)
+                self._sel.register(c, selectors.EVENT_READ, conn)
+                self.tcp_conns[c] = conn
+                self.tcp_accepted += 1
+            except OSError:
+                c.close()
+
+    def _tcp_budget(self):
+        """Bytes the TCP connections may read now (slow reader); 0 = not now."""
+        if not self._rd_lim:
+            return 262144
+        now = time.monotonic()
+        on, off = self.tcp_read_on, self.tcp_read_off
+        if on > 0 and off > 0 and (now - self._rd_t0) % (on + off) >= on:
+            self._rd_last = now
+            return 0
+        rate = self.tcp_read_rate * 125000.0
+        if rate > 0:
+            self._rd_tok = min(self._rd_tok + (now - self._rd_last) * rate, max(rate * 0.1, 16384.0))
+            self._rd_last = now
+            b = int(self._rd_tok)
+            return min(262144, b) if b >= 1024 else 0
+        return 262144
+
+    def _tcp_block(self, conn):
+        """No reading now: take the socket out of the select (no busy loop)."""
+        if conn.sock in self._rd_blocked:
+            return
+        self._rd_blocked.add(conn.sock)
+        try:
+            self._sel.unregister(conn.sock)
+        except (KeyError, ValueError, OSError):
+            pass
+
+    def _tcp_unblock(self):
+        if not self._rd_blocked or self._tcp_budget() <= 0:
+            return
+        for sk in list(self._rd_blocked):
+            if sk in self.tcp_conns:
+                try:
+                    self._sel.register(sk, selectors.EVENT_READ, self.tcp_conns[sk])
+                except (KeyError, ValueError, OSError):
+                    pass
+        self._rd_blocked.clear()
+
+    def _tcp_close(self, conn):
+        self._rd_blocked.discard(conn.sock)
+        try:
+            self._sel.unregister(conn.sock)
+        except (KeyError, ValueError, OSError):
+            pass
+        self.tcp_conns.pop(conn.sock, None)
+        try:
+            conn.sock.close()
+        except OSError:
+            pass
+
+    def _tcp_read(self, conn):
+        """Read what the connection has and hand every complete message to _process."""
+        process = self._process
+        lim = self._rd_lim
+        for _ in range(8):               # bounded: UDP and the other connections must not starve
+            want = self._tcp_budget() if lim else 262144
+            if not want:
+                self._tcp_block(conn)    # slow reader: leave the data in the kernel buffer
+                return
+            try:
+                data = conn.sock.recv(want)
+            except (BlockingIOError, InterruptedError):
+                self.last_empty = time.monotonic()      # drained: not "at the limit"
+                return
+            except OSError:
+                self._tcp_close(conn)
+                return
+            if not data:
+                self._tcp_close(conn)
+                return
+            got = len(data)
+            if lim and self.tcp_read_rate > 0:
+                self._rd_tok -= got
+            if conn.rest:
+                data = conn.rest + data
+            n = len(data)
+            off = 0
+            if not conn.size:            # hello first
+                if n < _TCP_HELLO.size:
+                    if n >= 4 and data[:4] != _TCP_MAGIC:
+                        self.tcp_foreign += 1
+                        self._tcp_close(conn)
+                        return
+                    conn.rest = data
+                    continue
+                magic, ver, dscp, _fl, size, _rs = _TCP_HELLO.unpack_from(data, 0)
+                if (magic != _TCP_MAGIC or ver != _TCP_VERSION
+                        or not _MIN_PACKET_SIZE <= size <= TCP_MAX_MSG):
+                    self.tcp_foreign += 1
+                    self._tcp_close(conn)
+                    return
+                conn.size = size
+                if conn.syn_dscp is None:
+                    conn.dscp = dscp & 0x3F      # announced by the sender (no way to see the SYN here)
+                off = _TCP_HELLO.size
+            size = conn.size
+            self._dst_raw = conn.local_raw
+            ip, port, dscp = conn.ip, conn.port, conn.dscp
+            self._cur_conn = conn
+            while off + size <= n:
+                process(data[off:off + size], ip, dscp, None, port, 'TCP')
+                off += size
+                conn.msgs += 1
+            self._cur_conn = None
+            conn.rest = data[off:] if off < n else b''
+            if got < want:
+                if want == 262144:
+                    self.last_empty = time.monotonic()
+                return
+
+    def _tcp_cleanup(self):
+        for conn in list(self.tcp_conns.values()):
+            self._tcp_close(conn)
+        for ls in self.tcp_listeners:
+            try:
+                self._sel.unregister(ls)
+            except (KeyError, ValueError, OSError):
+                pass
+            ls.close()
+        self.tcp_listeners = []
+
     def receive_loop(self):
         """Main receive loop (only one receiver may run per program)."""
         with _RX_LOCK:
@@ -2072,6 +2782,10 @@ class PacketReceiver:
                 print(f"{Colors.GREEN}║   Ports: {format_ports(self.ports)} ({len(self.ports)}){Colors.ENDC}")
             else:
                 print(f"{Colors.GREEN}║   Port: {self.port:<33}{Colors.ENDC}")
+            if self.tcp_listeners:
+                print(f"{Colors.GREEN}║   TCP: listening on the same port(s){Colors.ENDC}")
+            for problem in self.tcp_problems:
+                print(f"{Colors.YELLOW}║   ⚠ {problem}{Colors.ENDC}")
             print(f"{Colors.GREEN}║   OWD Sync: {sync_status}{Colors.ENDC}")
             if self.verify_all:
                 print(f"{Colors.GREEN}║   Verify: CRC + pattern of every packet{Colors.ENDC}")
@@ -2096,9 +2810,30 @@ class PacketReceiver:
 
         try:
             if len(self.socks) == 1:
-                # single port: one recvmsg per packet (fastest path)
+                # single port: one recvmsg per packet (fastest path); TCP
+                # (listener + connections) is looked at every 256 packets and
+                # whenever the UDP queue is empty
                 sock = self.sock
-                recvmsg = sock.recvmsg
+                tcp_on = bool(self.tcp_listeners)
+                tcp_n = 0
+
+                def tcp_service(wait):
+                    fds = self.tcp_listeners + [c for c in self.tcp_conns if c not in self._rd_blocked]
+                    rd = select.select(fds + [sock] if wait else fds, [], [], wait)[0]
+                    for fd in rd:
+                        if fd is sock:
+                            continue
+                        try:
+                            data = self._sel.get_key(fd).data
+                        except (KeyError, ValueError):
+                            continue
+                        if data.__class__ is _TcpListener:
+                            self._tcp_accept(data)
+                        else:
+                            self._tcp_read(data)
+                    return bool(rd)
+
+                recvmsg = _fast_recvmsg(sock)
                 recvfrom = sock.recvfrom
                 port = self.port
                 while True:
@@ -2114,29 +2849,48 @@ class PacketReceiver:
                     except (BlockingIOError, socket.timeout):
                         # queue empty: wait for traffic, then tick
                         self.last_empty = time.monotonic()
-                        if not select.select([sock], [], [], timeout)[0]:
+                        if tcp_on:
+                            self._tcp_unblock()
+                            if not tcp_service(timeout if not self.tcp_conns else 0.05):
+                                self.last_empty = time.monotonic()
+                                self._idle()
+                        elif not select.select([sock], [], [], timeout)[0]:
                             self.last_empty = time.monotonic()   # waited: not saturated
                             self._idle()
                         continue
                     process(packet, addr[0], dscp, rx_ns, port, cast)
+                    if tcp_on:
+                        tcp_n += 1
+                        if not tcp_n & 255:
+                            self._tcp_unblock()
+                            tcp_service(0)
             else:
-                # port range / list: one socket per port, multiplexed
-                sel = selectors.DefaultSelector()
+                # port range / list / TCP: one socket per port, multiplexed
+                sel = self._sel
+                nb = 32 if len(self.socks) <= 8 else 8
+                rxfn = {sk: _fast_recvmsg(sk, nb) for sk in self.socks}
                 for sk, prt in self.socks.items():
                     sel.register(sk, selectors.EVENT_READ, prt)
                 while True:
-                    events = sel.select(timeout)
+                    events = sel.select(0.02 if self._rd_blocked else timeout)
+                    self._tcp_unblock()
                     if not events:
                         self.last_empty = time.monotonic()       # waited: not saturated
                         self._idle()
                         continue
                     for key, _mask in events:
                         sk, port = key.fileobj, key.data
+                        if port.__class__ is not int:       # TCP: listener or connection
+                            if port.__class__ is _TcpListener:
+                                self._tcp_accept(port)
+                            else:
+                                self._tcp_read(port)
+                            continue
                         # drain what is queued (bounded: the other ports must not starve)
                         for _ in range(32):
                             try:
                                 if use_recvmsg:
-                                    packet, ancillary, _flags, addr = sk.recvmsg(65535, 256)
+                                    packet, ancillary, _flags, addr = rxfn[sk](65535, 256)
                                     dscp, rx_ns, cast, ovfl = extract(ancillary)
                                     if ovfl is not None:
                                         kdrops[port] = ovfl
@@ -2159,9 +2913,29 @@ class PacketReceiver:
             self._live_stop()
             for sk in self.socks:
                 sk.close()
+            self._tcp_cleanup()
             if self.csv_file:
                 self.csv_file.close()
             self.sync.stop()
+
+    def _poll_sysdrops(self):
+        """macOS/BSD have no per-socket drop counter: read the system-wide UDP counter
+        'dropped due to full socket buffers' (netstat -s -p udp)."""
+        import subprocess
+        try:
+            out = subprocess.run(['netstat', '-s', '-p', 'udp'], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, universal_newlines=True,
+                                 timeout=5).stdout
+            m = re.search(r'(\d+)\s+dropped due to full socket buffers', out)
+            if m:
+                v = int(m.group(1))
+                if self._nd_base is None:
+                    self._nd_base = v
+                self._nd_val = v
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        finally:
+            self._nd_busy = False
 
     def health(self, now=None):
         """Receiver overload check. Returns (drops_since_last_call, saturated):
@@ -2169,7 +2943,22 @@ class PacketReceiver:
         whether the receive queue has not been empty for over a second (any OS).
         A packet dropped here shows up as loss, but it is not network loss."""
         now = time.monotonic() if now is None else now
-        total = sum(self.kdrops.values())
+        if _ANC_CACHE_OK and sys.platform != 'win32':
+            if now - self._nd_at >= 2.0 and not self._nd_busy:
+                self._nd_at, self._nd_busy = now, True
+                threading.Thread(target=self._poll_sysdrops, daemon=True).start()
+            if self._nd_val is not None and self._nd_base is not None:
+                self.kdrops['sys'] = max(0, self._nd_val - self._nd_base)
+        # The macOS counter is system-wide: drops of other programs' sockets must not be
+        # blamed on this receiver. Only count them while this receiver gets packets itself.
+        sysv = self.kdrops.get('sys', 0)
+        pk = (sum(st.total_packets for st in list(self.streams.values()))
+              + self.foreign_packets + self.corrupt_packets)
+        if sysv > self._sys_seen and pk == self._hk_pk:
+            self._kd_off += sysv - self._sys_seen
+        self._sys_seen = sysv
+        self._hk_pk = pk
+        total = max(0, sum(self.kdrops.values()) - self._kd_off)
         new = max(0, total - self._kd_seen)
         self._kd_seen = total
         self.kdrops_total_seen = total
@@ -2239,11 +3028,14 @@ class PacketReceiver:
         s = stream
         if cast:
             s.cast = cast
+            if cast == 'TCP':
+                size -= _UDP_IP_OVERHEAD         # a TCP message is the payload: no UDP/IP header added to it
         status, gap = s.check_order(seq)
         if self.multi:
             self._note_duplicate(s, PacketInfo(seq, delay_ms, size, dscp, s, ts_us, cast), rx_ns)
 
-        s.last_rx = time.monotonic()
+        now = time.monotonic()
+        s.last_rx = now
 
         # clamped (>=0) delay for on-screen stats/averages; the
         # raw, possibly-negative delay_ms still goes to CSV
@@ -2295,7 +3087,6 @@ class PacketReceiver:
 
         # display
         live = self.live
-        now = time.monotonic()
         paused = live is not None and live.paused
         if not self.summary_interval:
             if not paused:
@@ -2376,8 +3167,8 @@ class _WinQos:
                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         return r.returncode, (r.stdout + r.stderr).decode('utf-8', 'replace').strip()
 
-    def apply(self, dest, port, dscp):
-        """Mark UDP to dest:port with dscp. None on success, else a text for the user."""
+    def apply(self, dest, port, dscp, proto='UDP'):
+        """Mark UDP/TCP to dest:port with dscp. None on success, else a text for the user."""
         if not dscp and not self.names:
             return None
         if not self.is_admin():
@@ -2386,7 +3177,7 @@ class _WinQos:
         try:
             ip = socket.gethostbyname(dest)
             port, dscp = int(port), int(dscp)
-            name = f"{self.PREFIX}{ip}-{port}"
+            name = f"{self.PREFIX}{ip}-{port}" + ('-tcp' if proto == 'TCP' else '')
             exe = os.path.basename(sys.executable) or 'python.exe'
             with self.lock:
                 if not self.cleaned:
@@ -2403,7 +3194,7 @@ class _WinQos:
                     return None
                 code, out = self._ps(
                     rm + f"New-NetQosPolicy -Name '{name}' -PolicyStore ActiveStore -NetworkProfile All "
-                    f"-IPProtocolMatchCondition UDP -IPDstPrefixMatchCondition '{ip}/32' "
+                    f"-IPProtocolMatchCondition {proto} -IPDstPrefixMatchCondition '{ip}/32' "
                     f"-IPDstPortStartMatchCondition {port} -IPDstPortEndMatchCondition {port} "
                     f"-AppPathNameMatchCondition '{exe}' -DSCPAction {dscp} | Out-Null")
                 if code != 0:
@@ -2430,6 +3221,18 @@ class _WinQos:
 
 
 _WIN_QOS = _WinQos()
+
+
+_IFACE_WARN = "BC/MC: without Source address the OS may use the wrong interface - select it"
+
+
+def _needs_iface_hint(dst, src):
+    """True for a broadcast / multicast destination without a source address."""
+    if src or not dst:
+        return False
+    dst = str(dst).strip()
+    gi = _ip_to_int(dst)
+    return _is_broadcast(dst) or (gi is not None and 0xE0000000 <= gi <= 0xEFFFFFFF)
 
 
 def _create_send_socket(config, warn=None):
@@ -2463,6 +3266,21 @@ def _create_send_socket(config, warn=None):
             note(f"Could not select multicast interface: {e}")
 
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, config['ttl'])
+
+    # multicast / broadcast without a source address: the OS picks the interface
+    # from its routing table - with several interfaces that is often the wrong one
+    if not config['source_address']:
+        dst = config['destination_address']
+        gi = _ip_to_int(dst)
+        if _is_broadcast(dst) or (gi is not None and 0xE0000000 <= gi <= 0xEFFFFFFF):
+            try:
+                nics = [ip for ip, _n in local_ipv4_addresses() if not ip.startswith('127.')]
+            except Exception:
+                nics = []
+            if len(nics) > 1:
+                note("Multicast/broadcast without source address: the OS chooses the "
+                     "interface and may use the wrong one - select the source address "
+                     "(" + ', '.join(nics[:4]) + (', ...' if len(nics) > 4 else '') + ")")
 
     if sys.platform == 'win32':
         err = _WIN_QOS.apply(config['destination_address'], config['destination_port'],
@@ -2741,7 +3559,9 @@ SEND_MAX_STREAMS = 32      # streams in the sender (raise here if more are neede
 
 _STREAM_KEYS = ('destination_address', 'destination_port', 'packet_size',
                 'packets_per_second', 'source_address', 'source_port',
-                'dscp_value', 'ttl', 'burst_mbps', 'df_bit', 'burst_mode')
+                'dscp_value', 'ttl', 'burst_mbps', 'df_bit', 'burst_mode',
+                'protocol', 'connections', 'tcp_cc', 'tcp_sndbuf', 'tcp_mss', 'tcp_nodelay',
+                'tcp_on', 'tcp_off', 'tcp_recycle')
 
 
 def _stream_params(d=None):
@@ -2865,6 +3685,17 @@ class SendStream:
         self._gen = 0
         self._halt = False
         self._thread = None
+        self._hist = []                   # [t, Mbit/s, pps, send errors total] per second (all streams)
+        self._hist_t0 = 0.0
+        self._tcp_ids = {}                # connection index -> [stream id, next seq]: survives a change of the settings
+        self._tcp_stats = {}              # connection index -> _tcp_info() dict (TCP streams)
+        self._tcp_base = {}               # connection index -> retransmit count at the last statistics reset
+        self._tcp_conn_ms = {}            # connection index -> handshake time (ms) of the last connect
+        self._tcp_hist = []               # one sample per second, see _tcp_point()
+        self._tcp_t0 = 0.0
+        self._tcp_reconnects = 0
+        self._tcp_up = 0                  # established connections
+        self._tcp_lock = threading.Lock()
 
     # -- control -------------------------------------------------------------
     def params(self):
@@ -2888,6 +3719,16 @@ class SendStream:
         self.error = ''
         self.notes = []
         self.sid = _new_stream_id()           # a new run of the stream = a new stream id
+        self._hist = []
+        self._hist_t0 = 0.0
+        self._tcp_ids = {}
+        self._tcp_stats = {}
+        self._tcp_base = {}
+        self._tcp_conn_ms = {}
+        self._tcp_hist = []
+        self._tcp_t0 = 0.0
+        self._tcp_reconnects = 0
+        self._tcp_up = 0
         self.state = 'running'
         self._samp = (self.sent, self.bytes, time.monotonic())
         self._thread = threading.Thread(target=self._run, daemon=True, name='send-stream')
@@ -2933,13 +3774,50 @@ class SendStream:
         if self.state == 'running':
             self.rate_pps = (self.sent - sent0) / dt
             self.rate_mbps = (self.bytes - bytes0) * 8 / (dt * 1e6)
+            if not self._hist_t0:
+                self._hist_t0 = now
+            if not self._hist or now - self._hist_t0 - self._hist[-1][0] >= 0.95:
+                self._hist.append([round(now - self._hist_t0, 1), round(self.rate_mbps, 2),
+                                   round(self.rate_pps, 1), self.errors])
+                del self._hist[:-900]
         else:
             self.rate_pps = self.rate_mbps = 0.0
         self._samp = (self.sent, self.bytes, now)
 
     # -- worker --------------------------------------------------------------
     def _note(self, text):
-        self.notes.append(text)
+        if text not in self.notes:
+            self.notes.append(text)
+
+    def reset_stats(self):
+        """Zero the statistics (counters, history, TCP values); the sequence numbers and the
+        running stream are not touched."""
+        with self._tcp_lock:
+            self.sent = 0
+            self.bytes = 0
+            self.errors = 0
+            self.error = ''
+            self.notes = []
+            self.rate_pps = self.rate_mbps = 0.0
+            self._samp = (0, 0, time.monotonic())
+            self._hist = []
+            self._hist_t0 = 0.0
+            self._tcp_hist = []
+            self._tcp_t0 = 0.0
+            self._tcp_reconnects = 0
+            # the kernel counts retransmits per connection since connect: remember the value now
+            self._tcp_base = {i: x['retrans'] for i, x in self._tcp_stats.items()}
+
+    ERROR_SHOW = 8.0                   # seconds a transient error message stays visible
+
+    def error_text(self):
+        """Error message for the views: a stream that stopped on an error keeps it,
+        a transient one (send error, reconnect) disappears after a few seconds."""
+        if not self.error:
+            return ''
+        if self.state == 'error' or time.monotonic() - self.error_at < self.ERROR_SHOW:
+            return self.error
+        return ''
 
     def _fail(self, e):
         self.errors += 1
@@ -2973,6 +3851,9 @@ class SendStream:
                     self.state = 'error'
                     return
                 self.notes = []
+                if p.get('protocol') == 'tcp':
+                    self._run_tcp(p, gen, dest)
+                    continue
                 sock = _open_send_socket(p, report=self._note)
                 if sock is None:
                     self._fail(self.notes[-1] if self.notes else 'cannot open the send socket')
@@ -3073,9 +3954,348 @@ class SendStream:
             body.release()
 
 
+    # -- TCP -----------------------------------------------------------------
+    def _run_tcp(self, p, gen, dest):
+        """TCP stream: one thread per connection; returns when the stream is
+        stopped or its parameters changed (then _run_streams starts it again)."""
+        n = max(1, int(p.get('connections') or 1))
+        if sys.platform == 'win32':
+            err = _WIN_QOS.apply(dest[0], dest[1], p['dscp_value'] or 0, 'TCP')
+            if err:
+                self._note(err)
+        self._tcp_stats = {}
+        self._tcp_up = 0
+        threads = []
+        for i in range(n):
+            t = threading.Thread(target=self._tcp_conn, args=(p, gen, dest, i, n),
+                                 daemon=True, name=f'send-tcp-{i}')
+            t.start()
+            threads.append(t)
+        while not self._halt and self._gen == gen and any(t.is_alive() for t in threads):
+            time.sleep(0.05)
+        for t in threads:
+            t.join(3.0)
+
+    def _tcp_connect(self, p, dest, size, n):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if p['source_address'] or (p['source_port'] and n == 1):
+                sock.bind((p['source_address'] or '', p['source_port'] if n == 1 else 0))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, p['ttl'])
+            if p.get('df_bit') and sys.platform == 'linux':        # force DF (IP_MTU_DISCOVER=10, IP_PMTUDISC_DO=2)
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, 10, 2)
+                except OSError as e:
+                    self._note(f"Could not set DF bit: {e}")
+            if sys.platform != 'win32' and p['dscp_value']:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, p['dscp_value'] << 2)
+                except OSError as e:
+                    self._note(f"Could not set DSCP: {e}")
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1 if p.get('tcp_nodelay', True) else 0)
+            if p.get('tcp_sndbuf'):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(p['tcp_sndbuf']) * 1024)
+                except OSError as e:
+                    self._note(f"Could not set the send buffer: {e}")
+            if p.get('tcp_mss') and sys.platform != 'win32':
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, int(p['tcp_mss']))
+                except OSError as e:
+                    self._note(f"Could not set the MSS: {e}")
+            if p.get('tcp_cc'):
+                if sys.platform.startswith('linux'):
+                    try:
+                        sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_CONGESTION', 13), p['tcp_cc'].encode())
+                    except OSError as e:
+                        self._note(f"Could not set the congestion control '{p['tcp_cc']}': {e.strerror or e}")
+                else:
+                    self._note('Congestion control per connection: Linux only')
+            lowat = {'linux': 25, 'darwin': 0x201}.get(sys.platform if sys.platform != 'linux2' else 'linux')
+            if lowat:                          # keep the unsent send queue short (see _tcp_send)
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, lowat, 32768)
+                except OSError:
+                    pass
+            sock.settimeout(3.0)
+            t0 = time.perf_counter()
+            sock.connect(dest)
+            ms = (time.perf_counter() - t0) * 1000.0
+            sock.sendall(_TCP_HELLO.pack(_TCP_MAGIC, _TCP_VERSION, p['dscp_value'] & 0x3F, 0, size, 0))
+            sock.setblocking(False)
+            return sock, ms
+        except BaseException:
+            sock.close()
+            raise
+
+    def _tcp_conn(self, p, gen, dest, idx, n):
+        size = p['packet_size']
+        with self._tcp_lock:                 # id and sequence of this connection index continue when the settings change
+            ids = self._tcp_ids.get(idx)
+            if ids is None:
+                ids = self._tcp_ids[idx] = [_new_stream_id() if idx else self.sid, 0]
+        sid = ids[0]
+        buf = _build_packet_buffer(size + _UDP_IP_OVERHEAD,
+                                   _advertised_sync_port(self.sync_server), sid)
+        seq = ids[1]
+        first = True
+        fails = 0
+        while not self._halt and self._gen == gen:
+            try:
+                sock, conn_ms = self._tcp_connect(p, dest, len(buf), n)
+            except OSError as e:
+                fails += 1
+                hint = ''
+                if getattr(e, 'errno', None) in (errno.ECONNREFUSED, 10061):
+                    hint = ' - no TCP listener (receiver started without TCP?)'
+                self._fail(f"TCP connect to {dest[0]}:{dest[1]}: {e}{hint}")
+                self._tcp_wait(gen, min(0.5 * fails, 3.0))
+                continue
+            fails = 0
+            self.error = ''                  # connected again: the old message is obsolete
+            with self._tcp_lock:
+                self._tcp_up += 1
+                self._tcp_conn_ms[idx] = conn_ms
+                self._tcp_base.pop(idx, None)         # new connection: its counter starts at 0
+                if not first:
+                    self._tcp_reconnects += 1
+            first = False
+            recycled = False
+            try:
+                seq = self._tcp_send(p, gen, sock, buf, idx, n, seq)
+                recycled = not self._halt and self._gen == gen      # returned by itself: planned reconnect
+            except OSError as e:
+                self._fail(f"TCP connection {idx + 1}: {e}")
+            finally:
+                with self._tcp_lock:
+                    self._tcp_up -= 1
+                    self._tcp_stats.pop(idx, None)
+                sock.close()
+                ids[1] = seq
+            self._tcp_wait(gen, 0.0 if recycled else 0.5)
+
+    def _tcp_wait(self, gen, secs):
+        end = time.monotonic() + secs
+        while not self._halt and self._gen == gen and time.monotonic() < end:
+            time.sleep(0.05)
+
+    def _tcp_send(self, p, gen, sock, buf, idx, n, seq):
+        """Send loop of one connection.  Messages are written in batches; the
+        rate of the stream is shared by its connections.  Returns the next
+        sequence number."""
+        msg = len(buf)
+        wire = msg + 52                       # approx. IP + TCP (with timestamps) headers
+        per = 64                              # messages that may be due at once (catching up)
+        chunk = max(1, 16384 // msg)          # messages stamped and written together
+        big = bytearray(msg * chunk)
+        for i in range(chunk):
+            big[i * msg:(i + 1) * msg] = buf
+        if p['burst_mode']:
+            pacing = p['burst_mbps'] > 0
+            interval = n * (wire * 8) / (p['burst_mbps'] * 1e6) if pacing else 0.0
+        else:
+            pacing = True
+            interval = n / max(p['packets_per_second'], 0.01)
+        pack_hdr = _HDR_STRUCT.pack_into
+        pack_crc = _CRC_STRUCT.pack_into
+        crc32 = zlib.crc32
+        crc_len = msg - _CRC_STRUCT.size
+        time_ns = time.time_ns
+        perf = time.perf_counter
+        view = memoryview(big)
+        next_t = perf()
+        info_t = 0.0
+        sleep = time.sleep
+        on_s, off_s = float(p.get('tcp_on') or 0), float(p.get('tcp_off') or 0)
+        cyc = on_s + off_s if on_s > 0 and off_s > 0 else 0.0     # burst / pause pattern
+        recycle = float(p.get('tcp_recycle') or 0)
+        t_start = perf()
+
+        def poll():
+            nonlocal info_t
+            now = perf()
+            if now - info_t > 1.0:
+                info_t = now
+                ti = _tcp_info(sock)
+                if ti:
+                    with self._tcp_lock:
+                        self._tcp_stats[idx] = ti
+                        if idx == 0:        # one history point per second
+                            self._tcp_point()
+
+        try:
+            while not self._halt and self._gen == gen:
+                if recycle and perf() - t_start >= recycle:
+                    return seq                      # all messages written: the caller opens a new connection
+                if cyc:
+                    ph = (perf() - t_start) % cyc
+                    if ph >= on_s:                  # pause: the connection stays idle
+                        poll()
+                        sleep(min(cyc - ph, 0.05))
+                        next_t = perf()
+                        continue
+                count = per
+                if pacing:
+                    now = perf()
+                    if now < next_t:
+                        rem = next_t - now
+                        sleep(min(rem, 0.05) if rem > 0.0005 else 0)
+                        continue
+                    if now - next_t > 1.0:
+                        next_t = now
+                    count = min(per, int((now - next_t) / interval) + 1)
+                # Messages are stamped just before they are written, and only while the kernel
+                # has room (TCP_NOTSENT_LOWAT): the delay then shows the network, not a
+                # send queue of our own host.
+                left = count
+                while left > 0:
+                    k = min(chunk, left)
+                    while not select.select([], [sock], [], 0)[1]:
+                        if self._halt or self._gen != gen:
+                            return seq
+                        select.select([], [sock], [], 0.2)
+                        poll()                      # blocked (zero window): keep the TCP values current
+                    seq0 = seq
+                    for i in range(k):
+                        o = i * msg
+                        pack_hdr(big, o, seq, time_ns() // 1000)
+                        pack_crc(big, o + crc_len, crc32(view[o:o + crc_len]))
+                        seq = (seq + 1) & 0xFFFFFFFF
+                    total = k * msg
+                    done = 0
+                    while done < total:
+                        if self._halt or self._gen != gen:
+                            return (seq0 + done // msg) & 0xFFFFFFFF      # messages not completely written are sent again
+                        try:
+                            done += sock.send(view[done:total])
+                        except (BlockingIOError, InterruptedError):
+                            select.select([], [sock], [], 0.2)
+                            poll()
+                    left -= k
+                with self._tcp_lock:
+                    self.sent += count
+                    self.bytes += count * wire
+                if pacing:
+                    next_t += interval * count
+                poll()
+        finally:
+            view.release()
+        return seq
+
+    def _retr_total(self, locked=False):
+        """Retransmits of all connections since the last statistics reset."""
+        if locked:
+            return sum(max(0, x['retrans'] - self._tcp_base.get(i, 0)) for i, x in self._tcp_stats.items())
+        with self._tcp_lock:
+            return sum(max(0, x['retrans'] - self._tcp_base.get(i, 0)) for i, x in self._tcp_stats.items())
+
+    def tcp_info(self):
+        """TCP values of the stream as a dict for the views (None for UDP streams)."""
+        if self.p.get('protocol') != 'tcp':
+            return None
+        with self._tcp_lock:
+            st = list(self._tcp_stats.values())
+            cms = [v for v in self._tcp_conn_ms.values() if v]
+            hist = [h[1] for h in self._tcp_hist]
+            d = {'up': self._tcp_up, 'n': int(self.p.get('connections') or 1), 'reconnects': self._tcp_reconnects,
+                 'connect': round(sum(cms) / len(cms), 2) if cms else None}
+        if st:
+            d['rtt'] = round(sum(x['rtt_ms'] for x in st) / len(st), 2)
+            d['retrans'] = self._retr_total()
+            d['cwnd'] = round(sum(x['cwnd'] for x in st) / len(st) / 1024)
+            sw = [x['snd_wnd'] for x in st if x.get('snd_wnd') is not None]
+            d['rwnd'] = round(sum(sw) / len(sw) / 1024) if sw else None
+            d['queue'] = round(sum(x.get('notsent', 0) for x in st) / 1024, 1)
+            x0 = st[0]
+            if x0.get('cc'):
+                d['cc'] = x0['cc']
+            if x0.get('mss'):
+                d['mss'] = x0['mss']
+            if x0.get('opts') is not None:
+                d['opts'] = ' '.join(n for bit, n in ((1, 'TS'), (2, 'SACK'), (4, 'WS'), (8, 'ECN')) if x0['opts'] & bit) or 'none'
+            ss = [x['ssthresh'] for x in st if x.get('ssthresh') is not None and x['ssthresh'] < 0x7fffffff * 1000]
+            d['ssthresh'] = round(sum(ss) / len(ss) / 1024) if ss else None      # None = not set yet (slow start)
+            if 'rto_ms' in x0:
+                d['rto'] = round(sum(x['rto_ms'] for x in st) / len(st))
+                d['lost'] = sum(x.get('lost', 0) for x in st)
+                d['reord'] = max(x.get('reord', 0) for x in st)
+                d['ca'] = _CA_NAMES[min(max(x.get('ca_state', 0) for x in st), 4)]
+            if any(x.get('pacing') is not None for x in st):
+                d['pacing'] = round(sum(x.get('pacing', 0) for x in st) * 8 / 1e6, 1)
+            if any(x.get('delivery') is not None for x in st):
+                d['delivery'] = round(sum(x.get('delivery', 0) for x in st) * 8 / 1e6, 1)
+        if len(hist) > 1:
+            d['rtt_min'], d['rtt_avg'], d['rtt_max'] = round(min(hist), 2), round(sum(hist) / len(hist), 2), round(max(hist), 2)
+        return d
+
+    def tcp_text(self):
+        """Short TCP status for the sender view ('' for UDP streams)."""
+        if self.p.get('protocol') != 'tcp':
+            return ''
+        n = int(self.p.get('connections') or 1)
+        with self._tcp_lock:
+            up = self._tcp_up
+            st = list(self._tcp_stats.values())
+            cms = [v for v in self._tcp_conn_ms.values() if v]
+            hist = [h[1] for h in self._tcp_hist]
+            rec = self._tcp_reconnects
+        txt = f"{up}/{n} conn"
+        cc = st[0].get('cc') if st else None
+        if cc:
+            txt += f"  cc {cc}"
+        if cms:
+            txt += f"  connect {sum(cms) / len(cms):.1f} ms"
+        if rec:
+            txt += f" ({rec} reconnects)"
+        if st:
+            rtt = sum(x['rtt_ms'] for x in st) / len(st)
+            ret = self._retr_total()
+            cw = sum(x['cwnd'] for x in st) / len(st)
+            txt += f"  RTT {rtt:.2f} ms"
+            if len(hist) > 1:
+                txt += f" (min {min(hist):.2f} avg {sum(hist) / len(hist):.2f} max {max(hist):.2f})"
+            txt += f"  retrans {ret}  cwnd {cw / 1024:.0f} KB"
+            sw = [x['snd_wnd'] for x in st if x.get('snd_wnd') is not None]
+            if sw:
+                txt += f"  rwnd {sum(sw) / len(sw) / 1024:.0f} KB"
+            nq = sum(x.get('notsent', 0) for x in st)
+            if nq:
+                txt += f"  queue {nq / 1024:.0f} KB"
+            if 'rto_ms' in st[0]:
+                txt += f"  RTO {sum(x['rto_ms'] for x in st) / len(st):.0f} ms"
+                lost = sum(x.get('lost', 0) for x in st)
+                if lost:
+                    txt += f"  lost {lost}"
+        return txt
+
+    def _tcp_point(self):
+        """One history sample (lock held): [t, rtt avg, rtt lowest, rtt highest, cwnd KB,
+        rwnd KB, queue KB, retransmits total, Mbit/s] over all connections."""
+        st = list(self._tcp_stats.values())
+        r = [x['rtt_ms'] for x in st]
+        n = len(st)
+        now = time.monotonic()
+        if not self._tcp_t0:
+            self._tcp_t0 = now
+        self._tcp_hist.append([round(now - self._tcp_t0, 1), round(sum(r) / n, 3), round(min(r), 3), round(max(r), 3),
+                               round(sum(x['cwnd'] for x in st) / n / 1024, 1),
+                               round(sum(x.get('snd_wnd', 0) for x in st) / n / 1024, 1),
+                               round(sum(x.get('notsent', 0) for x in st) / 1024, 1),
+                               self._retr_total(True), round(self.rate_mbps, 2)])
+        del self._tcp_hist[:-900]
+
+    def tcp_history(self):
+        """History for the web view: {'points': [...], 'connect_ms': ..., 'reconnects': ...}."""
+        with self._tcp_lock:
+            cms = [v for v in self._tcp_conn_ms.values() if v]
+            return {'points': list(self._tcp_hist), 'connect_ms': round(sum(cms) / len(cms), 2) if cms else 0,
+                    'reconnects': self._tcp_reconnects, 'text': ''}
+
+
 def parse_stream_spec(spec, defaults):
     """'dest:port[,pps=N][,size=N][,dscp=N|NAME][,ttl=N][,burst[=Mbit/s]]
-    [,src=IP][,sport=N][,df]' -> parameter dict (missing values from defaults)."""
+    [,src=IP][,sport=N][,df][,tcp][,conn=N]' -> parameter dict (missing values from defaults)."""
     parts = [x.strip() for x in spec.split(',') if x.strip()]
     if not parts:
         raise ValueError('empty stream specification')
@@ -3112,6 +4332,21 @@ def parse_stream_spec(spec, defaults):
                 p['source_port'] = int(val)
             elif key == 'df':
                 p['df_bit'] = (val.lower() not in ('0', 'off', 'no', 'false')) if eq else True
+            elif key == 'tcp':
+                p['protocol'] = 'udp' if (eq and val.lower() in ('0', 'off', 'no', 'false')) else 'tcp'
+            elif key in ('conn', 'connections'):
+                p['connections'] = int(val)
+                p['protocol'] = 'tcp'
+            elif key == 'cc':
+                p['tcp_cc'], p['protocol'] = val.lower(), 'tcp'
+            elif key == 'sndbuf':
+                p['tcp_sndbuf'], p['protocol'] = int(val), 'tcp'
+            elif key == 'mss':
+                p['tcp_mss'], p['protocol'] = int(val), 'tcp'
+            elif key == 'nagle':
+                p['tcp_nodelay'], p['protocol'] = False, 'tcp'
+            elif key in ('on', 'off', 'recycle'):
+                p['tcp_' + key], p['protocol'] = float(val), 'tcp'
             else:
                 raise ValueError(f"unknown option '{key}'")
         except KeyError:
@@ -3204,6 +4439,46 @@ def egress_mtu(dest, src=''):
     return res
 
 
+def _check_tcp_params(p):
+    """Problems of a TCP stream ('' = ok)."""
+    gi = _ip_to_int(str(p['destination_address']).strip())
+    if gi is not None and (0xE0000000 <= gi <= 0xEFFFFFFF or _is_broadcast(str(p['destination_address']).strip())):
+        return 'TCP needs a unicast destination (no multicast / broadcast)'
+    if not _MIN_PACKET_SIZE <= p['packet_size'] <= TCP_MAX_MSG:
+        return f"TCP message size must be {_MIN_PACKET_SIZE}-{TCP_MAX_MSG} bytes"
+    if not 1 <= int(p.get('connections') or 1) <= TCP_MAX_CONN:
+        return f"TCP connections must be 1-{TCP_MAX_CONN}"
+    cc = str(p.get('tcp_cc') or '').strip()
+    if cc:
+        if not sys.platform.startswith('linux'):
+            return 'the congestion control can only be chosen per connection on Linux'
+        avail = tcp_cc_available()
+        if cc not in avail:
+            return f"congestion control '{cc}' is not available (available: {', '.join(avail)})"
+    if int(p.get('tcp_sndbuf') or 0) and not 4 <= int(p['tcp_sndbuf']) <= 1048576:
+        return 'TCP send buffer must be 0 (default) or 4-1048576 KB'
+    if int(p.get('tcp_mss') or 0) and not 88 <= int(p['tcp_mss']) <= 9000:
+        return 'TCP MSS must be 0 (default) or 88-9000'
+    on, off, rec = (float(p.get(k) or 0) for k in ('tcp_on', 'tcp_off', 'tcp_recycle'))
+    if not (0 <= on <= 3600 and 0 <= off <= 3600 and 0 <= rec <= 86400):
+        return 'TCP send / pause time 0-3600 s, reconnect 0-86400 s'
+    if off > 0 and on <= 0:
+        return 'TCP pause needs a send time > 0'
+    if rec and rec < 1:
+        return 'TCP reconnect interval must be 0 (never) or at least 1 s'
+    if not p['burst_mode'] and not 0.01 <= p['packets_per_second'] <= 10_000_000:
+        return 'pps must be 0.01-10000000'
+    if not 0 <= p['dscp_value'] <= 63:
+        return 'DSCP must be 0-63'
+    if not 1 <= p['ttl'] <= 255:
+        return 'TTL must be 1-255'
+    if not 0 <= p['source_port'] <= 65535:
+        return 'source port must be 0-65535'
+    if p['source_address'] and not _ip_usable(p['source_address']):
+        return f"source address {p['source_address']} is not an address of this host"
+    return ''
+
+
 def check_stream_params(p, mtu=True):
     """'' if the stream parameters are usable, otherwise the problem.
     mtu: also limit the size to the MTU of the way to the destination."""
@@ -3211,6 +4486,8 @@ def check_stream_params(p, mtu=True):
         return 'destination required'
     if not 1 <= p['destination_port'] <= 65535:
         return 'destination port must be 1-65535'
+    if p.get('protocol', 'udp') == 'tcp':
+        return _check_tcp_params(p)
     lo = _MIN_PACKET_SIZE + _UDP_IP_OVERHEAD
     if not lo <= p['packet_size'] <= 65507:
         return f"size must be {lo}-65507"
@@ -3245,7 +4522,8 @@ def _validate_stream(streams, params, ignore=None):
             continue
         q = st.params()
         if (q['destination_port'] == params['destination_port']
-                and q['source_address'] == params['source_address']):
+                and q['source_address'] == params['source_address']
+                and q.get('protocol', 'udp') == params.get('protocol', 'udp')):
             return (f"Port {params['destination_port']} is already used by stream "
                     f"{i + 1} - a receiver would merge the two")
     return ''
@@ -3287,7 +4565,8 @@ def run_senders_plain(plist, sync_server):
     streams = [SendStream(p, sync_server) for p in plist[:SEND_MAX_STREAMS]]
     for i, st in enumerate(streams, 1):
         p = st.params()
-        print(f"{Colors.GREEN}Stream {i}: {p['destination_address']}:{p['destination_port']}  "
+        proto = (f"TCP x{p['connections']}  " if p.get('protocol') == 'tcp' else '')
+        print(f"{Colors.GREEN}Stream {i}: {proto}{p['destination_address']}:{p['destination_port']}  "
               f"{p['packet_size']} B  {st.mode_text()}  DSCP {p['dscp_value']} "
               f"({dscp_to_name(p['dscp_value'])})  TTL {p['ttl']}{Colors.ENDC}")
     sync = (f"port {sync_server.port}" if sync_server.active
@@ -3308,7 +4587,7 @@ def run_senders_plain(plist, sync_server):
                 last = now
                 for i, st in enumerate(streams, 1):
                     print(f"[{format_elapsed(now - start)}] stream {i}: {st.state_text():<8s} "
-                          f"{st.sent:>12,d} packets" + (f"  {st.error}" if st.error else ''))
+                          f"{st.sent:>12,d} packets" + (f"  {st.error_text()}" if st.error_text() else ''))
     except KeyboardInterrupt:
         pass
     finally:
@@ -3322,7 +4601,27 @@ def run_senders_plain(plist, sync_server):
 
 # --- Config (~/.mau/config.json) ----------------------------------------------
 
-CONFIG_DIR = Path.home() / '.mau'
+def _real_home():
+    """Home directory of the user who started mautg (also when it runs through sudo)."""
+    try:
+        if os.geteuid() == 0 and os.environ.get('SUDO_USER'):
+            import pwd
+            return Path(pwd.getpwnam(os.environ['SUDO_USER']).pw_dir)
+    except (AttributeError, KeyError, ImportError):
+        pass
+    return Path.home()
+
+
+def _give_back(path):
+    """Files created while running through sudo belong to the user who called sudo."""
+    try:
+        if os.geteuid() == 0 and os.environ.get('SUDO_UID'):
+            os.chown(str(path), int(os.environ['SUDO_UID']), int(os.environ.get('SUDO_GID', -1)))
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+CONFIG_DIR = _real_home() / '.mau'
 
 
 def _default_config():
@@ -3340,6 +4639,15 @@ def _default_config():
             'burst_mbps': 0,                 # 0 = unlimited
             'df_bit': False,
             'burst_mode': False,             # form menu: Normal / Burst
+            'protocol': 'udp',               # udp | tcp
+            'connections': 1,                # TCP: parallel connections of the stream
+            'tcp_cc': '',                    # TCP congestion control ('' = system default; Linux)
+            'tcp_sndbuf': 0,                 # TCP send buffer in KB (0 = system default / autotuning)
+            'tcp_mss': 0,                    # TCP maximum segment size (0 = system default)
+            'tcp_nodelay': True,             # TCP: send small messages at once (False = Nagle algorithm)
+            'tcp_on': 0.0,                   # TCP pattern: send for N seconds ... (0 = continuous)
+            'tcp_off': 0.0,                  # ... then pause for N seconds (idle connection: slow-start restart)
+            'tcp_recycle': 0.0,              # TCP: close and reconnect every N seconds (0 = never)
             'extra_streams': [],             # streams 2..N (sender live view), same keys as above
         },
         'recv': {
@@ -3352,6 +4660,11 @@ def _default_config():
             'group': '239.1.1.1',
             'interface': 'all',              # multicast join: all | auto | IP | interface name
             'print_limit': PKT_LINE_LIMIT,   # per-packet display: max lines/s (0 = unlimited)
+            'tcp': True,                     # also accept TCP streams on the data ports
+            'tcp_rcvbuf': 0,                 # TCP receive buffer in KB (0 = system default / autotuning)
+            'tcp_read_rate': 0.0,            # slow reader: TCP read rate in Mbit/s (0 = unlimited)
+            'tcp_read_on': 0.0,              # slow reader: read for N seconds ...
+            'tcp_read_off': 0.0,             # ... then do not read for N seconds
             'port': '5001-5008',             # port, range or list
             'summary': 2,                    # seconds, 0 = per-packet display
             'compact': False,
@@ -3381,12 +4694,16 @@ def load_config():
 
 def save_config(cfg):
     """Persist config to disk."""
+    new_dir = not CONFIG_DIR.exists()
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if new_dir:
+        _give_back(CONFIG_DIR)
     try:
         clean = {k: ({kk: vv for kk, vv in v.items() if not kk.startswith('_')}
                      if isinstance(v, dict) else v) for k, v in cfg.items()}
         with open(CONFIG_DIR / 'config.json', 'w') as f:
             json.dump(clean, f, indent=2)
+        _give_back(CONFIG_DIR / 'config.json')
     except OSError as e:
         print(f"{Colors.RED}✗ Config save error: {e}{Colors.ENDC}")
 
@@ -3740,6 +5057,11 @@ def _make_receiver(rc, log_file, sync, view):
         unicast_mode=rc['unicast'],
         live=view,
         print_limit=rc.get('print_limit', PKT_LINE_LIMIT),
+        tcp=rc.get('tcp', True),
+        tcp_rcvbuf=int(rc.get('tcp_rcvbuf') or 0),
+        tcp_read_rate=float(rc.get('tcp_read_rate') or 0),
+        tcp_read_on=float(rc.get('tcp_read_on') or 0),
+        tcp_read_off=float(rc.get('tcp_read_off') or 0),
     )
 
 
@@ -4227,8 +5549,10 @@ class LiveView:
                     vals = {
                         'st': s.label, 'src': s.ip, 'port': s.port, 'cast': s.cast or '--',
                         'pk': _short(s.total_packets, 8),
-                        'loss': f"{loss:.2f}" if loss < 100 else "100",
-                        'miss': _short(s.total_missing, 5), 'cons': _short(s.max_gap, 5), 'ord': _short(s.total_misorder, 3),
+                        'loss': '-' if s.cast == 'TCP' else (f"{loss:.2f}" if loss < 100 else "100"),
+                        'miss': '-' if s.cast == 'TCP' else _short(s.total_missing, 5),
+                        'cons': '-' if s.cast == 'TCP' else _short(s.max_gap, 5),
+                        'ord': '-' if s.cast == 'TCP' else _short(s.total_misorder, 3),
                         'avg': self._fmt_dly(s.delay_stats, 'avg'),
                         'min': self._fmt_dly(s.delay_stats, 'min'),
                         'max': self._fmt_dly(s.delay_stats, 'max'),
@@ -4323,7 +5647,7 @@ class LiveView:
 class _Field:
     def __init__(self, label, kind, get=None, set=None, choices=(), lo=None,
                  hi=None, enabled=None, show=None, action=None, check=None,
-                 on_change=None, items=None, cast=None, title=''):
+                 on_change=None, items=None, cast=None, title='', hide=None):
         self.label = label
         self.kind = kind          # text int float bool choice button sep
         self.get = get
@@ -4339,13 +5663,17 @@ class _Field:
         self.items = items        # pick: callable -> [(label, value)]
         self.cast = cast          # pick: manual text -> value
         self.title = title
+        self.hide = hide          # callable -> True: the row is not shown
+
+    def is_hidden(self):
+        return self.hide is not None and bool(self.hide())
 
     def is_enabled(self):
         return self.enabled is None or self.enabled()
 
     @property
     def selectable(self):
-        return self.kind != 'sep' and self.is_enabled()
+        return self.kind != 'sep' and self.is_enabled() and not self.is_hidden()
 
 
 def _dict_field(label, kind, d, key, **kw):
@@ -4500,6 +5828,11 @@ class TUI:
         return items
 
     @staticmethod
+    def _cc_items():
+        return [(f"{n or 'default':<10s} {t if not n else _CC_INFO.get(n, 'kernel module')}", n)
+                for n, t in tcp_cc_options()]
+
+    @staticmethod
     def _source_items():
         items = [("any            let the OS choose", "")]
         for ip, name in local_ipv4_addresses():
@@ -4510,6 +5843,7 @@ class TUI:
     def _sender_page(self):
         sc = _StreamProxy(self)
         burst = lambda: bool(sc.get('burst_mode'))
+        is_tcp = lambda: sc.get('protocol') == 'tcp'
         return [
             _Field('Stream', 'text', lambda: self.send_idx,
                    lambda v: None, enabled=lambda: False,
@@ -4519,6 +5853,24 @@ class TUI:
             _dict_field('Destination', 'text', sc, 'destination_address',
                         check=lambda t: '' if t.strip() else 'Destination required'),
             _dict_field('Destination port', 'int', sc, 'destination_port', lo=1, hi=65535),
+            _Field('Protocol', 'choice', lambda: 'TCP' if is_tcp() else 'UDP',
+                   lambda v: sc.__setitem__('protocol', v.lower()), choices=['UDP', 'TCP']),
+            _dict_field('TCP connections', 'int', sc, 'connections', lo=1, hi=TCP_MAX_CONN,
+                        hide=lambda: not is_tcp()),
+            _dict_field('TCP congestion ctl', 'pick', sc, 'tcp_cc', items=self._cc_items,
+                        title='TCP congestion control', hide=lambda: not is_tcp(),
+                        show=lambda v: v or 'system default'),
+            _dict_field('TCP send buffer (KB)', 'int', sc, 'tcp_sndbuf', lo=0, hi=1048576,
+                        hide=lambda: not is_tcp(), show=lambda v: 'default' if not v else str(v)),
+            _dict_field('TCP MSS', 'int', sc, 'tcp_mss', lo=0, hi=9000,
+                        hide=lambda: not is_tcp(), show=lambda v: 'default' if not v else str(v)),
+            _dict_field('TCP no-delay', 'bool', sc, 'tcp_nodelay', hide=lambda: not is_tcp()),
+            _dict_field('TCP send for (s)', 'float', sc, 'tcp_on', lo=0, hi=3600,
+                        hide=lambda: not is_tcp(), show=lambda v: 'continuous' if not v else f"{v:g}"),
+            _dict_field('TCP then pause (s)', 'float', sc, 'tcp_off', lo=0, hi=3600,
+                        hide=lambda: not is_tcp() or not sc.get('tcp_on', 0) > 0, show=lambda v: 'none' if not v else f"{v:g}"),
+            _dict_field('TCP reconnect every (s)', 'float', sc, 'tcp_recycle', lo=0, hi=86400,
+                        hide=lambda: not is_tcp(), show=lambda v: 'never' if not v else f"{v:g}"),
             _dict_field('Packet size (bytes)', 'int', sc, 'packet_size',
                         lo=_MIN_PACKET_SIZE + _UDP_IP_OVERHEAD, hi=65507),
             _Field('Mode', 'choice', lambda: 'Burst' if burst() else 'Normal',
@@ -4533,7 +5885,8 @@ class TUI:
                         items=self._dscp_items, title='DSCP value',
                         show=lambda v: f"{v} ({dscp_to_name(v)})"),
             _dict_field('TTL', 'int', sc, 'ttl', lo=1, hi=255),
-            _dict_field("Don't fragment (DF)", 'bool', sc, 'df_bit'),
+            _dict_field("Don't fragment (DF)", 'bool', sc, 'df_bit',
+                        enabled=lambda: not is_tcp() or sys.platform == 'linux'),
             _dict_field('Source address', 'pick', sc, 'source_address',
                         items=self._source_items, title='Source address (this host)',
                         check=lambda t: '' if (not t or _ip_usable(t))
@@ -4631,6 +5984,16 @@ class TUI:
                         show=lambda v: 'per packet' if not v else f"every {v} s"),
             _dict_field('Compact summary', 'bool', rc, 'compact',
                         enabled=lambda: rc['summary'] > 0),
+            _dict_field('TCP listener', 'bool', rc, 'tcp'),
+            _dict_field('TCP receive buffer (KB)', 'int', rc, 'tcp_rcvbuf', lo=0, hi=1048576,
+                        enabled=lambda: rc.get('tcp', True), show=lambda v: 'default' if not v else str(v)),
+            _dict_field('TCP read rate (Mbit/s)', 'float', rc, 'tcp_read_rate', lo=0, hi=100000,
+                        enabled=lambda: rc.get('tcp', True), show=lambda v: 'unlimited' if not v else f"{v:g}"),
+            _dict_field('TCP read for (s)', 'float', rc, 'tcp_read_on', lo=0, hi=3600,
+                        enabled=lambda: rc.get('tcp', True), show=lambda v: 'always' if not v else f"{v:g}"),
+            _dict_field('TCP then pause (s)', 'float', rc, 'tcp_read_off', lo=0, hi=3600,
+                        enabled=lambda: rc.get('tcp', True) and rc.get('tcp_read_on', 0) > 0,
+                        show=lambda v: 'none' if not v else f"{v:g}"),
             _dict_field('Show sender IP', 'bool', rc, 'show_ip'),
             _dict_field('Verify every packet', 'bool', rc, 'verify'),
             _dict_field('CSV log', 'choice', rc, '_log_mode', choices=['off', 'auto', 'file']),
@@ -4779,19 +6142,22 @@ class TUI:
 
         body_h = rows - 4
         page = self.pages[self.tab]
+        vis = [i for i, f in enumerate(page) if not f.is_hidden()]    # rows that are shown (offset counts these)
         sel = self.sel[self.tab]
+        sp = vis.index(sel) if sel in vis else 0
         off = self.off[self.tab]
-        if sel < off:
-            off = sel
-        if sel >= off + body_h:
-            off = sel - body_h + 1
+        if sp < off:
+            off = sp
+        if sp >= off + body_h:
+            off = sp - body_h + 1
+        off = max(0, min(off, max(0, len(vis) - 1)))
         self.off[self.tab] = off
 
         lines = [top]
         vv = fr + v + rs
         for i in range(body_h):
-            idx = off + i
-            lines.append(self._row(page[idx], idx == sel, inner) if idx < len(page)
+            k = off + i
+            lines.append(self._row(page[vis[k]], vis[k] == sel, inner) if k < len(vis)
                          else vv + ' ' * inner + vv)
         cr = _credit(inner - 6)
         if cr:
@@ -4807,8 +6173,18 @@ class TUI:
                 for i, o in enumerate(opts))
             lines.append(msg)
         else:
-            colr = (Colors.RED if self.err else Colors.GREEN) if self.msg else ''
-            lines.append(colr + (' ' + self.msg)[:W] + (Colors.ENDC if colr else ''))
+            msg, err = self.msg, self.err
+            if not msg:
+                try:
+                    cs = self.cur_stream()
+                    if (self._tab_names()[self.tab].startswith('Sender')
+                            and _needs_iface_hint(cs.get('destination_address'),
+                                                  cs.get('source_address'))):
+                        msg, err = _IFACE_WARN, True
+                except Exception:
+                    pass
+            colr = (Colors.RED if err else Colors.GREEN) if msg else ''
+            lines.append(colr + (' ' + msg)[:W] + (Colors.ENDC if colr else ''))
         lines.append(_keybar(self._help_pairs(), W))
 
         for i, ln in enumerate(lines):
@@ -5306,7 +6682,7 @@ class SenderView:
     / stop / edit / add / delete while they are running."""
 
     HELP = (('q', 'Quit'), ('r', 'Receiver'), ('Space', 'Toggle'), ('e', 'Edit'), ('n', 'New'),
-            ('d', 'Del'), ('s/x', 'All'), ('w', 'Save'))
+            ('d', 'Del'), ('s/x', 'All'), ('c', 'Clear'), ('w', 'Save'))
 
     def __init__(self, streams, sync_server, on_save=None):
         self.streams = streams
@@ -5372,7 +6748,7 @@ class SenderView:
 
     # -- drawing -----------------------------------------------------------------
     def _visible(self):
-        return max(1, self._size[1] - 9)
+        return max(1, self._size[1] - 10)
 
     @staticmethod
     def _columns(width):
@@ -5385,7 +6761,7 @@ class SenderView:
                       [('dscp', 'DSCP', 7, '<')]]
             if ttl:
                 groups.append([('ttl', 'TTL', 3, '>')])
-                groups.append([('df', 'DF', 3, '<')])
+                groups.append([('df', 'DF', 6, '<')])
             sm, mb = ('sent', 'Sent', sent, '>'), ('mbit', 'Mbit/s', 6, '>')
             pn = ('ppsn', 'Pps now', 7, '>')
             groups += [[sm, mb, pn]] if merge else [[sm], [mb], [pn]]
@@ -5443,7 +6819,9 @@ class SenderView:
                         'port': p['destination_port'], 'size': p['packet_size'],
                         'rate': st.rate_text(),
                         'dscp': f"{p['dscp_value']} {dscp_to_name(p['dscp_value'])}",
-                        'ttl': p['ttl'], 'df': 'on' if p.get('df_bit') else 'off', 'sent': _short(st.sent, sent_w),
+                        'ttl': p['ttl'],
+                        'df': (('TCP DF' if p.get('df_bit') else 'TCP') if p.get('protocol') == 'tcp'
+                               else 'on' if p.get('df_bit') else 'off'), 'sent': _short(st.sent, sent_w),
                         'mbit': f"{st.rate_mbps:.2f}", 'ppsn': f"{st.rate_pps:.0f}"}
                 if idx == self.sel:
                     line = (_sty('sel') + _tbl_row(groups, vals)[:width].ljust(width) + _RESET)
@@ -5463,17 +6841,27 @@ class SenderView:
             p = st.params()
             d1 = (f" Stream {self.sel + 1}:  source {p['source_address'] or 'any'}:"
                   f"{p['source_port'] or 'any'}   TTL {p['ttl']}   "
-                  f"DF {'on' if p['df_bit'] else 'off'}   seq {st.seq}   "
-                  f"{st.rate_pps:,.1f} pps now")
-            d2 = f" {st.errors} send errors" if st.errors else ''
-            if st.error:
-                d2 += f"   last error: {st.error}"
+                  + (('DF on   ' if p['df_bit'] else '') + st.tcp_text() if p.get('protocol') == 'tcp'
+                     else f"DF {'on' if p['df_bit'] else 'off'}   seq {st.seq}")
+                  + f"   {st.rate_pps:,.1f} pps now")
+            err = st.error_text()
+            d2 = f" {st.errors} send errors" if (st.errors and err) else ''
+            if err:
+                d2 += f"   last error: {err}"
             elif st.notes:
                 d2 += f" {st.notes[-1]}"
-        c2 = Colors.RED if (n and self.streams[self.sel].error) else ''
+        c2 = Colors.RED if (n and self.streams[self.sel].error_text()) else ''
         out.append(R(5 + vis) + fr + rule + rs + _ESC + '[K')
-        out.append(R(6 + vis) + d1[:width] + _ESC + '[K')
-        out.append(R(7 + vis) + c2 + d2[:width] + (Colors.ENDC if c2 else '') + _ESC + '[K')
+        if n:
+            tot = {'n': '', 'state': 'SUM', 'dest': f"{n} streams", 'port': '', 'size': '', 'rate': '',
+                   'dscp': '', 'ttl': '', 'df': '', 'sent': _short(sum(x.sent for x in self.streams), sent_w),
+                   'mbit': f"{sum(x.rate_mbps for x in self.streams):.2f}",
+                   'ppsn': f"{sum(x.rate_pps for x in self.streams):.0f}"}
+            out.append(R(6 + vis) + _ESC + '[1m' + _tbl_row(groups, tot)[:width] + _RESET + _ESC + '[K')
+        else:
+            out.append(R(6 + vis) + _ESC + '[K')
+        out.append(R(7 + vis) + d1[:width] + _ESC + '[K')
+        out.append(R(8 + vis) + c2 + d2[:width] + (Colors.ENDC if c2 else '') + _ESC + '[K')
         if self.confirm is not None:
             m = f" Delete stream {self.confirm + 1}?  y = yes, any other key = no"
             out.append(R(rows - 1) + Colors.YELLOW + m[:width] + Colors.ENDC + _ESC + '[K')
@@ -5572,6 +6960,10 @@ class SenderView:
             for st in self.streams:
                 st.stop()
             self.say('All streams stopped')
+        elif k in ('c', 'C'):
+            for st in self.streams:
+                st.reset_stats()
+            self.say('Statistics reset')
         elif k in ('e', 'enter') and cur:
             self._edit(self.sel)
         elif k == 'n':
@@ -5608,7 +7000,7 @@ def run_sender(cfg, sync_server, plist, live=True, autostart=True):
     if _WEB.active:
         run_senders_plain(plist, sync_server)       # streams are shown in the browser
         return
-    if len(plist) == 1:
+    if len(plist) == 1 and plist[0].get('protocol', 'udp') == 'udp':
         sc = dict(cfg['send'])
         sc.update(plist[0])
         if plist[0]['burst_mode']:
@@ -6054,6 +7446,16 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 ls = 0
             self._json(200, hub.status(ls))
+        elif url.path == '/api/rx_hist':
+            self._json(200, hub.rx_hist(urllib.parse.parse_qs(url.query).get('l', [''])[0]))
+        elif url.path == '/api/tcp_hist':
+            try:
+                i = int(urllib.parse.parse_qs(url.query).get('i', ['0'])[0])
+            except ValueError:
+                i = 0
+            self._json(200, hub.tcp_hist(i))
+        elif url.path == '/api/test_csv':
+            hub.send_test_csv(self)
         elif url.path == '/api/download/log':
             hub.send_csv(self)
         elif url.path == '/api/download/config':
@@ -6145,6 +7547,166 @@ def _num(v, kind, name, lo=None, hi=None):
     return x
 
 
+
+# --- TCP test runs: step test and algorithm comparison -------------------------------
+
+def _parse_values(text, kind):
+    """'1,2,4' / '1-8/2' / '100 250 500' -> list of numbers (ints for kind 'conn')."""
+    out = []
+    for tok in re.split(r'[,\s;]+', str(text or '').strip()):
+        if not tok:
+            continue
+        m = re.fullmatch(r'([0-9.]+)-([0-9.]+)(?:/([0-9.]+))?', tok)
+        try:
+            if m:
+                a, b = float(m.group(1)), float(m.group(2))
+                st = float(m.group(3)) if m.group(3) else 1.0
+                if st <= 0 or b < a:
+                    raise ValueError
+                x = a
+                while x <= b + 1e-9:
+                    out.append(x)
+                    x += st
+            else:
+                out.append(float(tok))
+        except ValueError:
+            raise ValueError(f"bad value '{tok}'")
+        if len(out) > 60:
+            raise ValueError('too many steps (at most 40)')
+    if kind == 'conn':
+        out = [int(round(x)) for x in out]
+    return out
+
+
+class _TcpTest(threading.Thread):
+    """Runs one test on a TCP stream: every step changes one setting, waits for the
+    warm-up, then measures for `dur` seconds (one TCP history point per second).
+    The original settings come back at the end (or on STOP)."""
+
+    CSV_HEAD = ['step', 'setting', 'value', 'Mbit/s avg', 'Mbit/s min', 'Mbit/s max', 'RTT avg ms',
+                'RTT p95 ms', 'RTT max ms', 'retransmits', 'retrans %', 'cwnd avg KB', 'connections up (min)',
+                'worst state', 'samples']
+
+    def __init__(self, hub, st, idx, kind, steps, dur, warm):
+        super().__init__(daemon=True, name='tcp-test')
+        self.hub, self.st, self.idx, self.kind = hub, st, idx, kind
+        self.steps, self.dur, self.warm = steps, dur, warm        # steps: [(label, value, patch)]
+        self.rows = []
+        self.state = 'running'
+        self.step = 0
+        self.label = ''
+        self.error = ''
+        self.phase = 'warm-up'
+        self.stop_ev = threading.Event()
+        self.id = int(time.time() * 1000)
+        self.dest = f"{st.p['destination_address']}:{st.p['destination_port']}"
+        self.t0 = time.monotonic()
+
+    def _wait(self, secs):
+        end = time.monotonic() + secs
+        while time.monotonic() < end:
+            if self.stop_ev.wait(0.2):
+                return False
+        return True
+
+    def _last_point(self):
+        st = self.st
+        with st._tcp_lock:
+            return list(st._tcp_hist[-1]) if st._tcp_hist else None
+
+    def _measure(self, label, value):
+        st = self.st
+        self.phase = 'measuring'
+        pts, seen, cas, ups = [], None, [], []
+        end = time.monotonic() + self.dur
+        while time.monotonic() < end:
+            if self.stop_ev.wait(0.25):
+                return None
+            pt = self._last_point()
+            if pt and pt[0] != seen:
+                seen = pt[0]
+                pts.append(pt)
+                ti = st.tcp_info() or {}
+                cas.append(_CA_NAMES.index(ti['ca']) if ti.get('ca') in _CA_NAMES else 0)
+                ups.append(ti.get('up', 0))
+        if len(pts) < 2:
+            return {'label': label, 'value': value, 'n': len(pts), 'mbit': None}
+        mb = [q[8] for q in pts]
+        rt = [q[1] for q in pts]
+        rtt_sorted = sorted(rt)
+        p95 = rtt_sorted[min(len(rtt_sorted) - 1, int(0.95 * len(rtt_sorted)))]
+        retr = max(0, pts[-1][7] - pts[0][7])
+        mss = (st.tcp_info() or {}).get('mss') or 1448
+        sent_seg = max(1.0, (sum(mb) / len(mb)) * 1e6 / 8 * (len(pts) - 1) / mss)
+        return {'label': label, 'value': value, 'n': len(pts),
+                'mbit': round(sum(mb) / len(mb), 2), 'mbit_min': round(min(mb), 2), 'mbit_max': round(max(mb), 2),
+                'rtt': round(sum(rt) / len(rt), 2), 'rtt_p95': round(p95, 2), 'rtt_max': round(max(q[3] for q in pts), 2),
+                'retr': retr, 'retr_pct': round(100.0 * retr / sent_seg, 3),
+                'cwnd': round(sum(q[4] for q in pts) / len(pts)),
+                'up': min(ups) if ups else 0, 'ca': _CA_NAMES[max(cas)] if cas else 'Open'}
+
+    def run(self):
+        st = self.st
+        orig = st.params()
+        was_running = st.running
+        try:
+            if not was_running:
+                st.start()
+            for i, (label, value, patch) in enumerate(self.steps):
+                if self.stop_ev.is_set():
+                    break
+                self.step, self.label, self.phase = i + 1, label, 'warm-up'
+                q = dict(orig)
+                q.update(patch)
+                st.apply(_stream_params(q))
+                if not self._wait(self.warm):
+                    break
+                row = self._measure(label, value)
+                if row is None:
+                    break
+                self.rows.append(row)
+        except Exception as e:                       # a test must never take the program down
+            self.error = str(e)
+        finally:
+            try:
+                st.apply(_stream_params(orig))
+                if not was_running:
+                    st.stop(wait=False)
+            except Exception:
+                pass
+            self.state = 'stopped' if self.stop_ev.is_set() else ('error' if self.error else 'done')
+            self.phase = ''
+
+    def csv_text(self):
+        w = lambda x: '' if x is None else str(x)
+        lines = [f"# mautg TCP test: {self.kind}, stream {self.idx + 1} {self.dest}, {self.dur} s per step, warm-up {self.warm} s",
+                 ','.join(self.CSV_HEAD)]
+        what = {'conn': 'connections', 'rate': 'rate limit Mbit/s', 'algo': 'congestion control', 'bloat': 'load'}[self.kind]
+        for i, r in enumerate(self.rows):
+            lines.append(','.join(w(x) for x in (
+                i + 1, what, r['label'], r.get('mbit'), r.get('mbit_min'), r.get('mbit_max'), r.get('rtt'), r.get('rtt_p95'),
+                r.get('rtt_max'), r.get('retr'), r.get('retr_pct'), r.get('cwnd'), r.get('up'), r.get('ca'), r.get('n'))))
+        b = self.bloat()
+        if b:
+            lines.append(f"# bufferbloat: idle RTT {b['idle']} ms, RTT under load avg {b['load']} ms (+{b['add']} ms), "
+                         f"p95 {b['load_p95']} ms (+{b['add_p95']} ms)")
+        return '\n'.join(lines) + '\n'
+
+    def bloat(self):
+        """Queueing delay: RTT under load against RTT of the idle connection."""
+        if self.kind != 'bloat' or len(self.rows) < 2 or any(r.get('rtt') is None for r in self.rows[:2]):
+            return None
+        i, l = self.rows[0], self.rows[1]
+        return {'idle': i['rtt'], 'load': l['rtt'], 'add': round(l['rtt'] - i['rtt'], 2),
+                'load_p95': l['rtt_p95'], 'add_p95': round(l['rtt_p95'] - i['rtt'], 2)}
+
+    def info(self):
+        return {'id': self.id, 'state': self.state, 'kind': self.kind, 'idx': self.idx, 'dest': self.dest,
+                'step': self.step, 'steps': len(self.steps), 'label': self.label, 'phase': self.phase,
+                'dur': self.dur, 'warm': self.warm, 'rows': list(self.rows), 'error': self.error, 'bloat': self.bloat(),
+                'elapsed': round(time.monotonic() - self.t0)}
+
+
 class _WebHub:
     LOG_MAX = 3000
 
@@ -6153,6 +7715,7 @@ class _WebHub:
         self.control = False
         self.headless = False
         self.exit_requested = False
+        self.test = None           # running / last TCP test (_TcpTest)
         self.dual = None           # running DualHost (terminal session with both views)
         self.owns = False          # the hub itself owns the streams (-web, or side-car beside the menu)
         self.own = None
@@ -6173,6 +7736,11 @@ class _WebHub:
         self.rx_stop_req = False
         self._rx_last = None
         self._prev = {}
+        self._rxh = {}                   # stream label -> history of the web view
+        self._rxs = []                   # receiver: sum over all streams
+        self._rxs_t0 = 0.0
+        self._txs = []                   # sender: sum over all streams
+        self._txs_t0 = 0.0
         self.streams = None
         self.on_save = None
         self.view = None
@@ -6214,6 +7782,7 @@ class _WebHub:
         self.tee = _LogTee(sys.stdout, self, passthrough=not headless)
         sys.stdout = self.tee
         self.active = True
+        threading.Thread(target=self._collector, daemon=True, name='web-hist').start()
         if side and control:
             def on_save(pl):
                 store_streams(cfg, pl)
@@ -6337,15 +7906,21 @@ class _WebHub:
             else:
                 return {'ok': False, 'error': 'nothing is running in the terminal'}
             return {'ok': True}
+        if cmd == 'test_start':
+            return self.test_start(data)
+        if cmd == 'test_stop':
+            if self.test is not None and self.test.state == 'running':
+                self.test.stop_ev.set()
+            return {'ok': True}
         if cmd in ('rx_start', 'rx_save', 'cfg_apply'):
             if not self.owns:
                 return {'ok': False, 'error': 'the receiver is controlled from the terminal'}
             kind = 'rxc'
-        elif cmd in ('rx_stop', 'rx_reset', 'rx_show_ip', 'rx_view', 'rx_interval', 'rx_log_start', 'rx_log_stop'):
+        elif cmd in ('rx_stop', 'rx_reset', 'rx_hist_reset', 'rx_show_ip', 'rx_view', 'rx_interval', 'rx_log_start', 'rx_log_stop'):
             if self.rx is None:
                 return {'ok': False, 'error': 'receiver not running'}
             kind = 'rx'
-        elif cmd in ('tx_add', 'tx_set', 'tx_start', 'tx_stop', 'tx_del'):
+        elif cmd in ('tx_add', 'tx_set', 'tx_start', 'tx_stop', 'tx_del', 'tx_reset'):
             if not self.controllable:
                 return {'ok': False, 'error': 'the sender cannot be controlled from the browser'}
             kind = 'tx'
@@ -6413,8 +7988,18 @@ class _WebHub:
         rx, cmd, v = self.rx, c['cmd'], c['value']
         if rx is None:
             return 'receiver not running'
-        if cmd == 'rx_reset':
+        if cmd == 'rx_hist_reset':
+            if v == '*':
+                self._rxs = []
+                self._rxs_t0 = 0.0
+            else:
+                self._rxh.pop(v, None)
+            self.say(f"Graph of stream {v} reset")
+        elif cmd == 'rx_reset':
             rx.reset()
+            self._rxh.clear()
+            self._rxs = []
+            self._rxs_t0 = 0.0
             live._prev.clear()
             self._prev.clear()
             if live.term is not None:
@@ -6486,6 +8071,13 @@ class _WebHub:
             rc['summary'] = int(rc['summary'])
         rc['compact'] = bool(d.get('compact'))
         rc['show_ip'] = bool(d.get('show_ip'))
+        rc['tcp'] = bool(d.get('tcp'))
+        rc['tcp_rcvbuf'] = _num(d.get('tcp_rcvbuf') or 0, int, 'TCP receive buffer', 0, 1048576)
+        rc['tcp_read_rate'] = _num(d.get('tcp_read_rate') or 0, float, 'TCP read rate', 0, 100000)
+        rc['tcp_read_on'] = _num(d.get('tcp_read_on') or 0, float, 'TCP read time', 0, 3600)
+        rc['tcp_read_off'] = _num(d.get('tcp_read_off') or 0, float, 'TCP pause', 0, 3600)
+        if rc['tcp_read_off'] > 0 and rc['tcp_read_on'] <= 0:
+            raise ValueError('TCP pause needs a read time > 0')
         rc['verify'] = bool(d.get('verify'))
         rc['print_limit'] = _num(d.get('print_limit') or 0, int, 'Per-packet lines per second', 0)
         lm = d.get('log_mode', 'off')
@@ -6581,9 +8173,10 @@ class _WebHub:
 
     @staticmethod
     def _coerce_stream(d):
-        ints = ('destination_port', 'packet_size', 'dscp_value', 'ttl', 'source_port')
-        floats = ('packets_per_second', 'burst_mbps')
-        bools = ('df_bit', 'burst_mode')
+        ints = ('destination_port', 'packet_size', 'dscp_value', 'ttl', 'source_port', 'connections',
+                'tcp_sndbuf', 'tcp_mss')
+        floats = ('packets_per_second', 'burst_mbps', 'tcp_on', 'tcp_off', 'tcp_recycle')
+        bools = ('df_bit', 'burst_mode', 'tcp_nodelay')
         q = {}
         for k in _STREAM_KEYS:
             if k not in d:
@@ -6646,6 +8239,17 @@ class _WebHub:
                 i = self._index(v)
                 ss[i].start() if start else ss[i].stop()
                 self.say(f"Stream {i + 1} " + ('started' if start else 'stopped'))
+        elif cmd == 'tx_reset':
+            if v == 'all':
+                for st in ss:
+                    st.reset_stats()
+                self._txs = []
+                self._txs_t0 = 0.0
+                self.say('Statistics of all streams reset')
+            else:
+                i = self._index(v)
+                ss[i].reset_stats()
+                self.say(f"Statistics of stream {i + 1} reset")
         elif cmd == 'tx_del':
             i = self._index(v)
             ss[i].stop()
@@ -6673,6 +8277,87 @@ class _WebHub:
                 lst = []
             self._ifaces = (lst, time.time())
         return lst
+
+    def _collector(self):
+        """Once per second: history points of the receiver streams and sender samples,
+        whether or not a browser is looking."""
+        while True:
+            time.sleep(1.0)
+            try:
+                now = time.monotonic()
+                rx = self.rx
+                if rx is not None:
+                    pts = [p for p in (self._rx_hist_point(s, now) for s in list(rx.streams.values())) if p]
+                    if pts:
+                        self._rx_sum_point(rx, now, pts)
+                sts = list(self.streams or [])
+                for st in sts:
+                    st.sample(now)
+                if any(st.running for st in sts):
+                    if not self._txs_t0:
+                        self._txs_t0 = now
+                    self._txs.append([round(now - self._txs_t0, 1), round(sum(st.rate_mbps for st in sts), 2),
+                                      round(sum(st.rate_pps for st in sts), 1), sum(st.errors for st in sts)])
+                    del self._txs[:-900]
+            except Exception:
+                pass
+
+    def _rx_hist_point(self, s, now):
+        """One history sample per second and stream: [t, Mbit/s, pps, lost/s, misordered/s,
+        delay avg, delay min, delay max (ms, None = no packet with delay), loss %, packets]."""
+        h = self._rxh.get(s.label)
+        ds = s.delay_stats
+        cur = (now, s.total_missing, s.total_misorder, ds.count, ds.total, s.total_bytes, s.total_packets)
+        if h is None:
+            self._rxh[s.label] = {'pts': [], 't0': now, 'last': cur, 'src': s.ip, 'port': s.port, 'dscp': '', 'proto': 'UDP', 'size': 0}
+            return None
+        last = h['last']
+        dt = now - last[0]
+        if dt < 0.95:
+            return None
+        dn = ds.count - last[3]
+        mbit = max(0.0, (s.total_bytes - last[5]) * 8 / (dt * 1e6))
+        pps = max(0.0, (s.total_packets - last[6]) / dt)
+        lo, hi = ds.take_window()
+        if dn > 0:
+            avg, lo, hi = round((ds.total - last[4]) / dn, 3), round(lo, 3), round(hi, 3)
+        else:
+            avg = lo = hi = None
+        pt = [round(now - h['t0'], 1), round(mbit, 2), round(pps), max(0, s.total_missing - last[1]),
+              max(0, s.total_misorder - last[2]), avg, lo, hi, round(s.loss_pct(), 3), s.total_packets]
+        h['pts'].append(pt)
+        del h['pts'][:-900]
+        h['last'] = cur
+        h['src'], h['port'] = s.ip, s.port
+        h['dscp'] = dscp_to_name(s.last_dscp)
+        h['proto'] = 'TCP' if getattr(s, 'cast', '') == 'TCP' else 'UDP'
+        h['size'] = int(s.total_bytes / s.total_packets) if s.total_packets else 0
+        return pt + [dn, ds.total - last[4]]          # (dn, delay sum of the second: only for the SUM point)
+
+    def _rx_sum_point(self, rx, now, pts):
+        if not self._rxs_t0:
+            self._rxs_t0 = now
+        dn = sum(p[10] for p in pts)
+        los = [p[6] for p in pts if p[6] is not None]
+        his = [p[7] for p in pts if p[7] is not None]
+        allst = list(rx.streams.values())
+        miss = sum(x.total_missing for x in allst)
+        pk = sum(x.total_packets for x in allst)
+        self._rxs.append([round(now - self._rxs_t0, 1), round(sum(p[1] for p in pts), 2), round(sum(p[2] for p in pts)),
+                          sum(p[3] for p in pts), sum(p[4] for p in pts),
+                          round(sum(p[11] for p in pts) / dn, 3) if dn else None,
+                          round(min(los), 3) if los else None, round(max(his), 3) if his else None,
+                          round(100.0 * miss / (pk + miss), 3) if pk + miss else 0.0, pk])
+        del self._rxs[:-900]
+
+    def rx_hist(self, label):
+        if label == '*':
+            return {'kind': 'rx', 'points': list(self._rxs), 'label': label, 'dest': 'SUM - all streams', 'num': 'SUM'}
+        h = self._rxh.get(label)
+        if h is None:
+            return {'kind': 'rx', 'points': [], 'label': label}
+        return {'kind': 'rx', 'points': list(h['pts']), 'label': label, 'dest': f"{h['src']}:{h['port']}",
+                'num': label, 'proto': h.get('proto', 'UDP'), 'dscp': h.get('dscp', ''), 'size': h.get('size', 0), 'rate': ''}
 
     def _rx_status(self, rx, running):
         now = time.monotonic()
@@ -6748,8 +8433,32 @@ class _WebHub:
                 'state': st.state_text(), 'params': p, 'rate': st.rate_text(),
                 'dscp': dscp_to_name(p['dscp_value']), 'sent': st.sent,
                 'mbps': round(st.rate_mbps, 3), 'pps': round(st.rate_pps, 1),
-                'error': st.error, 'seq': st.seq})
+                'error': st.error_text(), 'seq': st.seq, 'tcp': st.tcp_text(), 'tcpd': st.tcp_info()})
         return out
+
+    def tcp_hist(self, i):
+        sts = list(self.streams or [])
+        if i < 0:
+            return {'kind': 'udp', 'points': list(self._txs), 'dest': 'SUM - all streams', 'rate': f"{len(sts)} streams",
+                    'size': 0, 'text': '', 'conns': 1, 'num': 'SUM', 'proto': ''}
+        if not 0 <= i < len(sts):
+            return {'points': []}
+        st = sts[i]
+        if st.p.get('protocol') == 'tcp':
+            h = st.tcp_history()
+            h['kind'] = 'tcp'
+        else:
+            h = {'kind': 'udp', 'points': list(st._hist), 'size': st.p['packet_size'],
+                 'rate': st.rate_text()}
+        h['text'] = st.tcp_text()
+        h['dest'] = f"{st.p['destination_address']}:{st.p['destination_port']}"
+        h['conns'] = int(st.p.get('connections') or 1)
+        h['num'] = str(i + 1)
+        h['proto'] = 'TCP' if st.p.get('protocol') == 'tcp' else 'UDP'
+        h['dscp'] = dscp_to_name(st.p['dscp_value'])
+        h['rate'] = st.rate_text().replace('max rate', 'max')
+        h['size'] = st.p['packet_size']
+        return h
 
     def status(self, ls):
         self.last_poll = time.time()
@@ -6778,12 +8487,81 @@ class _WebHub:
             'stopped': self.stopped,
             'message': text if time.time() - at < 6.0 else '', 'message_err': err,
             'ifaces': self._local_ifaces(),
+            'tcp_cc': tcp_cc_options(),
+            'test': self.test_status(),
             'dscp': [[v, n, m] for v, n, m in DSCP_TABLE],
             'defaults': {'recv': {k: v for k, v in self.cfg['recv'].items()
                                   if isinstance(v, (str, int, float, bool))},
                          'send': send_defaults},
             'rx': rxs, 'tx': self._tx_status(now),
             'log': {'seq': seq, 'lines': lines[-1500:]}}
+
+    # -- TCP tests ------------------------------------------------------------------------
+    def test_start(self, d):
+        if not self.controllable:
+            return {'ok': False, 'error': 'the sender cannot be controlled from the browser'}
+        if self.test is not None and self.test.state == 'running':
+            return {'ok': False, 'error': 'a test is already running - stop it first'}
+        try:
+            kind = str(d.get('kind') or 'conn')
+            if kind not in ('conn', 'rate', 'algo', 'bloat'):
+                raise ValueError('unknown test')
+            idx = int(d.get('idx'))
+            sts = list(self.streams or [])
+            if not 0 <= idx < len(sts):
+                raise ValueError('no such stream')
+            st = sts[idx]
+            if st.p.get('protocol') != 'tcp':
+                raise ValueError(f"stream {idx + 1} is not a TCP stream")
+            dur = _num(d.get('dur') or 20, float, 'Duration per step', 3, 600)
+            warm = _num(d.get('warm') if d.get('warm') not in (None, '') else 5, float, 'Warm-up', 0, 120)
+            if kind == 'conn':
+                vals = _parse_values(d.get('v_conn'), 'conn')
+                steps = [(str(v), v, {'connections': v}) for v in vals]
+            elif kind == 'bloat':
+                ld = _num(d.get('v_load') or 0, float, 'Load rate', 0, 1000000)
+                steps = [('idle (1 packet/s)', 'idle', {'burst_mode': False, 'packets_per_second': 1.0,
+                                                          'tcp_on': 0.0, 'tcp_off': 0.0}),
+                         ((f"under load ({ld:g} Mbit/s)" if ld else 'under load (stream setting)'), 'load',
+                          ({'burst_mode': True, 'burst_mbps': ld} if ld else {}))]
+            elif kind == 'rate':
+                vals = _parse_values(d.get('v_rate'), 'rate')
+                steps = [((f"{v:g} Mbit/s" if v else 'unlimited'), v, {'burst_mode': True, 'burst_mbps': v}) for v in vals]
+            else:
+                names = [t for t in re.split(r'[,\s;]+', str(d.get('v_algo') or '').strip()) if t]
+                if not names:
+                    names = tcp_cc_available()
+                steps = []
+                for n in names:
+                    n = '' if n.lower() in ('default', 'system') else n.lower()
+                    steps.append((n or 'default', n, {'tcp_cc': n}))
+            if not steps:
+                raise ValueError('no steps')
+            if len(steps) > 40:
+                raise ValueError('at most 40 steps')
+            for label, _v, patch in steps:
+                q = _stream_params(dict(st.params(), **patch))
+                problem = check_stream_params(q)
+                if problem:
+                    raise ValueError(f"step {label}: {problem}")
+        except (ValueError, TypeError) as e:
+            return {'ok': False, 'error': str(e)}
+        t = _TcpTest(self, st, idx, kind, steps, dur, warm)
+        self.test = t
+        t.start()
+        self.say(f"TCP test started: {len(steps)} steps, {dur:g} s each (+ {warm:g} s warm-up) on stream {idx + 1}")
+        return {'ok': True}
+
+    def test_status(self):
+        return self.test.info() if self.test is not None else None
+
+    def send_test_csv(self, h):
+        t = self.test
+        if t is None or not t.rows:
+            h._send(404, 'no test result', 'text/plain; charset=utf-8')
+            return
+        h._send(200, t.csv_text(), 'text/csv; charset=utf-8',
+                {'Content-Disposition': 'attachment; filename="mautg-tcptest_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S') + '.csv"'})
 
     def send_csv(self, h):
         rx = self.rx
@@ -7115,12 +8893,19 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
   #ro{color:var(--acc)}
   .layout{display:flex;flex-direction:column;height:100%}
   .body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+  #testbox{flex:0 0 auto;max-height:40%;overflow:auto;padding:6px 8px;border-top:1px solid var(--line);font-size:var(--fs)}
+  #testbox .th{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;gap:10px}
+  #testbox table{border-collapse:collapse} #testbox th{color:var(--dim);font-weight:400;text-align:right;padding:2px 10px} #testbox td{padding:2px 10px;text-align:right;white-space:nowrap}
+  #testbox th:first-child,#testbox td:first-child{text-align:center}
+  .tbar{display:inline-block;height:9px;background:var(--up);vertical-align:middle;margin-left:6px;border-radius:2px;opacity:.75}
   #grid{flex:0 0 auto;max-height:46%;overflow:auto;padding:4px 0 0 8px;font-size:var(--fs);line-height:1.35}
-  table.t{border-collapse:collapse;border-left:1px solid var(--line);border-right:1px solid var(--line)}
-  table.t th,table.t td{padding:0 1ch;white-space:nowrap;border-bottom:1px solid #131b13}
+  table.t{border-collapse:collapse}
+  table.t th,table.t td{padding:2px 1.2ch;white-space:nowrap;border-bottom:1px solid #131b13}
   table.t tfoot td{font-weight:700;border-top:1px solid var(--dim);border-bottom:0;background:var(--panel);position:sticky;bottom:0}
   table.t th{color:var(--dim);font-weight:600;text-align:left;border-bottom:1px solid var(--line);user-select:none}
   table.t .r{text-align:right} .c{text-align:center}
+  table.t td.hlc{cursor:pointer}
+  .hlx{display:inline-block;width:100%}
   table.t tr.sel td{background:#182418}
   table.t tr.clk{cursor:pointer}
   table.t tr.clk:hover td{background:#142014}
@@ -7138,6 +8923,36 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
              min-width:300px;max-width:92vw;max-height:90vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.5)}
   .modal-box h3{margin:0 0 10px;font-size:18px;letter-spacing:.5px}
   .modal-box p{margin:0 0 14px;color:#b4c4b4;font-size:14px;line-height:1.5}
+  table.t.tx tbody.sg tr.clk td{padding-top:7px;padding-bottom:3px;border-bottom:0}
+  table.t.tx tbody.sg tr:nth-child(2) td{padding:2px 1.2ch 8px;border-bottom:0;background:#0c130c}
+  table.t.tx tbody.sg{border-top:1px solid var(--line);border-bottom:0}
+  table.t.tx tbody.sg:last-of-type{border-bottom:1px solid var(--line)}
+  table.t.tx tbody.sg tr.sel td{background:#182418}
+  table.t.tx tbody.sg tr.sel + tr td{background:#101c10}
+  .gck{cursor:pointer;color:var(--acc);user-select:none} .gck input{vertical-align:middle;margin:0 3px 0 0;cursor:pointer}
+  #graphs{flex:0 1 auto;min-height:0;align-self:stretch;max-height:55%;overflow:auto;padding:6px 8px;border-top:1px solid var(--line);display:none;
+    grid-template-columns:repeat(auto-fill,minmax(520px,1fr));gap:10px;align-content:start}
+  #gsplit{flex:0 0 auto;height:11px;cursor:row-resize;background:#1c261c;border-top:1px solid var(--line);border-bottom:1px solid var(--line);position:relative;touch-action:none;user-select:none}
+  #gsplit:hover,#gsplit.drag{background:#2a3d2a}
+  #gsplit span{position:absolute;left:50%;top:3px;width:60px;margin-left:-30px;height:5px;border-top:1px solid var(--acc);border-bottom:1px solid var(--acc)}
+  #graphs{scrollbar-width:auto;scrollbar-color:#4a6a4a #101810}
+  #graphs::-webkit-scrollbar{width:12px;height:12px} #graphs::-webkit-scrollbar-track{background:#101810} #graphs::-webkit-scrollbar-thumb{background:#4a6a4a;border-radius:6px}
+  .gp{max-width:780px;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px 10px;min-width:0}
+  .gh{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+  .gh button{padding:1px 8px;font-size:12px}
+  .rttlink{cursor:pointer}
+  .fixw{width:0;min-width:100%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .fixo{width:0;overflow:visible;white-space:nowrap;padding:2px 0 3px}
+  .tc{display:inline-block;white-space:nowrap}
+  .bloat{padding:6px 8px;border-top:1px solid var(--line,#444)}
+  .tk{color:var(--dim)}
+  .tv{color:var(--fg);font-weight:600}
+  .tv.warnc{color:var(--warn)} .tv.ok{color:var(--up)}
+  th.wsent{min-width:13ch} th.wnum{min-width:9ch}
+  .thsum{font-size:13px;margin:0 0 8px;color:#b4c4b4}
+  .thsum b{color:var(--fg)}
+  .thleg{font-size:12px;display:flex;gap:14px;flex-wrap:wrap;margin-top:6px}
+  .thtip{position:absolute;pointer-events:none;background:#0b0f0b;border:1px solid var(--ctrl-line);border-radius:4px;padding:6px 8px;font-size:12px;line-height:1.5;width:max-content;white-space:nowrap;z-index:60}
   .modal-box.wide{width:900px;max-width:92vw;max-height:82vh;overflow-y:auto}
   .modal-box.wide table{width:100%;border-collapse:collapse}
   .fpick{width:100%;max-height:220px;overflow-y:auto;margin:0 0 14px;border:1px solid var(--ctrl-line);border-radius:4px;padding:6px 10px;box-sizing:border-box}
@@ -7153,6 +8968,7 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
   .frow input[type=text],.frow input[type=number],.frow select{width:100%;min-width:0}
   .frow.chk{flex-direction:row;align-items:center;gap:8px}
   .ferr{color:var(--down);min-height:1.3em;font-size:14px}
+  .fwarn{color:var(--down);font-size:13px;margin:6px 0 0}
   body.compact .bar button{padding:3px 6px;font-size:12px}
 </style>
 </head>
@@ -7207,6 +9023,9 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
         <button id="btnTxDel" class="danger" title="delete the selected stream">DELETE</button>
         <button id="btnTxStartAll">START ALL</button>
         <button id="btnTxStopAll">STOP ALL</button>
+        <button id="btnTxReset" title="reset the statistics (counters, graphs) of all streams; the streams keep running">RESET STATS</button>
+        <button id="btnTxTest" title="step test (connections / rate) or algorithm comparison on the selected TCP stream">TCP TEST</button>
+        <button id="btnTxDetail" title="show / hide the second TCP line (algorithm state, RTO, pacing, ...) of all streams">VIEW DETAILS</button>
       </span>
       <select id="selFile" title="download / upload / delete files in the working directory of mautg.py, download or upload the configuration">
         <option value="" selected disabled hidden>FILE OPERATIONS</option>
@@ -7254,6 +9073,9 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
 
   <div class="body">
     <div id="grid"></div>
+    <div id="testbox" style="display:none"></div>
+    <div id="graphs" style="display:none"></div>
+    <div id="gsplit" title="drag up/down to resize the graph area (double-click: reset)" style="display:none"><span></span></div>
     <div id="logwrap"><div id="loghead"></div><pre id="log"></pre></div>
   </div>
   <footer id="foot">connecting ...</footer>
@@ -7315,7 +9137,7 @@ function stick(){ endUntil = Date.now() + 3500; scrollEnd(); }
 function note(t, err){ var e = tab==='receiver' ? $('msg') : $('msg2'); e.textContent = t; e.className = 'msg'+(err?' err':''); }
 
 /* ---------- generic form modal ---------- */
-function openForm(title, intro, fields, values, buttons){
+function openForm(title, intro, fields, values, buttons, warn){
   var host = $('modalHost'), v = {}, k;
   for(k in values) v[k] = values[k];
   var h = '<div class="modal-overlay"><div class="modal-box" style="width:600px"><h3>'+esc(title)+'</h3>'+(intro?'<p>'+esc(intro)+'</p>':'');
@@ -7331,7 +9153,7 @@ function openForm(title, intro, fields, values, buttons){
         + (f.type==='number'?' step="any"':'')+' value="'+esc(val==null?'':val)+'" autocomplete="off"></div>';
     }
   });
-  h += '<div class="ferr" id="formErr"></div><div class="modal-buttons">'
+  h += '<div class="fwarn" id="formWarn"></div><div class="ferr" id="formErr"></div><div class="modal-buttons">'
     + buttons.map(function(b,i){ return '<button data-b="'+i+'" class="'+(b.cls||'')+'">'+esc(b.label)+'</button>'; }).join('')+'</div></div></div>';
   host.innerHTML = h;
   function read(){
@@ -7345,8 +9167,11 @@ function openForm(title, intro, fields, values, buttons){
   function refresh(){
     var o = read();
     fields.forEach(function(f){
-      if(f.enabled){ var el = $('f_'+f.k); if(el) el.disabled = !f.enabled(o); }
+      var el = $('f_'+f.k);
+      if(f.enabled && el) el.disabled = !f.enabled(o);
+      if(f.show && el){ var row = el.closest('.frow'); if(row) row.style.display = f.show(o) ? '' : 'none'; }
     });
+    if(warn) $('formWarn').textContent = warn(o) || '';
   }
   fields.forEach(function(f){ var el = $('f_'+f.k); if(el){ el.onchange = refresh; el.oninput = refresh; } });
   refresh();
@@ -7388,6 +9213,7 @@ document.addEventListener('keydown', function(e){
     else if(kl==='d' || kl==='Delete') click('btnTxDel');
     else if(kl==='s') click('btnTxStartAll');
     else if(kl==='x') click('btnTxStopAll');
+    else if(kl==='c') click('btnTxReset');
   } else if(!ro){
     var rx = S.rx || {};
     if(kl==='s') click('btnRxStart');
@@ -7419,6 +9245,11 @@ function rxFields(){
     {k:'resync_interval', label:'Resync interval (s)', type:'number', enabled:function(o){ return o.sync_mode!=='off'; }},
     {k:'summary', label:'Summary interval (s)', hint:'0 = per-packet display', type:'number'},
     {k:'compact', label:'Compact summary', type:'check'},
+    {k:'tcp', label:'TCP listener', hint:'(TCP streams on the same port numbers)', type:'check'},
+    {k:'tcp_rcvbuf', label:'TCP receive buffer (KB)', hint:'0 = system default (autotuning); a small buffer limits the window', type:'number', enabled:function(o){ return o.tcp; }},
+    {k:'tcp_read_rate', label:'TCP read rate (Mbit/s)', hint:'slow reader: 0 = unlimited; the window shrinks up to zero', type:'number', enabled:function(o){ return o.tcp; }},
+    {k:'tcp_read_on', label:'TCP read for (s)', hint:'slow reader: read this long ... (0 = always)', type:'number', enabled:function(o){ return o.tcp; }},
+    {k:'tcp_read_off', label:'TCP then pause (s)', hint:'... then do not read at all (zero window)', type:'number', enabled:function(o){ return o.tcp && +o.tcp_read_on>0; }},
     {k:'show_ip', label:'Show sender IP', type:'check'},
     {k:'verify', label:'Verify every packet', hint:'(CRC + padding)', type:'check'},
     {k:'print_limit', label:'Per-packet lines per second', hint:'0 = unlimited', type:'number'},
@@ -7431,7 +9262,7 @@ function rxValues(rc){
   return {unicast: !!rc.unicast, group: rc.group||'239.1.1.1', interface: rc.interface||'all', port: rc.port||'5001-5008',
     sync_mode: rc.sender_ip==='none' ? 'off' : (rc.sender_ip ? 'ip' : 'auto'), sender_ip: (rc.sender_ip&&rc.sender_ip!=='none')?rc.sender_ip:'',
     sender_sync_port: rc.sender_sync_port||0, resync_interval: rc.resync_interval||3, summary: rc.summary==null?2:rc.summary,
-    compact: !!rc.compact, show_ip: !!rc.show_ip, verify: !!rc.verify, print_limit: rc.print_limit==null?500:rc.print_limit,
+    compact: !!rc.compact, tcp: rc.tcp!==false, tcp_rcvbuf: rc.tcp_rcvbuf||0, tcp_read_rate: rc.tcp_read_rate||0, tcp_read_on: rc.tcp_read_on||0, tcp_read_off: rc.tcp_read_off||0, show_ip: !!rc.show_ip, verify: !!rc.verify, print_limit: rc.print_limit==null?500:rc.print_limit,
     log_mode: !rc.log ? 'off' : (rc.log==='auto' ? 'auto' : 'file'), log_name: (rc.log&&rc.log!=='auto')?rc.log:''};
 }
 function openRxSettings(){
@@ -7439,7 +9270,9 @@ function openRxSettings(){
   openForm('RECEIVER SETTINGS', running ? 'The receiver is running - START restarts it with these settings.' : '',
     rxFields(), rxValues(running ? S.rx.rc : S.defaults.recv), [
     {label: running ? 'RESTART' : 'START', cls:'on', fn:function(v, done){ post('rx_start','',v,function(j){ done(j.ok?null:(j.error||'rejected')); }); }},
-    {label:'SAVE AS DEFAULT', fn:function(v, done){ post('rx_save','',v,function(j){ done(j.ok?null:(j.error||'rejected')); }); }},
+    {label:'SAVE AS DEF AND START', fn:function(v, done){ post('rx_save','',v,function(j){
+       if(!j.ok){ done(j.error||'rejected'); return; }
+       post('rx_start','',v,function(j2){ done(j2.ok?null:(j2.error||'rejected')); }); }); }},
     {label:'CANCEL'}]);
 }
 
@@ -7450,13 +9283,22 @@ function txFields(){
   return [
     {k:'destination_address', label:'Destination', hint:'IP or host name', type:'text'},
     {k:'destination_port', label:'Destination port', type:'number'},
-    {k:'packet_size', label:'Packet size (bytes)', hint:'wire size, 55 up to the interface MTU (DF off: up to 65507, fragmented)', type:'number'},
+    {k:'protocol', label:'Protocol', type:'select', options:[['udp','UDP'],['tcp','TCP - unicast only']]},
+    {k:'connections', label:'TCP connections', hint:'1-64, the rate is shared', type:'number', show:function(o){ return o.protocol==='tcp'; }},
+    {k:'tcp_cc', label:'TCP congestion control', hint:'(Linux; per connection)', type:'select', options:(S.tcp_cc||[['','system default']]), show:function(o){ return o.protocol==='tcp'; }},
+    {k:'tcp_sndbuf', label:'TCP send buffer (KB)', hint:'0 = system default (autotuning); a small buffer limits the window', type:'number', show:function(o){ return o.protocol==='tcp'; }},
+    {k:'tcp_mss', label:'TCP MSS (bytes)', hint:'0 = system default', type:'number', show:function(o){ return o.protocol==='tcp'; }},
+    {k:'tcp_nodelay', label:'TCP no-delay', hint:'(off = Nagle algorithm)', type:'check', show:function(o){ return o.protocol==='tcp'; }},
+    {k:'tcp_on', label:'TCP send for (s)', hint:'burst / pause pattern: send this long ... (0 = continuous)', type:'number', show:function(o){ return o.protocol==='tcp'; }},
+    {k:'tcp_off', label:'TCP then pause (s)', hint:'... then stay silent: idle connection, slow start restart', type:'number', show:function(o){ return o.protocol==='tcp' && +o.tcp_on>0; }},
+    {k:'tcp_recycle', label:'TCP reconnect every (s)', hint:'close and open the connections again (0 = never): slow start each time', type:'number', show:function(o){ return o.protocol==='tcp'; }},
+    {k:'packet_size', label:'Packet size (bytes)', hint:'UDP: wire size, 55 up to the interface MTU (DF off: up to 65507, fragmented); TCP: message size', type:'number'},
     {k:'burst_mode', label:'Burst mode', hint:'(as fast as the limit allows)', type:'check'},
     {k:'packets_per_second', label:'Rate (pps)', type:'number', enabled:function(o){ return !o.burst_mode; }},
     {k:'burst_mbps', label:'Burst limit (Mbit/s)', hint:'0 = unlimited', type:'number', enabled:function(o){ return o.burst_mode; }},
     {k:'dscp_value', label:'DSCP', type:'select', options:dscp},
     {k:'ttl', label:'TTL', type:'number'},
-    {k:'df_bit', label:'Don\'t fragment (DF)', hint:'(Linux)', type:'check'},
+    {k:'df_bit', label:'Don\'t fragment (DF)', hint:'(Linux; TCP: forces DF, otherwise the kernel default)', type:'check'},
     {k:'source_address', label:'Source address', type:'select', options:src},
     {k:'source_port', label:'Source port', hint:'0 = any', type:'number'}
   ];
@@ -7470,15 +9312,22 @@ function openTxEditor(idx){
     while(used[p.destination_port] && p.destination_port < 65535) p.destination_port++;
   } else p = JSON.parse(JSON.stringify(S.tx.streams[idx].params));
   var fields = txFields();
-  var hasDscp = fields[6].options.some(function(o){ return String(o[0])===String(p.dscp_value); });
-  if(!hasDscp) fields[6].options.push([p.dscp_value, p.dscp_value+'  custom']);
-  var hasSrc = fields[9].options.some(function(o){ return o[0]===p.source_address; });
-  if(!hasSrc) fields[9].options.push([p.source_address, p.source_address+'  (not on this host)']);
+  var fDscp = fields.filter(function(f){ return f.k==='dscp_value'; })[0];
+  var fSrc = fields.filter(function(f){ return f.k==='source_address'; })[0];
+  var hasDscp = fDscp.options.some(function(o){ return String(o[0])===String(p.dscp_value); });
+  if(!hasDscp) fDscp.options.push([p.dscp_value, p.dscp_value+'  custom']);
+  var hasSrc = fSrc.options.some(function(o){ return o[0]===p.source_address; });
+  if(!hasSrc) fSrc.options.push([p.source_address, p.source_address+'  (not on this host)']);
   openForm(isNew ? 'ADD STREAM' : 'EDIT STREAM '+(idx+1), isNew ? '' : 'Changes take effect immediately; the sequence numbers continue.', fields, p,
     [{label: isNew ? 'ADD AND START' : 'APPLY', cls:'on', fn:function(v, done){
        v.dscp_value = parseInt(v.dscp_value,10);
        post(isNew ? 'tx_add' : 'tx_set', isNew ? '' : idx, v, function(j){ done(j.ok?null:(j.error||'rejected')); });
-     }}, {label:'CANCEL'}]);
+     }}, {label:'CANCEL'}], function(o){
+       var d = String(o.destination_address||'').trim(), m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(d);
+       if(o.source_address || !m) return '';
+       var a = +m[1], bc = (d==='255.255.255.255' || +m[4]===255);
+       return (bc || (a>=224 && a<=239)) ? 'BC/MC: without Source address the OS may use the wrong interface - select it' : '';
+     });
 }
 
 /* ---------- tables ---------- */
@@ -7487,39 +9336,359 @@ function rxTable(rx){
   if(!rows.length) return '<div class="empty">'+(rx.running ? 'waiting for traffic ...' : 'receiver not running - START RECEIVER')+'</div>';
   var pc = rx.port_col;
   var h = '<table class="t"><thead><tr><th>ST</th><th>SOURCE</th>'+(pc?'<th class="r">PORT</th>':'')+'<th>CAST</th><th class="r">PACKETS</th><th class="r">LOSS%</th><th class="r">MISS</th><th class="r" title="most packets lost in a row">CONS</th><th class="r">ORD</th>'
-        + '<th class="r">AVG</th><th class="r">MIN</th><th class="r">MAX</th><th class="r">MBIT/S</th><th class="r">PKT/S</th><th>DSCP</th><th class="r">SIZE</th><th class="r">SPORT</th><th>SYNC</th></tr></thead><tbody>';
+        + '<th class="r">AVG</th><th class="r">MIN</th><th class="r">MAX</th><th class="r">MBIT/S</th><th class="r">PKT/S</th><th>DSCP</th><th class="r">SIZE</th><th class="r">SPORT</th><th>SYNC</th><th></th></tr></thead><tbody>';
   rows.forEach(function(s){
     var sc = {ok:'ok', FAIL:'bad', wait:'warnc', off:'dim', none:'dim'}[s.sync] || '';
-    h += '<tr><td class="acc">'+esc(s.st)+'</td><td>'+esc(s.src)+'</td>'+(pc?'<td class="r">'+s.port+'</td>':'')+'<td>'+esc(s.cast)+'</td>'
-      + '<td class="r">'+num(s.pk)+'</td><td class="r '+(s.miss?'warnc':'ok')+'">'+f2(s.loss)+'</td><td class="r">'+num(s.miss)+'</td><td class="r">'+num(s.cons)+'</td><td class="r">'+num(s.ord)+'</td>'
+    var hc = HL.hasOwnProperty(s.st) ? ' style="background:'+HLCOL[HL[s.st]]+'"' : '';
+    h += '<tr><td class="acc hlc" data-st="'+esc(s.st)+'" title="click: mark the lines of this stream in the live view (click again: remove)"'+hc+'>'+esc(s.st)+'</td><td class="hlc" data-st="'+esc(s.st)+'" title="click: mark the lines of this stream in the live view (click again: remove)"'+hc+'>'+esc(s.src)+'</td>'+(pc?'<td class="r">'+s.port+'</td>':'')+'<td>'+esc(s.cast)+'</td>'
+      + '<td class="r">'+num(s.pk)+'</td>'+(s.cast==='TCP' ? '<td class="r dim">-</td><td class="r dim">-</td><td class="r dim">-</td><td class="r dim">-</td>'
+        : '<td class="r '+(s.miss?'warnc':'ok')+'">'+f2(s.loss)+'</td><td class="r">'+num(s.miss)+'</td><td class="r">'+num(s.cons)+'</td><td class="r">'+num(s.ord)+'</td>')
       + '<td class="r">'+f2(s.avg)+'</td><td class="r">'+f2(s.min)+'</td><td class="r">'+f2(s.max)+'</td><td class="r">'+f2(s.mbit)+'</td><td class="r">'+num(s.pps)+'</td>'
-      + '<td>'+esc(s.dscp)+'</td><td class="r">'+s.size+'B</td><td class="r">'+(s.sport||'-')+'</td><td class="'+sc+'">'+esc(s.sync)+'</td></tr>';
+      + '<td>'+esc(s.dscp)+'</td><td class="r">'+s.size+'B</td><td class="r">'+(s.sport||'-')+'</td><td class="'+sc+'">'+esc(s.sync)+'</td><td>'+grBox('rx', s.st)+'</td></tr>';
   });
   h += '</tbody>';
   var t = rx.total;
   if(t){
     h += '<tfoot><tr><td class="acc">SUM</td><td>'+t.n+' streams</td>'+(pc?'<td></td>':'')+'<td></td>'
       + '<td class="r">'+num(t.pk)+'</td><td class="r '+(t.miss?'warnc':'ok')+'">'+f2(t.loss)+'</td><td class="r">'+num(t.miss)+'</td><td class="r">'+num(t.cons)+'</td><td class="r">'+num(t.ord)+'</td>'
-      + '<td class="r">'+f2(t.avg)+'</td><td class="r">'+f2(t.min)+'</td><td class="r">'+f2(t.max)+'</td><td class="r">'+f2(t.mbit)+'</td><td class="r">'+num(t.pps)+'</td>'
-      + '<td></td><td></td><td></td><td></td></tr></tfoot>';
+      + '<td class="r">'+f2(t.avg)+'</td><td class="r">'+f2(t.min)+'</td><td class="r">'+f2(t.max)+'</td><td class="r">'+f2(t.mbit)+'</td><td class="r">'+num(Math.round(t.pps))+'</td>'
+      + '<td></td><td></td><td></td><td></td><td>'+grBox('rx', '*')+'</td></tr></tfoot>';
   }
   return h + '</table>';
 }
 function txTable(tx){
   var rows = tx.streams||[];
   if(!rows.length) return '<div class="empty">no streams - ADD STREAM</div>';
-  var h = '<table class="t"><thead><tr><th class="r">#</th><th>STATE</th><th>DESTINATION</th><th class="r">PORT</th><th class="r">SIZE</th><th>RATE</th><th>DSCP</th><th class="r">TTL</th><th>DF</th>'
-        + '<th>SOURCE</th><th class="r">SENT</th><th class="r">MBIT/S</th><th class="r">PPS NOW</th></tr></thead><tbody>';
+  var h = '<table class="t tx"><thead><tr><th class="r">#</th><th>STATE</th><th>DESTINATION</th><th class="r">PORT</th><th class="r">SIZE</th><th>RATE</th><th>DSCP</th><th class="r">TTL</th><th>DF</th>'
+        + '<th>SOURCE</th><th class="r wsent">SENT</th><th class="r wnum">MBIT/S</th><th class="r wnum">PPS NOW</th><th></th></tr></thead>';
   rows.forEach(function(s, i){
     var c = s.state==='running' ? 'ok' : (s.state==='ERROR' ? 'bad' : 'dim');
     var p = s.params;
-    h += '<tr class="clk'+(i===selRow?' sel':'')+'" data-i="'+i+'"><td class="r">'+(i+1)+'</td><td class="'+c+'">'+esc(s.state)+'</td><td>'+esc(p.destination_address)+'</td>'
-      + '<td class="r">'+p.destination_port+'</td><td class="r">'+p.packet_size+'</td><td>'+esc(s.rate)+'</td><td>'+p.dscp_value+' '+esc(s.dscp)+'</td><td class="r">'+p.ttl+'</td><td class="'+(p.df_bit?'acc':'dim')+'">'+(p.df_bit?'on':'off')+'</td>'
-      + '<td>'+esc(p.source_address||'any')+(p.source_port?':'+p.source_port:'')+'</td><td class="r">'+num(s.sent)+'</td><td class="r">'+f2(s.mbps)+'</td><td class="r">'+(s.pps?Math.round(s.pps).toLocaleString('en-US'):'0')+'</td></tr>'
-      + (s.error ? '<tr><td></td><td colspan="12" class="bad">'+esc(s.error)+'</td></tr>' : '');
+    h += '<tbody class="sg"><tr class="clk'+(i===selRow?' sel':'')+'" data-i="'+i+'"><td class="r">'+(i+1)+'</td><td class="'+c+'">'+esc(s.state)+'</td><td>'+esc(p.destination_address)+'</td>'
+      + '<td class="r">'+p.destination_port+'</td><td class="r">'+p.packet_size+'</td><td>'+esc(s.rate)+'</td><td>'+p.dscp_value+' '+esc(s.dscp)+'</td><td class="r">'+p.ttl+'</td><td class="'+(p.protocol==='tcp'||p.df_bit?'acc':'dim')+'">'+(p.protocol==='tcp'?(p.df_bit?'TCP DF':'TCP'):p.df_bit?'on':'off')+'</td>'
+      + '<td>'+esc(p.source_address||'any')+(p.source_port?':'+p.source_port:'')+'</td><td class="r">'+num(s.sent)+'</td><td class="r">'+f2(s.mbps)+'</td><td class="r">'+(s.pps?Math.round(s.pps).toLocaleString('en-US'):'0')+'</td>'
+      + '<td>'+grBox('tx', String(i))+'</td></tr>'
+      + (s.tcpd ? '<tr><td></td><td colspan="13">'+tcpChips(s.tcpd)+'</td></tr>' : '')
+      + (s.error ? '<tr><td></td><td colspan="13" class="bad"><div class="fixo">'+esc(s.error)+'</div></td></tr>' : '') + '</tbody>';
   });
-  return h + '</tbody></table>';
+  var T = {sent:0, mbps:0, pps:0}; rows.forEach(function(s){ T.sent += s.sent; T.mbps += s.mbps; T.pps += s.pps; });
+  h += '<tfoot><tr><td></td><td class="acc">SUM</td><td>'+rows.length+' streams</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>'
+    + '<td class="r">'+num(T.sent)+'</td><td class="r">'+f2(T.mbps)+'</td><td class="r">'+Math.round(T.pps).toLocaleString('en-US')+'</td>'
+    + '<td>'+grBox('tx', 'sum')+'</td></tr></tfoot>';
+  return h + '</table>';
 }
+var testHidden = 0;
+function testDesc(t){
+  var l = t.label;
+  if(t.kind==='conn') return l+' connection'+(l==='1' ? '' : 's');
+  if(t.kind==='algo') return 'congestion control '+l;
+  if(t.kind==='bloat') return l;
+  return l;
+}
+function testRender(){
+  var box = $('testbox'), t = S && S.test;
+  if(!t || t.id === testHidden){ box.style.display = 'none'; return; }
+  var kinds = {conn:'step test: connections', rate:'step test: rate limit', algo:'algorithm comparison', bloat:'bufferbloat: idle RTT against RTT under load'};
+  var run = t.state === 'running';
+  var head = '<div class="th"><span><b>TCP TEST</b> - '+kinds[t.kind]+' - stream '+(t.idx+1)+' '+esc(t.dest)+' - '
+    + (run ? '<span class="ok">running</span> step '+t.step+'/'+t.steps+' - '+t.phase+' - <span class="acc">test with '+esc(testDesc(t))+'</span>' : (t.state==='done' ? '<span class="ok">done</span>' : '<span class="warnc">'+esc(t.state)+(t.error ? ': '+esc(t.error) : '')+'</span>'))
+    + ' <span class="dim">'+t.dur+' s per step + '+t.warm+' s warm-up</span></span><span>'
+    + (run ? '<button id="tstop">STOP</button> ' : '')
+    + (t.rows.length ? '<button id="tcsv" title="download the result as a CSV file">SAVE</button> ' : '') + '<button id="tclose">'+(run ? 'HIDE' : 'CLOSE')+'</button></span></div>';
+  var mx = 0; t.rows.forEach(function(r){ if(r.mbit != null && r.mbit > mx) mx = r.mbit; });
+  var h = '<table><thead><tr><th title="the setting changed in this step">'+({conn:'CONNECTIONS',rate:'RATE LIMIT',algo:'ALGORITHM',bloat:'PHASE'}[t.kind])+'</th><th title="average rate during the measurement">MBIT/S AVG</th><th title="lowest rate of one second">MIN</th><th title="highest rate of one second">MAX</th><th title="average RTT">RTT AVG</th><th title="95 % of the seconds had an RTT below this">RTT P95</th><th title="highest RTT">RTT MAX</th><th title="segments sent again during the measurement">RETRANS</th><th title="retransmitted share of all segments">RETRANS %</th><th title="average congestion window">CWND KB</th><th title="worst congestion state seen">STATE</th></tr></thead><tbody>';
+  t.rows.forEach(function(r){
+    if(r.mbit == null){ h += '<tr><td>'+esc(r.label)+'</td><td colspan="10" class="dim">no data</td></tr>'; return; }
+    h += '<tr><td class="acc">'+esc(r.label)+'</td><td>'+f2(r.mbit)+'<span class="tbar" style="width:'+(mx ? Math.round(120*r.mbit/mx) : 0)+'px"></span></td><td>'+f2(r.mbit_min)+'</td><td>'+f2(r.mbit_max)+'</td>'
+      + '<td>'+f2(r.rtt)+'</td><td>'+f2(r.rtt_p95)+'</td><td>'+f2(r.rtt_max)+'</td><td class="'+(r.retr?'warnc':'')+'">'+num(r.retr)+'</td><td>'+r.retr_pct.toFixed(3)+'</td><td>'+num(r.cwnd)+'</td><td class="'+(r.ca==='Open'?'ok':'warnc')+'">'+esc(r.ca)+'</td></tr>';
+  });
+  h += '</tbody></table>';
+  if(t.bloat) h += '<div class="bloat" title="queueing delay: how much the RTT grows when the stream fills the path (buffer in front of the bottleneck)"><b>BUFFERBLOAT</b> idle RTT <b>'+f2(t.bloat.idle)+' ms</b> - under load <b>'+f2(t.bloat.load)+' ms</b> (p95 '+f2(t.bloat.load_p95)+' ms) - added delay <b class="'+(t.bloat.add>5?'warnc':'ok')+'">+'+f2(t.bloat.add)+' ms</b> (p95 +'+f2(t.bloat.add_p95)+' ms)</div>';
+  var key = h.length + head;
+  if(box._key !== key){
+    box._key = key; box.innerHTML = head + h;
+    var b;
+    if((b = $('tstop'))) b.onclick = function(){ post('test_stop'); };
+    if((b = $('tcsv'))) b.onclick = function(){ window.location = 'api/test_csv'; };
+    if((b = $('tclose'))) b.onclick = function(){ testHidden = t.id; testRender(); };
+  }
+  box.style.display = 'block';
+}
+function openTestDialog(){
+  var sts = S.tx.streams || [], i0 = Math.min(selRow, sts.length-1), tcpIdx = [];
+  sts.forEach(function(s, i){ if(s.params.protocol==='tcp') tcpIdx.push(i); });
+  if(!tcpIdx.length){ note('the test needs a TCP stream (Protocol = TCP)', true); return; }
+  if(tcpIdx.indexOf(i0) < 0) i0 = tcpIdx[0];
+  var algos = (S.tcp_cc||[]).filter(function(o){ return o[0]; }).map(function(o){ return o[0]; });
+  var fields = [
+    {k:'idx', label:'Stream', type:'select', options:tcpIdx.map(function(i){ var p = sts[i].params; return [i, (i+1)+'  '+p.destination_address+':'+p.destination_port+'  x'+p.connections]; })},
+    {k:'kind', label:'Test', type:'select', options:[['conn','Step test: connections'],['rate','Step test: rate limit (Mbit/s, burst mode)'],['algo','Algorithm comparison'],['bloat','Bufferbloat: idle RTT against RTT under load']]},
+    {k:'v_conn', label:'Connections', hint:'e.g. 1,2,4,8 or 1-8/1', type:'text', enabled:function(o){ return o.kind==='conn'; }},
+    {k:'v_rate', label:'Rate limits (Mbit/s)', hint:'e.g. 100,250,500,1000 or 100-1000/100; 0 = unlimited', type:'text', enabled:function(o){ return o.kind==='rate'; }},
+    {k:'v_algo', label:'Algorithms', hint:'available: '+(algos.join(', ')||'Linux only')+' - default = system default', type:'text', enabled:function(o){ return o.kind==='algo'; }},
+    {k:'v_load', label:'Load rate (Mbit/s)', hint:'0 = the stream setting (burst mode without limit fills the path); the idle phase sends 1 packet/s', type:'number', enabled:function(o){ return o.kind==='bloat'; }},
+    {k:'dur', label:'Measuring time per step (s)', type:'number'},
+    {k:'warm', label:'Warm-up per step (s)', hint:'(not measured)', type:'number'}
+  ];
+  openForm('TCP TEST', 'The selected stream is changed step by step and restored afterwards. The result table appears below; SAVE downloads it as a CSV file.',
+    fields, {idx:i0, kind:'conn', v_conn:'1,2,4,8', v_rate:'100,250,500,1000', v_algo:algos.join(','), v_load:0, dur:20, warm:5},
+    [{label:'START TEST', cls:'on', fn:function(v, done){ testHidden = 0; v.idx = parseInt(v.idx, 10); post('test_start', '', v, function(j){ done(j.ok?null:(j.error||'rejected')); }); }},
+     {label:'CANCEL'}]);
+}
+var TCPTIP = {
+  'TCP': 'TCP connections up / configured',
+  'algorithm': 'Congestion control algorithm in use',
+  'connect': 'Handshake time (SYN until connected)',
+  'RTT': 'Round-trip time now (kernel, smoothed)',
+  'min / avg / max': 'RTT since the start: min / average / max',
+  'retransmits': 'Segments sent again after a loss (since reset)',
+  'reconnects': 'Connections lost and opened again',
+  'cwnd': 'Congestion window: data allowed in flight (sender limit)',
+  'rwnd': 'Receive window: data the receiver accepts (receiver limit)',
+  'send queue': 'Data written but not yet sent (own host queue)',
+  'ssthresh': 'Slow-start threshold: window size where growth slows down (unset = no loss yet)',
+  'RTO': 'Retransmission timeout: wait before sending again',
+  'state': 'Congestion state: Open = normal; Disorder, CWR, Recovery, Loss = trouble',
+  'lost': 'Segments the kernel considers lost',
+  'reordering': 'Reordering distance seen by the kernel (segments)',
+  'pacing': 'Kernel pacing rate: sending speed limit',
+  'delivery rate': 'Measured rate at which data is acknowledged',
+  'MSS': 'Maximum segment size: payload per segment',
+  'negotiated': 'Options agreed with the peer: TS timestamps, SACK, WS window scale, ECN'
+};
+function tcpChips(d){
+  // fixed widths (monospace, ch): the same value of every stream stands exactly below each other
+  function c(k, v, cls, w){
+    if(v==null) return '<span class="tc" style="width:'+w+'ch"></span>';
+    var t = esc(TCPTIP[k]||'');
+    return '<span class="tc" style="width:'+w+'ch" title="'+t+'"><span class="tk" title="'+t+'">'+k+'</span> <span class="tv'+(cls?' '+cls:'')+'" title="'+t+'">'+v+'</span></span>';
+  }
+  var a = c('TCP', d.up+'/'+d.n+' conn', d.up<d.n?'warnc':'ok', 17);
+  a += c('algorithm', d.cc||null, '', 21);
+  a += c('connect', d.connect!=null ? d.connect+' ms' : null, '', 20);
+  a += c('RTT', d.rtt!=null ? d.rtt.toFixed(2)+' ms' : null, '', 17);
+  a += c('min / avg / max', d.rtt_min!=null ? d.rtt_min.toFixed(2)+' / '+d.rtt_avg.toFixed(2)+' / '+d.rtt_max.toFixed(2)+' ms' : null, '', 47);
+  a += c('retransmits', d.retrans!=null ? d.retrans : null, d.retrans?'warnc':'', 20);
+  a += c('reconnects', d.reconnects!=null ? d.reconnects : null, d.reconnects?'warnc':'', 15);
+  if(txDetail){
+    a += c('cwnd', d.cwnd!=null ? d.cwnd+' KB' : null, '', 16);
+    a += c('rwnd', d.rwnd!=null ? d.rwnd+' KB' : null, '', 16);
+    a += c('send queue', d.queue!=null ? d.queue+' KB' : null, '', 22);
+  }
+  var b = '';
+  b += c('ssthresh', d.ssthresh!=null ? d.ssthresh+' KB' : 'unset', '', 17+4);
+  b += c('RTO', d.rto!=null ? d.rto+' ms' : null, '', 17);
+  b += c('state', d.ca||null, d.ca==='Open'?'ok':'warnc', 17);
+  b += c('lost', d.lost!=null ? d.lost : null, d.lost?'warnc':'', 14);
+  b += c('reordering', d.reord!=null ? d.reord : null, '', 17);
+  b += c('pacing', d.pacing!=null ? d.pacing+' Mbit/s' : null, '', 25);
+  b += c('delivery rate', d.delivery!=null ? d.delivery+' Mbit/s' : null, '', 32);
+  b += c('MSS', d.mss!=null ? d.mss : null, '', 12);
+  b += c('negotiated', d.opts||null, '', 28);
+  return '<div class="fixo">'+a+'</div>' + (txDetail && d.ca ? '<div class="fixo">'+b+'</div>' : '');
+}
+var txDetail = true;
+try{ txDetail = load('mautg_txdetail') !== '0'; }catch(e){}
+
+
+/* ---------- history charts ---------- */
+function tcpPct(a, p){ if(!a.length) return 0; var b = a.slice().sort(function(x,y){ return x-y; }); return b[Math.min(b.length-1, Math.floor(p*b.length))]; }
+function grTitle(d){
+  if(d.num==='SUM') return '#SUM  all streams'+(d.rate ? '  ('+d.rate+')' : '');
+  var a = ['#'+(d.num||'')];
+  if(d.proto) a.push(d.proto);
+  a.push((d.dest||'') + (d.proto==='TCP' && d.kind!=='rx' ? ' ('+(d.conns||1)+'conn)' : ''));
+  if(d.dscp) a.push(d.dscp);
+  if(d.rate) a.push(d.rate);
+  if(d.size) a.push(d.size + (d.kind==='rx' ? 'B' : ''));
+  return a.join('  ');
+}
+function histDraw(d, pn){
+  var T = pn.querySelector('.gt'), SM = pn.querySelector('.gs'), CH = pn.querySelector('.gc');
+  if(!d) return;
+  var P = d.points || [], tcp = d.kind==='tcp', rxk = d.kind==='rx';
+  T.textContent = grTitle(d);
+  if(P.length < 2){ SM.textContent = 'collecting data ... (one value per second)'; CH.innerHTML = ''; return; }
+  var n = P.length, panels, sumHtml, tipFn, legend;
+  function st(col){ var a = P.map(function(p){ return p[col]; }).filter(function(v){ return v!=null; }); if(!a.length) a = [0]; var n = a.length, m = a.reduce(function(x,y){ return x+y; }, 0)/n;
+    return {min:Math.min.apply(null,a), max:Math.max.apply(null,a), avg:m, p95:tcpPct(a,0.95), sd:Math.sqrt(a.reduce(function(x,y){ return x+(y-m)*(y-m); }, 0)/n)}; }
+  if(rxk){
+    var isT = d.proto==='TCP';                  /* TCP delivers everything in order: no loss / misorder */
+    var dl = st(5), mb = st(1), lastp = P[n-1], lost = P.reduce(function(a, p){ return a+p[3]; }, 0), ordr = P.reduce(function(a, p){ return a+p[4]; }, 0);
+    var dmin = Math.min.apply(null, P.map(function(p){ return p[6]==null ? Infinity : p[6]; })), dmax = Math.max.apply(null, P.map(function(p){ return p[7]==null ? -Infinity : p[7]; }));
+    sumHtml = 'delay <b>min '+(isFinite(dmin)?dmin.toFixed(2):'-')+'</b> / avg <b>'+dl.avg.toFixed(2)+'</b> / p95 <b>'+dl.p95.toFixed(2)+'</b> / max <b>'+(isFinite(dmax)?dmax.toFixed(2):'-')+'</b> ms'
+      + '<br>jitter (stddev of the per-second avg) <b>'+dl.sd.toFixed(2)+'</b> ms'+(isT ? '' : ' &nbsp; lost <b>'+lost+'</b> (total loss <b>'+lastp[8].toFixed(3)+'%</b>) &nbsp; misordered <b>'+ordr+'</b>')
+      + ' &nbsp; Mbit/s avg <b>'+mb.avg.toFixed(2)+'</b>';
+    panels = [
+      {title:'Delay (ms): avg per second, band = fastest..slowest packet of the second', h:130, lines:[{get:function(p){ return p[5]; }, c:'#7fd1ff'}], band:[function(p){ return p[6]; }, function(p){ return p[7]; }]},
+      {skip:isT, title:'Lost packets per second', h:70, bars:function(p){ return p[3]; }, c:'#ff4b4b'},
+      {skip:isT, title:'Misordered packets per second', h:60, bars:function(p){ return p[4]; }, c:'#e5c07b'},
+      {title:'Throughput (Mbit/s)', h:80, lines:[{get:function(p){ return p[1]; }, c:'#3ddc60'}]},
+      {title:'Packets per second', h:80, lines:[{get:function(p){ return p[2]; }, c:'#c792ea'}]}];
+    tipFn = function(p){ return 'avg-d: '+(p[5]==null?'n/a':p[5].toFixed(2)+' ms')+'<br>min-d: '+(p[6]==null?'n/a':p[6].toFixed(2)+' ms')+'<br>max-d: '+(p[7]==null?'n/a':p[7].toFixed(2)+' ms')+(isT ? '<br>' : '<br>lost '+p[3]+'/s, misordered '+p[4]+'/s<br>total loss '+p[8].toFixed(3)+'%<br>')+p[1].toFixed(2)+' Mbit/s, '+Math.round(p[2]).toLocaleString('en-US')+' pps'; };
+    legend = '<span style="color:#7fd1ff">delay</span> '+(isT ? '' : '<span style="color:#ff4b4b">lost</span> <span style="color:#e5c07b">misordered</span> ')+'<span style="color:#3ddc60">Mbit/s</span> <span style="color:#c792ea">pps</span>';
+  } else if(tcp){
+    var r = st(1), retr = P[n-1][7] - P[0][7];
+    sumHtml = 'RTT <b>min '+r.min.toFixed(2)+'</b> / avg <b>'+r.avg.toFixed(2)+'</b> / p95 <b>'+r.p95.toFixed(2)+'</b> / max <b>'+r.max.toFixed(2)+'</b> ms'
+      + '<br>jitter (stddev) <b>'+r.sd.toFixed(2)+'</b> ms &nbsp; retransmits <b>'+retr+'</b> &nbsp; connect <b>'+(d.connect_ms||0)+'</b> ms'
+      + (d.reconnects ? ' &nbsp; reconnects <b>'+d.reconnects+'</b>' : '');
+    panels = [
+      {title:'RTT (ms)', h:130, lines:[{get:function(p){ return p[1]; }, c:'#7fd1ff'}], band:[function(p){ return p[2]; }, function(p){ return p[3]; }]},
+      {title:'Retransmits per second', h:70, bars:function(p, i){ return i ? Math.max(0, p[7]-P[i-1][7]) : 0; }, c:'#ff4b4b'},
+      {title:'Windows / queue (KB)', h:110, lines:[{get:function(p){ return p[4]; }, c:'#3ddc60'},{get:function(p){ return p[5]; }, c:'#e5c07b'},{get:function(p){ return p[6]; }, c:'#c792ea'}]},
+      {title:'Throughput (Mbit/s)', h:80, lines:[{get:function(p){ return p[8]; }, c:'#3ddc60'}]}];
+    tipFn = function(p, i){ return 'avg-rtt: '+p[1].toFixed(2)+' ms<br>min-rtt: '+p[2].toFixed(2)+' ms<br>max-rtt: '+p[3].toFixed(2)+' ms<br>retransmits '+(i?p[7]-P[i-1][7]:0)+'/s (total '+p[7]+')<br>cwnd '+p[4]+' KB, rwnd '+p[5]+' KB<br>send queue '+p[6]+' KB<br>'+p[8]+' Mbit/s'; };
+    legend = '<span style="color:#7fd1ff">RTT avg (band = fastest..slowest connection)</span> <span style="color:#ff4b4b">retransmits</span> <span style="color:#3ddc60">cwnd</span> <span style="color:#e5c07b">rwnd</span> <span style="color:#c792ea">send queue</span>';
+  } else {
+    var m = st(1), q = st(2), er = P[n-1][3] - P[0][3];
+    sumHtml = 'Mbit/s <b>min '+m.min.toFixed(2)+'</b> / avg <b>'+m.avg.toFixed(2)+'</b> / max <b>'+m.max.toFixed(2)+'</b>'
+      + ' &nbsp; pps avg <b>'+Math.round(q.avg).toLocaleString('en-US')+'</b> / max <b>'+Math.round(q.max).toLocaleString('en-US')+'</b>'
+      + ' &nbsp; deviation (stddev) <b>'+m.sd.toFixed(2)+'</b> Mbit/s &nbsp; send errors <b>'+er+'</b> &nbsp; set: <b>'+esc(d.rate||'')+'</b>'+(d.size?', '+d.size+' B':'');
+    panels = [
+      {title:'Throughput (Mbit/s)', h:130, lines:[{get:function(p){ return p[1]; }, c:'#3ddc60'}]},
+      {title:'Packets per second', h:110, lines:[{get:function(p){ return p[2]; }, c:'#7fd1ff'}]},
+      {title:'Send errors per second', h:70, bars:function(p, i){ return i ? Math.max(0, p[3]-P[i-1][3]) : 0; }, c:'#ff4b4b'}];
+    tipFn = function(p, i){ return p[1].toFixed(2)+' Mbit/s<br>'+Math.round(p[2]).toLocaleString('en-US')+' pps<br>send errors '+(i?p[3]-P[i-1][3]:0)+'/s (total '+p[3]+')'; };
+    legend = '<span style="color:#3ddc60">Mbit/s</span> <span style="color:#7fd1ff">pps</span> <span style="color:#ff4b4b">send errors</span>';
+  }
+  panels = panels.filter(function(q){ return !q.skip; });
+  SM.innerHTML = sumHtml + ' &nbsp; <span class="dim">'+n+' s</span>';
+  panels.forEach(function(q){ q.h = Math.round(q.h*0.72); });
+  var W = 820, L = 54, R = 10;
+  var t0 = P[0][0], t1 = P[n-1][0], tspan = (t1-t0)||1, y = 0, svg = '';
+  function X(t){ return L + (t-t0)/tspan*(W-L-R); }
+  panels.forEach(function(pn){
+    var top = y+16, bot = y+pn.h, vals = [], lo, hi;
+    if(pn.bars) vals = P.map(pn.bars);
+    else pn.lines.forEach(function(l){ P.forEach(function(p){ var v = l.get(p); if(v!=null) vals.push(v); }); });
+    if(pn.band) P.forEach(function(p){ var a = pn.band[0](p), b2 = pn.band[1](p); if(a!=null) vals.push(a, b2); });
+    if(!vals.length) vals.push(0);
+    lo = (pn.bars || pn.band) ? 0 : Math.min(0, Math.min.apply(null, vals)); hi = Math.max.apply(null, vals) || 1;
+    function Y(v){ return bot - (v-lo)/(hi-lo||1)*(bot-top); }
+    svg += '<text x="'+L+'" y="'+(y+11)+'" fill="#8fa08f" font-size="12">'+pn.title+'</text>';
+    for(var g=0; g<=2; g++){
+      var gv = lo+(hi-lo)*g/2, gy = Y(gv);
+      svg += '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+gy+'" y2="'+gy+'" stroke="#1e2a1e"/><text x="'+(L-4)+'" y="'+(gy+4)+'" text-anchor="end" fill="#5d6b5d" font-size="10">'+(gv>=100?gv.toFixed(0):gv.toFixed(2).replace(/\.?0+$/,''))+'</text>';
+    }
+    if(pn.band){
+      var PB = P.filter(function(p){ return pn.band[0](p)!=null; });
+      var up = PB.map(function(p){ return X(p[0])+','+Y(pn.band[1](p)); }), dn = PB.map(function(p){ return X(p[0])+','+Y(pn.band[0](p)); }).reverse();
+      svg += '<polygon points="'+up.concat(dn).join(' ')+'" fill="#7fd1ff" opacity="0.15"/>';
+    }
+    if(pn.bars){
+      var bw = Math.max(1, (W-L-R)/n*0.8);
+      vals.forEach(function(v, i){ if(v>0) svg += '<rect x="'+(X(P[i][0])-bw/2)+'" y="'+Y(v)+'" width="'+bw+'" height="'+(bot-Y(v))+'" fill="'+pn.c+'"/>'; });
+    } else pn.lines.forEach(function(l){
+      svg += '<polyline fill="none" stroke="'+l.c+'" stroke-width="1.6" points="'+P.filter(function(p){ return l.get(p)!=null; }).map(function(p){ return X(p[0])+','+Y(l.get(p)); }).join(' ')+'"/>';
+    });
+    y += pn.h + 14;
+  });
+  var H = y;
+  svg += '<g><line class="thLine" y1="14" y2="'+H+'" stroke="#c8d6c8" opacity="0" /></g>';
+  for(var q2=0; q2<=4; q2++){ var tt = t0+tspan*q2/4; svg += '<text x="'+X(tt)+'" y="'+(H+12)+'" text-anchor="middle" fill="#5d6b5d" font-size="10">'+(tt-t1).toFixed(0)+' s</text>'; }
+  CH.innerHTML = '<div style="position:relative"><svg class="thSvg" viewBox="0 0 '+W+' '+(H+18)+'" width="100%" style="display:block"><rect x="0" y="0" width="'+W+'" height="'+(H+18)+'" fill="transparent"/>'+svg+'</svg><div class="thtip" class="thtip" style="display:none"></div></div>'
+    + '<div class="thleg">'+legend+'</div>';
+  var sv = CH.querySelector('.thSvg'), tip = CH.querySelector('.thtip'), ln = CH.querySelector('.thLine');
+  pn._mm = function(e){
+    var rc = sv.getBoundingClientRect(), x = (e.clientX - rc.left)/rc.width*W, t = t0 + (x-L)/(W-L-R)*tspan, bi = 0, bd = 1e9;
+    P.forEach(function(p, i){ var dd = Math.abs(p[0]-t); if(dd<bd){ bd = dd; bi = i; } });
+    var p = P[bi]; if(x < L || x > W-R){ tip.style.display = 'none'; ln.setAttribute('opacity', 0); return; }
+    var lx = X(p[0]); ln.setAttribute('x1', lx); ln.setAttribute('x2', lx); ln.setAttribute('opacity', 0.6);
+    tip.innerHTML = 'Time: <b>'+(p[0]-t1).toFixed(0)+' s</b><br>'+tipFn(p, bi);
+    tip.style.display = 'block';
+    var tw = tip.offsetWidth || 200, tx = lx/W*rc.width + 14; if(tx + tw > rc.width) tx -= tw + 28; if(tx < 0) tx = 0;
+    tip.style.left = tx+'px'; tip.style.top = Math.max(0, e.clientY - rc.top - 40)+'px';
+  };
+  pn._ml = function(){ tip.style.display = 'none'; ln.setAttribute('opacity', 0); };
+}
+
+/* ---------- inline graphs (checkbox of a row): shown below the stream table, everything stays usable ---------- */
+var GR = {tx:{}, rx:{}};
+try{ var gs0 = JSON.parse(load('mautg_graphs')||'{}'); if(gs0.tx) GR.tx = gs0.tx; }catch(e){}   /* only the sender selection is remembered */
+function grSave(){ store('mautg_graphs', JSON.stringify({tx: GR.tx})); }
+function grSide(){ return tab==='sender' ? 'tx' : 'rx'; }
+function grBox(side, key){
+  var on = !!GR[side][key];
+  return '<label class="gck" title="show the graph below the table"><input type="checkbox" class="gchk" data-s="'+side+'" data-k="'+esc(key)+'"'+(on?' checked':'')+'> graph</label>';
+}
+function grUrl(side, k){ return side==='tx' ? 'api/tcp_hist?i='+(k==='sum' ? -1 : k) : 'api/rx_hist?l='+encodeURIComponent(k); }
+var grFirst = false;
+function grSync(){
+  var side = grSide(), host = $('graphs'), keys = Object.keys(GR[side]).filter(function(k){ return GR[side][k]; });
+  if(keys.length && host.style.display === 'none') grFirst = true;           // the first graph appears
+  var have = {};
+  Array.prototype.slice.call(host.children).forEach(function(el){
+    if(el.getAttribute('data-s')!==side || keys.indexOf(el.getAttribute('data-k'))<0) host.removeChild(el); else have[el.getAttribute('data-k')] = el;
+  });
+  keys.forEach(function(k){
+    if(have[k]) return;
+    var el = document.createElement('div'); el.className = 'gp'; el.setAttribute('data-s', side); el.setAttribute('data-k', k);
+    el.innerHTML = '<div class="gh"><b class="gt"></b><span><button class="gr" title="reset the statistics and the graph">RESET</button> <button class="gx" title="hide this graph">&times;</button></span></div><div class="gs thsum">loading ...</div><div class="gc"></div>';
+    var gc = el.querySelector('.gc');
+    var refresh = function(){ if(el._dirty && el._d){ el._dirty = false; histDraw(el._d, el); } };
+    gc.addEventListener('mouseenter', function(){ el._hov = true; });
+    gc.addEventListener('mousemove', function(e){ refresh(); if(el._mm) el._mm(e); });
+    gc.addEventListener('click', function(e){ refresh(); if(el._mm) el._mm(e); });
+    gc.addEventListener('mouseleave', function(){ el._hov = false; refresh(); if(el._ml) el._ml(); });
+    host.appendChild(el);
+    grFetch(el);
+  });
+  host.style.display = keys.length ? 'grid' : 'none';
+  $('gsplit').style.display = keys.length ? 'block' : 'none';
+}
+function grFetch(el){
+  var side = el.getAttribute('data-s'), k = el.getAttribute('data-k');
+  fetch(grUrl(side, k)).then(function(r){ return r.json(); }).then(function(j){
+    if(!el.parentNode) return;
+    if(!j.points || j.points.length<2){
+      el.querySelector('.gt').textContent = (j.num ? grTitle(j) : j.dest || (side==='tx' ? (k==='sum' ? 'SUM - all streams' : 'stream '+(+k+1)) : (k==='*' ? 'SUM - all streams' : 'stream '+k)));
+      el.querySelector('.gs').textContent = 'collecting data ... (one value per second)'; el.querySelector('.gc').innerHTML = ''; return;
+    }
+    el._d = j;
+    if(el._hov){ el._dirty = true; return; }      // mouse is over the graph: keep the tooltip, redraw on the next move / click / leave
+    histDraw(j, el);
+    if(grFirst && el.parentNode && j.points && j.points.length >= 2){ grFirst = false; if(window.grAutoFit) window.grAutoFit(); }
+  }).catch(function(){});
+}
+setInterval(function(){
+  var side = grSide();
+  Array.prototype.forEach.call($('graphs').children, function(el){ if(el.getAttribute('data-s')===side) grFetch(el); });
+}, 1000);
+(function(){                                     // draggable divider above the graph area; height is remembered
+  var sp = $('gsplit'), host = $('graphs');
+  function setH(h){ h = Math.max(90, Math.min(h, window.innerHeight - 160)); host.style.maxHeight = 'none'; host.style.flex = '0 0 auto'; host.style.height = h+'px'; return h; }
+  window.grAutoFit = function(){                  // first graph shown: make the area as high as its content needs (if there is room)
+    var need = host.scrollHeight + 6;
+    if(host.getBoundingClientRect().height < need) setH(need);
+  };
+  try{ var h0 = parseInt(load('mautg_gh')||'0', 10); if(h0 > 0) setH(h0); }catch(e){}
+  sp.addEventListener('pointerdown', function(e){
+    e.preventDefault(); var y0 = e.clientY, h0 = host.getBoundingClientRect().height, cur = h0; sp.classList.add('drag');
+    try{ sp.setPointerCapture(e.pointerId); }catch(x){}
+    var mv = function(ev){ cur = setH(h0 + (ev.clientY - y0)); };
+    var up = function(){ sp.classList.remove('drag'); sp.removeEventListener('pointermove', mv); sp.removeEventListener('pointerup', up); sp.removeEventListener('pointercancel', up); store('mautg_gh', String(Math.round(cur))); };
+    sp.addEventListener('pointermove', mv); sp.addEventListener('pointerup', up); sp.addEventListener('pointercancel', up);
+  });
+  sp.addEventListener('dblclick', function(){ host.style.height = ''; host.style.maxHeight = ''; host.style.flex = ''; store('mautg_gh', '0'); });
+})();
+$('graphs').addEventListener('click', function(e){
+  var el = e.target.closest ? e.target.closest('.gp') : null; if(!el) return;
+  var side = el.getAttribute('data-s'), k = el.getAttribute('data-k');
+  if(e.target.closest('.gx')){ GR[side][k] = false; grSave(); grSync(); var cb = document.querySelector('.gchk[data-s="'+side+'"][data-k="'+k+'"]'); if(cb) cb.checked = false; }
+  else if(e.target.closest('.gr')){
+    var done = function(j){ if(j.ok) grFetch(el); else note(j.error||'rejected', true); };
+    if(side==='tx') post('tx_reset', k==='sum' ? 'all' : k, {}, done); else post('rx_hist_reset', k, {}, done);
+  }
+});
+// the table is redrawn every second: toggle on mousedown (the element may be gone at mouseup)
+$('grid').addEventListener('mousedown', function(e){
+  var l = e.target.closest ? e.target.closest('.gck') : null; if(!l) return;
+  e.preventDefault();
+  var t = l.querySelector('.gchk'), side = t.getAttribute('data-s'), k = t.getAttribute('data-k');
+  GR[side][k] = !GR[side][k]; t.checked = GR[side][k]; grSave(); grSync();
+});
+$('grid').addEventListener('click', function(e){ if(e.target.closest && e.target.closest('.gck')){ e.preventDefault(); e.stopPropagation(); } }, true);
+
 
 /* ---------- tabs ---------- */
 function setTab(t){
@@ -7533,17 +9702,39 @@ function setTab(t){
   $('statsTx').style.display = (t==='sender') ? '' : 'none';
   $('logwrap').style.display = (t==='receiver') ? '' : 'none';
   $('grid').style.maxHeight = (t==='receiver') ? '46%' : 'none';
-  $('grid').style.flex = (t==='receiver') ? '0 0 auto' : '1 1 auto';
+  $('grid').style.flex = '0 0 auto';
+  $('graphs').style.flex = (t==='receiver') ? '0 1 auto' : '1 1 0';
+  $('graphs').style.maxHeight = (t==='receiver') ? '55%' : 'none';
+  grSync();
   if(S) render();
 }
 $('tabRx').onclick = function(){ setTab('receiver'); };
 $('tabTx').onclick = function(){ setTab('sender'); };
 
 /* ---------- log ---------- */
+/* click on ST / SOURCE in the receiver table marks the lines of that stream in the live view (each stream its own colour) */
+var HLCOL = ['rgba(80,140,255,.30)','rgba(255,160,50,.30)','rgba(220,90,220,.30)','rgba(50,210,210,.28)','rgba(230,220,60,.26)','rgba(255,90,90,.30)','rgba(130,230,90,.26)','rgba(160,130,255,.30)'];
+var HL = {};
+function hlToggle(st){
+  if(HL.hasOwnProperty(st)){ delete HL[st]; }
+  else { var used = {}, i; Object.keys(HL).forEach(function(k){ used[HL[k]] = 1; }); for(i = 0; used[i]; i++); HL[st] = i % HLCOL.length; }
+  logRender(); if(S) render();
+}
+function logLine(l){
+  var h = ansi(l);
+  if(!Object.keys(HL).length) return h;
+  var m = /^\s*[0-9:.]+\s*\|\s*([^|\s]+)\s*\|/.exec(l.replace(/\x1b\[[0-9;]*m/g, ''));
+  if(m && HL.hasOwnProperty(m[1])) return '<span class="hlx" style="background:'+HLCOL[HL[m[1]]]+'">'+h+'</span>';
+  return h;
+}
+$('grid').addEventListener('click', function(e){
+  var td = e.target.closest ? e.target.closest('td[data-st]') : null;
+  if(td) hlToggle(td.getAttribute('data-st'));
+});
 function logRender(){
   var el = $('log'), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 30 || Date.now() < endUntil;
   var lines = logAll;
-  el.innerHTML = lines.slice(-1500).map(ansi).join('\n');
+  el.innerHTML = lines.slice(-1500).map(logLine).join('\n');
   if(atEnd) el.scrollTop = el.scrollHeight;
 }
 $('btnClearLog').onclick = function(){ logAll = []; $('log').innerHTML = ''; };
@@ -7553,6 +9744,7 @@ function render(){
   if(!S) return;
   var rx = S.rx || {}, tx = S.tx || {streams:[]};
   $('ver').textContent = 'v' + S.version;
+  testRender();
   $('clock').textContent = S.datetime;
   var ro = !!S.readonly;
   $('ro').textContent = ro ? '- read only, controlled from the terminal' : (S.mode==='control' ? '- terminal and browser control the same run' : '');
@@ -7595,8 +9787,8 @@ function render(){
     $('tRun').textContent = run; $('tSent').textContent = num(sent); $('tRate').textContent = f2(mb);
     $('tSync').textContent = tx.sync_active ? 'port '+tx.sync_port : 'off';
     var ctl = !!tx.controllable;
-    ['btnTxAdd','btnTxToggle','btnTxEdit','btnTxDel','btnTxStartAll','btnTxStopAll'].forEach(function(id){ $(id).disabled = !ctl; });
-    $('foot').textContent = ctl ? 'KEYS: TAB receiver | UP/DOWN select | SPACE start/stop | E edit | N new | D delete | S/X start/stop all' : (tx.attached ? 'sender running without live view - not controllable from the browser' : 'no sender running in this process');
+    ['btnTxAdd','btnTxToggle','btnTxEdit','btnTxDel','btnTxStartAll','btnTxStopAll','btnTxReset','btnTxTest'].forEach(function(id){ $(id).disabled = !ctl; });
+    $('foot').textContent = ctl ? 'KEYS: TAB receiver | UP/DOWN select | SPACE start/stop | E edit | N new | D delete | S/X start/stop all | C reset statistics' : (tx.attached ? 'sender running without live view - not controllable from the browser' : 'no sender running in this process');
   }
   (function(){
     var ro = !!S.readonly, rx = S.rx || {};
@@ -7618,12 +9810,15 @@ function render(){
 }
 
 /* ---------- polling ---------- */
+var ver0 = '';
 function poll(){
   if(giveUp) return;
   fetch('api/status?ls=' + logSeq).then(function(r){ return r.json(); }).then(function(s){
     if(s.stopped){ down = true; $('stoppedModal').style.display = 'flex'; setTimeout(poll, 1000); return; }
     fails = 0;
     if(down){ location.reload(); return; }           /* mautg was restarted: load the new page */
+    if(ver0 && s.version && s.version !== ver0){ location.reload(); return; }     /* new version behind the same address */
+    if(!ver0) ver0 = s.version;
     S = s;
     if(s.log){
       if(s.log.seq < logSeq){ logAll = []; }
@@ -7796,6 +9991,10 @@ $('btnTxEdit').onclick     = function(){ if(S.tx.streams.length) openTxEditor(se
 $('btnTxToggle').onclick   = function(){ var s = S.tx.streams[selRow]; if(s) post(s.state==='running' ? 'tx_stop' : 'tx_start', selRow); };
 $('btnTxStartAll').onclick = function(){ post('tx_start', 'all'); };
 $('btnTxStopAll').onclick  = function(){ post('tx_stop', 'all'); };
+$('btnTxReset').onclick    = function(){ post('tx_reset', 'all'); };
+$('btnTxTest').onclick     = function(){ openTestDialog(); };
+$('btnTxDetail').onclick   = function(){ txDetail = !txDetail; store('mautg_txdetail', txDetail ? '1' : '0'); $('btnTxDetail').className = txDetail ? 'on' : ''; render(); };
+$('btnTxDetail').className = txDetail ? 'on' : '';
 $('btnTxDel').onclick      = function(){
   var s = S.tx.streams[selRow]; if(!s) return;
   openForm('DELETE STREAM '+(selRow+1), s.params.destination_address+':'+s.params.destination_port+' will be stopped and removed.', [], {},
@@ -7824,6 +10023,8 @@ poll();
 # --- Main ---------------------------------------------------------------------
 
 def _ui_flags(p):
+    p.add_argument('--no-sudo', action='store_true', default=argparse.SUPPRESS,
+                   help='Do not offer to restart through sudo (also: MAUTG_NO_SUDO=1)')
     p.add_argument('--no-color', action='store_true', default=argparse.SUPPRESS,
                    help='No color codes (also: NO_COLOR environment variable)')
     p.add_argument('--color', action='store_true', default=argparse.SUPPRESS,
@@ -7866,6 +10067,24 @@ def build_parser():
                    help='Burst bandwidth limit in Mbit/s (0=unlimited)')
     s.add_argument('--df', action='store_true', default=None,
                    help="Set Don't Fragment (DF) bit on all packets (Linux)")
+    s.add_argument('--tcp', action='store_true',
+                   help='TCP stream instead of UDP (unicast; size = message bytes; the receiver must listen)')
+    s.add_argument('--connections', type=int, metavar='N',
+                   help='TCP: parallel connections (default 1)')
+    s.add_argument('--cc', metavar='NAME',
+                   help='TCP: congestion control algorithm (Linux), e.g. cubic, reno, bbr')
+    s.add_argument('--sndbuf', type=int, metavar='KB',
+                   help='TCP: send buffer in KB (limits the window; default: system / autotuning)')
+    s.add_argument('--mss', type=int, metavar='N',
+                   help='TCP: maximum segment size (default: system)')
+    s.add_argument('--tcp-on', type=float, metavar='S',
+                   help='TCP: send for S seconds, then pause (--tcp-off); repeated')
+    s.add_argument('--tcp-off', type=float, metavar='S',
+                   help='TCP: pause for S seconds after every --tcp-on period')
+    s.add_argument('--tcp-recycle', type=float, metavar='S',
+                   help='TCP: close and reconnect every S seconds (slow start each time)')
+    s.add_argument('--nagle', action='store_true', default=None,
+                   help='TCP: Nagle algorithm on (default: off = TCP_NODELAY)')
     s.add_argument('--source', metavar='IP',
                    help='Source IP of this host (also selects the multicast interface)')
     s.add_argument('--source-port', type=int, help='Source port')
@@ -7875,7 +10094,7 @@ def build_parser():
     s.add_argument('--stream', action='append', default=[], metavar='SPEC',
                    help="Add a stream (repeatable, up to %d): "
                         "DEST:PORT[,pps=N][,size=N][,dscp=N|NAME][,ttl=N][,burst[=MBIT]]"
-                        "[,src=IP][,sport=N][,df]; unset values come from the other "
+                        "[,src=IP][,sport=N][,df][,tcp][,conn=N][,cc=NAME][,sndbuf=KB][,mss=N][,nagle]; unset values come from the other "
                         "send options / the saved settings" % SEND_MAX_STREAMS)
     s.add_argument('--no-live', action='store_true',
                    help='Plain output instead of the full-screen sender view')
@@ -7911,6 +10130,16 @@ def build_parser():
     r.add_argument('--sender-sync-port', type=int, default=None,
                    help='OWD sync port on the sender (default: taken from the packets; '
                         f'{OWD_SYNC_PORT} with an explicit --sender)')
+    r.add_argument('--no-tcp', action='store_true',
+                   help='No TCP listeners (default: TCP streams are accepted on the data ports)')
+    r.add_argument('--tcp-rcvbuf', type=int, metavar='KB',
+                   help='TCP receive buffer in KB (limits the window the receiver announces; default: system / autotuning)')
+    r.add_argument('--tcp-read-rate', type=float, metavar='MBIT',
+                   help='TCP slow reader: read at most MBIT Mbit/s (default: unlimited)')
+    r.add_argument('--tcp-read-on', type=float, metavar='S',
+                   help='TCP slow reader: read for S seconds, then pause (--tcp-read-off)')
+    r.add_argument('--tcp-read-off', type=float, metavar='S',
+                   help='TCP slow reader: do not read for S seconds after every --tcp-read-on period')
     r.add_argument('--show-ip', action='store_true',
                    help='Show the sender IP in every line, after the stream label')
     r.add_argument('--verify', action='store_true',
@@ -7955,6 +10184,22 @@ def _apply_send_args(args, cfg):
         sc['source_port'] = args.source_port
     if args.df:
         sc['df_bit'] = True
+    if args.tcp:
+        sc['protocol'] = 'tcp'
+    if args.connections is not None:
+        sc['connections'] = args.connections
+        sc['protocol'] = 'tcp'
+    if args.cc:
+        sc['tcp_cc'], sc['protocol'] = args.cc.lower(), 'tcp'
+    if args.sndbuf is not None:
+        sc['tcp_sndbuf'], sc['protocol'] = args.sndbuf, 'tcp'
+    if args.mss is not None:
+        sc['tcp_mss'], sc['protocol'] = args.mss, 'tcp'
+    if args.nagle:
+        sc['tcp_nodelay'], sc['protocol'] = False, 'tcp'
+    for k in ('tcp_on', 'tcp_off', 'tcp_recycle'):
+        if getattr(args, k) is not None:
+            sc[k], sc['protocol'] = getattr(args, k), 'tcp'
 
 
 def _send_plist(args, cfg):
@@ -7970,7 +10215,7 @@ def _send_plist(args, cfg):
         plist = [parse_stream_spec(x, sc) for x in args.stream]
         seen = {}
         for i, q in enumerate(plist, 1):
-            key = (q['source_address'], q['destination_port'])
+            key = (q['source_address'], q['destination_port'], q['protocol'])
             if key in seen:
                 raise ValueError(
                     f"streams {seen[key]} and {i} use destination port "
@@ -7992,6 +10237,11 @@ def _apply_recv_args(args, cfg):
         'sender_sync_port': args.sender_sync_port or 0,
         'verify': args.verify,
         'show_ip': args.show_ip,
+        'tcp': not args.no_tcp,
+        'tcp_rcvbuf': args.tcp_rcvbuf or 0,
+        'tcp_read_rate': args.tcp_read_rate or 0.0,
+        'tcp_read_on': args.tcp_read_on or 0.0,
+        'tcp_read_off': args.tcp_read_off or 0.0,
         'unicast': args.unicast,
         'group': args.group,
         'interface': args.interface,
@@ -8005,12 +10255,47 @@ def _apply_recv_args(args, cfg):
     return rc
 
 
+def _offer_sudo(args):
+    """Interactive start without root (Linux/macOS): offer to restart through sudo, because
+    root gives better values (receive buffer above the OS limit, ...). If it is declined or sudo
+    does not work, mautg starts as it is, with a short info."""
+    if (sys.platform == 'win32' or not hasattr(os, 'geteuid') or os.geteuid() == 0
+            or os.environ.get('MAUTG_NO_SUDO') or os.environ.get('MAUTG_SUDO')
+            or getattr(args, 'no_sudo', False)
+            or not (sys.stdin.isatty() and sys.stdout.isatty())):
+        return
+    import shutil
+    import subprocess
+    why = ''
+    if not shutil.which('sudo'):
+        why = 'sudo is not installed'
+    else:
+        try:
+            ans = input(f"{Colors.CYAN}Root gives better values (receive buffer, accuracy). "
+                        f"Restart with sudo? [Y/n] {Colors.ENDC}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            ans = 'n'
+        if ans in ('n', 'no'):
+            why = 'sudo declined'
+        elif subprocess.call(['sudo', '-v']) != 0:        # asks for the password
+            why = 'sudo did not work (password, rights)'
+        else:
+            os.execvp('sudo', ['sudo', 'env', 'MAUTG_SUDO=1', sys.executable,
+                               os.path.abspath(sys.argv[0])] + sys.argv[1:])
+    print(f"{Colors.YELLOW}Info: running without root ({why}) - the receive buffer is limited by "
+          f"the OS (Linux: net.core.rmem_max), values at high rates may be worse. "
+          f"Silence: --no-sudo or MAUTG_NO_SUDO=1{Colors.ENDC}")
+
+
 def main():
     args = build_parser().parse_args()
 
     if args.version:
         print(f"mautg v{VERSION} {CREDIT}\n")
         return
+
+    _offer_sudo(args)
 
     _install_termination_handlers()
     if getattr(args, 'no_color', False) or os.environ.get('NO_COLOR'):

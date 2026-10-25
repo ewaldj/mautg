@@ -1,5 +1,7 @@
 mautg - portable Windows folder (web GUI), launcher version in the title bar
 
+ALPHA: hardly tested, reduced function compared to Linux (no kernel RX timestamps, no RX-drop detection, lower maximum pps, DSCP only as administrator).
+
 Start
   Double-click mautg.exe. A small window opens (no console window); mautg runs in the
   background and the web GUI opens in the browser (http://127.0.0.1:8081).
@@ -44,6 +46,5 @@ Options
 Notes
   - The web GUI listens on 127.0.0.1 only; add "-bind 0.0.0.0" to mautg-args.txt to
     reach it from the network (no authentication).
-  - Windows limits: delay is stamped in user space (no kernel RX timestamps), no
-    MC / UC / BC and no RX-drop detection (no recvmsg), lower maximum packet rate.
+  - Windows limits: delay is stamped in user space (no kernel RX timestamps), no RX-drop detection, lower maximum packet rate. DSCP and MC/UC/BC at the receiver are read with WSARecvMsg.
   - -wv / -wvc and the terminal (TUI) mode are not available through the launcher.

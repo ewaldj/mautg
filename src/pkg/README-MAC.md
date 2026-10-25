@@ -1,5 +1,7 @@
 # mautg for macOS
 
+ALPHA: hardly tested, reduced function compared to Linux (no kernel RX timestamps, no per-socket drop counter, no DF bit).
+
 Web GUI version of mautg. Start `mautg.app`: mautg runs in the background, the web GUI opens in the browser as soon as
 mautg answers (http://127.0.0.1:8081) and a small window controls it (same as the Windows version):
 Status, web port, Start / Stop / Restart, Open web GUI, Console log, Admin setup, Exit and an Update

@@ -4,6 +4,9 @@ Web GUI version of [mautg](https://github.com/ewaldj/mautg) for Windows 10/11 (x
 Python is bundled, nothing else has to be installed. A small launcher window controls mautg
 (Start / Stop / Restart, web port, Open web GUI, Console log, Admin, Update, Exit); the browser opens as soon as mautg answers.
 
+> **Alpha status:** hardly tested, reduced function compared to the Linux version (see the main [README](https://github.com/ewaldj/mautg#platform-status)). Expect bugs.
+> Windows: no kernel RX timestamps (user-space delay), no RX-drop detection, lower maximum pps, sender DSCP only as administrator, TCP algorithm system-wide, no TCP DF.
+
 ## Download
 
 | Variant | File | Use |
@@ -37,6 +40,6 @@ At start the launcher asks whether to restart as administrator (UAC); "No" is re
 ## Notes
 
 - The web GUI listens on 127.0.0.1 only; add `-bind 0.0.0.0` to `mautg-args.txt` to reach it from the network (no authentication).
-- Limits: no kernel RX timestamps, no MC/UC/BC and RX-drop detection (no `recvmsg`), lower maximum pps.
+- Limits: no kernel RX timestamps, no RX-drop detection, lower maximum pps. DSCP and MC/UC/BC at the receiver need Windows 10+.
 - Terminal (TUI) mode and `-wv` / `-wvc` are not available through the launcher.
 - Details: `README-WINDOWS.txt` in the zip, main project: [mautg](https://github.com/ewaldj/mautg), <https://www.jeitler.cc>

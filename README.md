@@ -14,7 +14,7 @@ By Ewald Jeitler - https://www.jeitler.cc
 
 - **macOS:** no kernel RX timestamps (delay stamped in user space), no per-socket drop counter (system-wide UDP counter only), no DF bit, TCP: algorithm system-wide, `TCP_CONNECTION_INFO` without windows / send queue.
 - **Windows:** no kernel RX timestamps (delay stamped in user space), no RX-drop detection, lower maximum pps, sender DSCP only as administrator (QoS policy), TCP: algorithm system-wide, sender send buffer adds to the delay, no TCP DF.
-- Launcher packages for both: [Windows / macOS](#windows--macos-launcher). Expect bugs; reports welcome.
+- Launcher packages for both: [Windows](https://github.com/ewaldj/mautg/tree/main/Windows_Version) / [macOS](https://github.com/ewaldj/mautg/tree/main/OSX_Version), see [launcher](#windows--macos-launcher). Expect bugs; reports welcome.
 
 ## Features
 
@@ -33,7 +33,7 @@ By Ewald Jeitler - https://www.jeitler.cc
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ewaldj/mautg/main/e-install.sh)"
 ```
 
-Installs `mautg.py` to `/usr/local/bin` as `mautg`; running it again updates. Manual: download `mautg.py` from https://github.com/ewaldj/mautg, `chmod +x mautg.py`. Windows / macOS: see [launcher](#windows--macos-launcher).
+Installs `mautg.py` to `/usr/local/bin` as `mautg`; running it again updates. Manual: download `mautg.py` from https://github.com/ewaldj/mautg, `chmod +x mautg.py`. Windows / macOS (alpha): [Windows installer](https://github.com/ewaldj/mautg/raw/main/Windows_Version/mautg-installer.exe), [macOS installer](https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-installer-mac.zip), see [launcher](#windows--macos-launcher).
 
 - Python 3.6.1+. Receiver cost per packet: 2.0 us (3.8), 1.3 us (3.11/3.13). Python 3.6 (Guest Shell): `python3 mautg.py`; not yet run on a real 3.6.
 - Guest Shell sees only its own interface (`eth0` / VirtualPortGroup / AppGigabitEthernet); multicast needs PIM or IGMP join towards it; use low rates (a few thousand pps).
@@ -452,13 +452,13 @@ hostB$ ./mautg.py send -d 10.0.0.1 --pps 10 ; hostA$ ./mautg.py recv -u -i 10
 
 **Alpha status:** hardly tested, reduced function compared to Linux (see [Platform status](#platform-status)).
 
-Packages with launcher window, bundled Python and update check are in `Windows_Version/` and `OSX_Version/` (details: `README.md` there). The launcher starts `mautg.py -web -bind 127.0.0.1` in the background, opens the web GUI and offers Start / Stop / Restart, web port, Console log, Update, Admin / Admin setup, Exit. Extra mautg options: `mautg-args.txt`. Terminal UI, `-wv`, `-wvc` are not available through the launcher.
+Packages with launcher window, bundled Python and update check are in [`Windows_Version/`](https://github.com/ewaldj/mautg/tree/main/Windows_Version) and [`OSX_Version/`](https://github.com/ewaldj/mautg/tree/main/OSX_Version) (details: `README.md` there). The launcher starts `mautg.py -web -bind 127.0.0.1` in the background, opens the web GUI and offers Start / Stop / Restart, web port, Console log, Update, Admin / Admin setup, Exit. Extra mautg options: `mautg-args.txt`. Terminal UI, `-wv`, `-wvc` are not available through the launcher.
 
-| Platform | Installer | Portable |
-|---|---|---|
-| Windows 10/11 x64 | `Windows_Version/mautg-installer.exe` | `Windows_Version/mautg-windows.zip` |
-| macOS 10.13+ (arm64 / x86_64) | `OSX_Version/mautg-installer-mac.zip` | `OSX_Version/mautg-mac.zip` |
+| Platform | Installer | Portable | Details |
+|---|---|---|---|
+| Windows 10/11 x64 (alpha) | [mautg-installer.exe](https://github.com/ewaldj/mautg/raw/main/Windows_Version/mautg-installer.exe) | [mautg-windows.zip](https://github.com/ewaldj/mautg/raw/main/Windows_Version/mautg-windows.zip) | [Windows_Version/README.md](https://github.com/ewaldj/mautg/tree/main/Windows_Version/README.md) |
+| macOS 10.13+ arm64 / x86_64 (alpha) | [mautg-installer-mac.zip](https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-installer-mac.zip) | [mautg-mac.zip](https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-mac.zip) | [OSX_Version/README.md](https://github.com/ewaldj/mautg/tree/main/OSX_Version/README.md) |
 
 - **Update:** the launcher compares `mversions` on GitHub (`mautg.py`, `mautg-windows`, `mautg-mac`) at start and every 6 hours. Build: `src/build.sh` (Go, cross compile; Python runtimes from `src/runtime/`).
 - **Windows:** receiver DSCP and MC/UC/BC from `WSARecvMsg` (ctypes, Windows 10+); no kernel RX timestamps, no RX-drop detection, lower maximum pps. Sender DSCP only as administrator (QoS policy per stream, removed at exit; the launcher asks at start).
-- **macOS:** the launcher can raise `net.inet.udp.maxdgram` and allow the bundled Python in the firewall (password prompt; mautg itself never runs as root). Apps are not signed / notarized: `OSX_Version/README.md`.
+- **macOS:** the launcher can raise `net.inet.udp.maxdgram` and allow the bundled Python in the firewall (password prompt; mautg itself never runs as root). Apps are not signed / notarized: [OSX_Version/README.md](https://github.com/ewaldj/mautg/tree/main/OSX_Version/README.md).

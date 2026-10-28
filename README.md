@@ -23,6 +23,7 @@ By Ewald Jeitler - https://www.jeitler.cc
 - Per stream: loss, `Cons` (most packets lost in a row), misorder, duplicates, restart detection, DSCP, MC/UC/BC, Mbit/s, pkt/s, delay avg/min/max; `SUM` row over all streams
 - TCP streams (parallel connections, per-message delay, kernel TCP statistics, congestion control, window/buffer settings, traffic patterns, slow reader, step / algorithm / bufferbloat tests), see [TCP](#tcp)
 - Burst mode, DSCP, TTL, DF, source address/port
+- Receiver query: the sender shows the values that arrive at the receiver (Mbit/s, pps, loss, misorder, delay, DSCP), also in its graphs, see [Receiver query](#receiver-query-sender-asks-the-receiver)
 - Receiver overload detection (RX drops, display limit), CSV log, Wireshark dissectors
 - Full-screen ANSI text UI with line-menu fallback; web GUI (`-web`) or web view of a terminal run (`-wv`, `-wvc`)
 - Python 3.6.1+ (also Cisco IOS-XE Guest Shell)
@@ -112,7 +113,7 @@ Up to 32 streams, one thread and one socket each, one shared sync server. The re
 
 Rate column = measured over the last 0.5 s. Send errors: `ERROR` + reason, retried every 0.2 s.
 
-`--stream DEST:PORT[,pps=N][,size=N][,dscp=N|NAME][,ttl=N][,burst[=MBIT]][,src=IP][,sport=N][,df][,tcp][,conn=N][,cc=NAME][,sndbuf=KB][,mss=N][,nagle][,on=S][,off=S][,recycle=S]`; unset values come from the other `send` options and the saved config. Without terminal or with `--no-live`: one stream prints plain output, several a status line every 5 s.
+`--stream DEST:PORT[,pps=N][,size=N][,dscp=N|NAME][,ttl=N][,burst[=MBIT]][,src=IP][,sport=N][,df][,tcp][,conn=N][,cc=NAME][,sndbuf=KB][,mss=N][,nagle][,on=S][,off=S][,recycle=S][,rx[=0]][,rxiv=S][,rxhost=ADDR]`; unset values come from the other `send` options and the saved config. Without terminal or with `--no-live`: one stream prints plain output, several a status line every 5 s.
 
 ### Options (`send`)
 
@@ -134,6 +135,9 @@ Rate column = measured over the last 0.5 s. Send errors: `ERROR` + reason, retri
 | `--sndbuf KB` | TCP send buffer (default: autotuning) |
 | `--mss N` | TCP MSS (88-9000, default: system) |
 | `--nagle` | TCP: Nagle on (default: `TCP_NODELAY`) |
+| `--rx-query` | Ask the receiver for the values of the stream, see [Receiver query](#receiver-query-sender-asks-the-receiver) |
+| `--rx-interval S` | Query interval (default 1 s, 0.2-3600; implies `--rx-query`) |
+| `--rx-host ADDR` | Receiver address (default: destination; required for multicast / broadcast; implies `--rx-query`) |
 | `--tcp-on S` / `--tcp-off S` | TCP: send for S s, then pause S s, repeated |
 | `--tcp-recycle S` | TCP: reconnect every S s (sequence and stream identity continue) |
 | `--stream SPEC` | Add stream (repeatable, max 32) |
@@ -257,6 +261,15 @@ Default 5001-5008, one socket per port (max 512). Stream key = sender IP + adver
 - **Restart:** a new stream id on the same IP/port after the old one was silent (more than 4x the packet interval, at least 0.3 s) = restart (`Sender restart detected`, tracker starts over); a new id while the old one still arrives = second sender (own stream); packets of the replaced id are dropped and counted. An outage of the same running stream (same id) is loss, not restart.
 - **Copies:** the same packet (timestamp + sequence) on two streams: `Copies of stream A: N` with arrival-time difference avg/min/max.
 - **Firewall / NAT:** UDP from receiver to the sender's sync port (5556) must be allowed; otherwise no delay (`--sender none`).
+
+### Receiver query (sender asks the receiver)
+
+Per stream (`--rx-query`, field *Ask the receiver for its values*): the sender opens a TCP connection to the receiver's data port (destination or `--rx-host`), sends a hello `MSTA` and a JSON line `{"iv":1.0,"sids":[...]}` (interval, stream ids of this stream: UDP one, TCP one per connection). The receiver answers with one JSON line per interval and stream: packets, bytes, lost, misordered, delay sum / count / min / max of the interval, DSCP, totals. The sender aggregates them and shows RX Mbit/s, pps, loss (interval in %, in brackets the lost packets summed up since the start of the stream), misorder (summed up), delay avg/min/max, DSCP and size below the stream row (web), in the detail line (TUI) and as orange lines / panels in the stream graph (receiver throughput, pps, delay band, lost and misordered packets per interval; UDP only for loss / misorder). The sums restart with the stream.
+
+- **One direction:** only sender -> receiver has to be open (TCP to the data port); the answers use the same connection. The OWD sync (receiver -> sender, UDP 5556) is separate.
+- **Requirements:** the receiver must accept TCP (no `--no-tcp`) and see the stream (UDP stream identified by the stream id, so NAT in between does not matter). States shown: `ok (found/streams)`, `connecting`, `refused (receiver without TCP or port closed)`, `stream not seen by the receiver`, `no answer`.
+- **Multicast / broadcast destinations:** the receiver address has to be given (`--rx-host`). Several receivers: one address per stream.
+- **Limits:** max 8 query connections per receiver; the delay min/max window is shared if two queries ask for the same stream; no authentication (the values are the same as in the receiver's web GUI).
 
 ### Delay measurement
 

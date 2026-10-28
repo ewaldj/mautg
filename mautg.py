@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-VERSION = "2.27"
+VERSION = "2.29"
 AUTHOR = "Ewald Jeitler"
 URL = "https://www.jeitler.cc"
 CREDIT = f"by {AUTHOR} - {URL}"
@@ -1219,6 +1219,7 @@ _MIN_PACKET_SIZE = _HEADER_SIZE  # 27 bytes
 # "loss" stays 0, a retransmission shows up as delay (and in the TCP statistics).
 _TCP_HELLO = struct.Struct('!4sBBHII')   # magic, version, dscp, flags, message size, reserved
 _TCP_MAGIC = b'MTCP'
+_STAT_MAGIC = b'MSTA'                    # hello of a statistics connection (sender asks the receiver)
 _TCP_VERSION = 1
 TCP_MAX_MSG = 1 << 20                    # largest message (bytes)
 TCP_MAX_CONN = 64                        # connections per sender stream
@@ -1453,12 +1454,14 @@ class RunningStats:
 
 class WinStats(RunningStats):
     """RunningStats plus min/max of a window that the web history takes over once per second."""
-    __slots__ = ('w_min', 'w_max')
+    __slots__ = ('w_min', 'w_max', 'q_min', 'q_max')
 
     def __init__(self):
         RunningStats.__init__(self)
         self.w_min = float('inf')
         self.w_max = float('-inf')
+        self.q_min = float('inf')          # window of the sender's statistics query
+        self.q_max = float('-inf')
 
     def add(self, value):
         self.count += 1
@@ -1471,6 +1474,16 @@ class WinStats(RunningStats):
             self.w_min = value
         if value > self.w_max:
             self.w_max = value
+        if value < self.q_min:
+            self.q_min = value
+        if value > self.q_max:
+            self.q_max = value
+
+    def take_qwindow(self):
+        lo, hi = self.q_min, self.q_max
+        self.q_min = float('inf')
+        self.q_max = float('-inf')
+        return lo, hi
 
     def take_window(self):
         lo, hi = self.w_min, self.w_max
@@ -1761,7 +1774,7 @@ class _TcpListener:
 class _TcpConn:
     """One TCP connection of a sender stream (receiver side)."""
     __slots__ = ('sock', 'ip', 'peer_port', 'port', 'local_raw', 'dscp', 'size', 'rest',
-                 'since', 'msgs', 'syn_dscp')
+                 'since', 'msgs', 'syn_dscp', 'stat')
 
     def __init__(self, sock, ip, peer_port, port, local_raw, syn_dscp):
         self.sock, self.ip, self.peer_port, self.port = sock, ip, peer_port, port
@@ -1772,6 +1785,20 @@ class _TcpConn:
         self.rest = b''                   # incomplete message from the previous read
         self.since = time.monotonic()
         self.msgs = 0
+        self.stat = None                  # _StatSub: the connection is a statistics query, not a stream
+
+
+class _StatSub:
+    """Subscription of a sender to the values of its streams (statistics connection)."""
+    __slots__ = ('buf', 'iv', 'sids', 'next', 'last', 'snap')
+
+    def __init__(self):
+        self.buf = b''
+        self.iv = 1.0
+        self.sids = []
+        self.next = 0.0
+        self.last = 0.0
+        self.snap = {}
 
 
 class PacketReceiver:
@@ -1871,6 +1898,7 @@ class PacketReceiver:
         self.tcp_read_off = float(tcp_read_off or 0)                   # ... then do not read for N s
         self._rd_lim = self.tcp_read_rate > 0 or (self.tcp_read_on > 0 and self.tcp_read_off > 0)
         self._rd_blocked = set()                                       # sockets taken out of the select
+        self._stat_conns = set()                                       # statistics connections of senders
         self._rd_tok = 0.0
         self._rd_last = self._rd_t0 = time.monotonic()
         try:
@@ -2663,7 +2691,82 @@ class PacketReceiver:
                     pass
         self._rd_blocked.clear()
 
+    def _stat_read(self, conn, data):
+        """Statistics connection: hello, then one JSON line per request (interval + stream ids)."""
+        sub = conn.stat
+        if sub is None:
+            if len(data) < _TCP_HELLO.size:
+                conn.rest = data
+                return
+            if len(self._stat_conns) >= 8:
+                self._tcp_close(conn)
+                return
+            sub = conn.stat = _StatSub()
+            self._stat_conns.add(conn)
+            data = data[_TCP_HELLO.size:]
+        sub.buf += data
+        if len(sub.buf) > 8192:
+            self._tcp_close(conn)
+            return
+        while b'\n' in sub.buf:
+            line, sub.buf = sub.buf.split(b'\n', 1)
+            try:
+                q = json.loads(line.decode('utf-8', 'replace'))
+                iv = min(3600.0, max(0.2, float(q.get('iv', 1.0))))
+                sids = [int(x) & 0xFFFFFFFF for x in list(q.get('sids') or [])[:16]]
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if sids != sub.sids:
+                sub.snap = {}
+            sub.iv, sub.sids = iv, sids
+            sub.next = time.monotonic() + iv
+            sub.last = time.monotonic()
+
+    def _stat_tick(self):
+        """Answer the statistics subscriptions that are due (called from the receive loop)."""
+        if not self._stat_conns:
+            return
+        now = time.monotonic()
+        for conn in list(self._stat_conns):
+            sub = conn.stat
+            if sub is None or not sub.sids or now < sub.next:
+                continue
+            dt = max(1e-3, now - sub.last)
+            sub.last = now
+            sub.next = now + sub.iv
+            out = []
+            for sid in sub.sids:
+                st = None
+                for x in list(self.streams.values()):
+                    if x.sid == sid and x.port == conn.port:
+                        st = x
+                        break
+                if st is None:
+                    sub.snap.pop(sid, None)
+                    out.append({'sid': sid, 'ok': 0})
+                    continue
+                ds = st.delay_stats
+                cur = (st.total_packets, st.total_bytes, st.total_missing, st.total_misorder, ds.total, ds.count)
+                prev = sub.snap.get(sid) or cur
+                sub.snap[sid] = cur
+                lo, hi = ds.take_qwindow()
+                out.append({'sid': sid, 'ok': 1, 'l': st.label, 'pk': cur[0] - prev[0], 'by': cur[1] - prev[1],
+                            'mi': max(0, cur[2] - prev[2]), 'od': cur[3] - prev[3],
+                            'ds': round(cur[4] - prev[4], 3), 'dn': cur[5] - prev[5],
+                            'dmin': round(lo, 3) if lo != float('inf') else None,
+                            'dmax': round(hi, 3) if hi != float('-inf') else None,
+                            'dscp': dscp_to_name(st.last_dscp), 'tp': cur[0], 'tl': round(st.loss_pct(), 3),
+                            'cast': st.cast or '', 'idle': round(now - st.last_rx, 1)})
+            msg = json.dumps({'dt': round(dt, 3), 's': out}, separators=(',', ':')) + '\n'
+            try:
+                conn.sock.send(msg.encode())
+            except (BlockingIOError, InterruptedError):
+                pass
+            except OSError:
+                self._tcp_close(conn)
+
     def _tcp_close(self, conn):
+        self._stat_conns.discard(conn)
         self._rd_blocked.discard(conn.sock)
         try:
             self._sel.unregister(conn.sock)
@@ -2680,7 +2783,7 @@ class PacketReceiver:
         process = self._process
         lim = self._rd_lim
         for _ in range(8):               # bounded: UDP and the other connections must not starve
-            want = self._tcp_budget() if lim else 262144
+            want = self._tcp_budget() if (lim and conn.stat is None) else 262144
             if not want:
                 self._tcp_block(conn)    # slow reader: leave the data in the kernel buffer
                 return
@@ -2696,10 +2799,16 @@ class PacketReceiver:
                 self._tcp_close(conn)
                 return
             got = len(data)
-            if lim and self.tcp_read_rate > 0:
+            if lim and conn.stat is None and self.tcp_read_rate > 0:
                 self._rd_tok -= got
             if conn.rest:
                 data = conn.rest + data
+                conn.rest = b''
+            if conn.stat is not None or (not conn.size and data[:4] == _STAT_MAGIC):
+                self._stat_read(conn, data)          # a sender asks for the values of its streams
+                if conn.sock not in self.tcp_conns or got < want:
+                    return
+                continue
             n = len(data)
             off = 0
             if not conn.size:            # hello first
@@ -2851,6 +2960,7 @@ class PacketReceiver:
                         self.last_empty = time.monotonic()
                         if tcp_on:
                             self._tcp_unblock()
+                            self._stat_tick()
                             if not tcp_service(timeout if not self.tcp_conns else 0.05):
                                 self.last_empty = time.monotonic()
                                 self._idle()
@@ -2863,6 +2973,7 @@ class PacketReceiver:
                         tcp_n += 1
                         if not tcp_n & 255:
                             self._tcp_unblock()
+                            self._stat_tick()
                             tcp_service(0)
             else:
                 # port range / list / TCP: one socket per port, multiplexed
@@ -2872,8 +2983,9 @@ class PacketReceiver:
                 for sk, prt in self.socks.items():
                     sel.register(sk, selectors.EVENT_READ, prt)
                 while True:
-                    events = sel.select(0.02 if self._rd_blocked else timeout)
+                    events = sel.select(0.02 if self._rd_blocked else (min(timeout, 0.1) if self._stat_conns else timeout))
                     self._tcp_unblock()
+                    self._stat_tick()
                     if not events:
                         self.last_empty = time.monotonic()       # waited: not saturated
                         self._idle()
@@ -3561,7 +3673,7 @@ _STREAM_KEYS = ('destination_address', 'destination_port', 'packet_size',
                 'packets_per_second', 'source_address', 'source_port',
                 'dscp_value', 'ttl', 'burst_mbps', 'df_bit', 'burst_mode',
                 'protocol', 'connections', 'tcp_cc', 'tcp_sndbuf', 'tcp_mss', 'tcp_nodelay',
-                'tcp_on', 'tcp_off', 'tcp_recycle')
+                'tcp_on', 'tcp_off', 'tcp_recycle', 'rx_query', 'rx_interval', 'rx_host')
 
 
 def _stream_params(d=None):
@@ -3696,6 +3808,10 @@ class SendStream:
         self._tcp_reconnects = 0
         self._tcp_up = 0                  # established connections
         self._tcp_lock = threading.Lock()
+        self._rxc = [0, 0]                # running totals from the receiver answers: lost, misordered
+        self.rxq = None                   # latest values of the receiver (dict), see _rxq_run()
+        self._rxh = []                    # [monotonic t, Mbit/s, pps, lost, misordered, delay avg, min, max, loss %] per answer
+        self._rxq_thread = None
 
     # -- control -------------------------------------------------------------
     def params(self):
@@ -3709,6 +3825,8 @@ class SendStream:
             self._gen += 1
         if self.state == 'error':
             self.start()
+        elif self.state == 'running':
+            self._rxq_ensure()
 
     def start(self):
         if self._thread is not None and self._thread.is_alive() and not self._halt:
@@ -3729,10 +3847,14 @@ class SendStream:
         self._tcp_t0 = 0.0
         self._tcp_reconnects = 0
         self._tcp_up = 0
+        self._rxc = [0, 0]
+        self.rxq = None
+        self._rxh = []
         self.state = 'running'
         self._samp = (self.sent, self.bytes, time.monotonic())
         self._thread = threading.Thread(target=self._run, daemon=True, name='send-stream')
         self._thread.start()
+        self._rxq_ensure()
 
     def stop(self, wait=True):
         self._halt = True
@@ -3784,6 +3906,164 @@ class SendStream:
             self.rate_pps = self.rate_mbps = 0.0
         self._samp = (self.sent, self.bytes, now)
 
+    # -- receiver query ------------------------------------------------------
+    def _rxq_ensure(self):
+        if not self.p.get('rx_query'):
+            return
+        t = self._rxq_thread
+        if t is not None and t.is_alive():
+            return
+        self._rxq_thread = threading.Thread(target=self._rxq_run, daemon=True, name='rx-query')
+        self._rxq_thread.start()
+
+    def _rxq_sids(self):
+        """Stream ids the receiver knows this stream by (TCP: one per connection)."""
+        if self.p.get('protocol') == 'tcp':
+            with self._tcp_lock:
+                return [v[0] for _k, v in sorted(self._tcp_ids.items())]
+        return [self.sid]
+
+    def _rxq_set(self, state, host='', **kw):
+        d = {'state': state, 'host': host, 'last': time.monotonic()}
+        d.update(kw)
+        self.rxq = d
+
+    def _rxq_run(self):
+        """Own thread: TCP connection (sender -> receiver data port), asks for the values of this
+        stream every interval; only this direction has to be open, the answers use the connection."""
+        sock = None
+        key = None
+        sent = None
+        buf = b''
+        try:
+            while not self._halt:
+                p = self.params()
+                if not p.get('rx_query'):
+                    break
+                host = (str(p.get('rx_host') or '').strip() or str(p['destination_address']).strip())
+                port = p['destination_port']
+                iv = min(3600.0, max(0.2, float(p.get('rx_interval') or 1.0)))
+                if sock is None or key != (host, port):
+                    if sock is not None:
+                        sock.close()
+                        sock = None
+                    key = (host, port)
+                    self._rxq_set('connecting', host)
+                    try:
+                        sock = socket.create_connection((socket.gethostbyname(host), port), 3.0)
+                        sock.settimeout(0.4)
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        sock.sendall(_TCP_HELLO.pack(_STAT_MAGIC, 1, 0, 0, 0, 0))
+                        buf, sent = b'', None
+                    except (OSError, UnicodeError) as e:
+                        sock = None
+                        why = 'refused (receiver without TCP or port closed)' if getattr(e, 'errno', None) in (errno.ECONNREFUSED, 10061) \
+                            else f"no connection ({str(e)[:40]})"
+                        self._rxq_set(why, host)
+                        self._tcp_wait(self._gen, 2.0)
+                        continue
+                sids = self._rxq_sids()
+                want = (iv, tuple(sids))
+                if sids and want != sent:
+                    try:
+                        sock.sendall(json.dumps({'iv': iv, 'sids': sids}).encode() + b'\n')
+                        sent = want
+                    except OSError:
+                        sock.close()
+                        sock = None
+                        continue
+                try:
+                    data = sock.recv(65536)
+                except socket.timeout:
+                    data = None
+                except OSError:
+                    data = b''
+                if data == b'':
+                    sock.close()
+                    sock = None
+                    self._rxq_set('connection closed by the receiver', host)
+                    self._tcp_wait(self._gen, 1.0)
+                    continue
+                if data:
+                    buf += data
+                    while b'\n' in buf:
+                        line, buf = buf.split(b'\n', 1)
+                        self._rxq_answer(line, host, iv)
+                    if len(buf) > 65536:
+                        buf = b''
+                elif self.rxq and self.rxq.get('state') == 'ok' and time.monotonic() - self.rxq['last'] > 3 * iv + 2:
+                    self.rxq = dict(self.rxq, state='no answer')
+                elif not sids:
+                    time.sleep(0.2)
+        finally:
+            if sock is not None:
+                sock.close()
+
+    def _rxq_answer(self, line, host, iv):
+        try:
+            m = json.loads(line.decode('utf-8', 'replace'))
+            ents = list(m['s'])
+        except (ValueError, KeyError, TypeError):
+            return
+        dt = float(m.get('dt') or iv) or iv
+        ok = [e for e in ents if e.get('ok')]
+        if not ok:
+            self._rxq_set('stream not seen by the receiver', host, found=0, n=len(ents), iv=iv)
+            return
+        pk = sum(e['pk'] for e in ok)
+        by = sum(e['by'] for e in ok)
+        mi = sum(e['mi'] for e in ok)
+        od = sum(e['od'] for e in ok)
+        dn = sum(e['dn'] for e in ok)
+        dsum = sum(e['ds'] for e in ok)
+        lows = [e['dmin'] for e in ok if e.get('dmin') is not None]
+        highs = [e['dmax'] for e in ok if e.get('dmax') is not None]
+        tp = sum(e['tp'] for e in ok)
+        tl = (sum(e['tp'] * e['tl'] for e in ok) / tp) if tp else 0.0
+        self._rxc[0] += mi
+        self._rxc[1] += od
+        r = {'state': 'ok', 'host': host, 'miss_tot': self._rxc[0], 'ord_tot': self._rxc[1], 'iv': iv, 'found': len(ok), 'n': len(ents), 'last': time.monotonic(),
+             'mbit': round(by * 8 / dt / 1e6, 3), 'pps': round(pk / dt, 1), 'pk': pk, 'miss': mi, 'ord': od,
+             'loss': round(100.0 * mi / (pk + mi), 3) if pk + mi else 0.0, 'tot_loss': round(tl, 3),
+             'davg': round(dsum / dn, 3) if dn else None, 'dmin': min(lows) if lows else None,
+             'dmax': max(highs) if highs else None, 'dscp': ok[0].get('dscp', ''), 'size': by // pk if pk else 0,
+             'cast': ok[0].get('cast', ''), 'label': ','.join(e.get('l', '') for e in ok)}
+        self.rxq = r
+        self._rxh.append([r['last'], r['mbit'], r['pps'], mi, od, r['davg'], r['dmin'], r['dmax'], r['loss']])
+        del self._rxh[:-900]
+
+    def rxq_info(self):
+        """Values of the receiver for the views (None when the query is off)."""
+        if not self.p.get('rx_query') or self.state != 'running':
+            return None
+        r = self.rxq
+        if r is None:
+            return {'state': 'connecting', 'host': ''}
+        r = dict(r)
+        r['age'] = round(time.monotonic() - r.pop('last', time.monotonic()), 1)
+        if r['state'] == 'ok' and r['age'] > 3 * float(r.get('iv') or 1) + 2:
+            r['state'] = 'no answer'
+        return r
+
+    def rxq_hist(self, base):
+        """Answer history relative to the start of the graph history (base = monotonic)."""
+        if not base:
+            return []
+        return [[round(h[0] - base, 1)] + h[1:] for h in list(self._rxh)]
+
+    def rxq_text(self):
+        r = self.rxq_info()
+        if r is None:
+            return ''
+        if r['state'] != 'ok':
+            return f"RX: {r['state']}"
+        t = f"RX {r['mbit']:.2f} Mbit/s {r['pps']:.0f} pps"
+        if self.p.get('protocol') != 'tcp':
+            t += f"  loss {r['loss']:.2f}% (total {r['miss_tot']})  misorder total {r['ord_tot']}"
+        if r['davg'] is not None:
+            t += f"  delay {r['davg']:.2f}/{r['dmin']:.2f}/{r['dmax']:.2f} ms"
+        return t
+
     # -- worker --------------------------------------------------------------
     def _note(self, text):
         if text not in self.notes:
@@ -3805,6 +4085,7 @@ class SendStream:
             self._tcp_hist = []
             self._tcp_t0 = 0.0
             self._tcp_reconnects = 0
+            self._rxh = []
             # the kernel counts retransmits per connection since connect: remember the value now
             self._tcp_base = {i: x['retrans'] for i, x in self._tcp_stats.items()}
 
@@ -4347,6 +4628,12 @@ def parse_stream_spec(spec, defaults):
                 p['tcp_nodelay'], p['protocol'] = False, 'tcp'
             elif key in ('on', 'off', 'recycle'):
                 p['tcp_' + key], p['protocol'] = float(val), 'tcp'
+            elif key == 'rx':
+                p['rx_query'] = (val.lower() not in ('0', 'off', 'no', 'false')) if eq else True
+            elif key == 'rxiv':
+                p['rx_interval'], p['rx_query'] = float(val), True
+            elif key == 'rxhost':
+                p['rx_host'], p['rx_query'] = val, True
             else:
                 raise ValueError(f"unknown option '{key}'")
         except KeyError:
@@ -4439,6 +4726,20 @@ def egress_mtu(dest, src=''):
     return res
 
 
+def _check_rx_params(p):
+    """Problems of the receiver query of a stream ('' = ok)."""
+    if not p.get('rx_query'):
+        return ''
+    if not 0.2 <= float(p.get('rx_interval') or 0) <= 3600:
+        return 'receiver query interval must be 0.2-3600 s'
+    if not str(p.get('rx_host') or '').strip():
+        d = str(p['destination_address']).strip()
+        gi = _ip_to_int(d)
+        if gi is not None and (0xE0000000 <= gi <= 0xEFFFFFFF or _is_broadcast(d)):
+            return 'receiver query: a multicast / broadcast destination needs the receiver address'
+    return ''
+
+
 def _check_tcp_params(p):
     """Problems of a TCP stream ('' = ok)."""
     gi = _ip_to_int(str(p['destination_address']).strip())
@@ -4486,6 +4787,9 @@ def check_stream_params(p, mtu=True):
         return 'destination required'
     if not 1 <= p['destination_port'] <= 65535:
         return 'destination port must be 1-65535'
+    problem = _check_rx_params(p)
+    if problem:
+        return problem
     if p.get('protocol', 'udp') == 'tcp':
         return _check_tcp_params(p)
     lo = _MIN_PACKET_SIZE + _UDP_IP_OVERHEAD
@@ -4648,6 +4952,9 @@ def _default_config():
             'tcp_on': 0.0,                   # TCP pattern: send for N seconds ... (0 = continuous)
             'tcp_off': 0.0,                  # ... then pause for N seconds (idle connection: slow-start restart)
             'tcp_recycle': 0.0,              # TCP: close and reconnect every N seconds (0 = never)
+            'rx_query': False,               # ask the receiver for the values of this stream (TCP to the data port)
+            'rx_interval': 1.0,              # ... every N seconds
+            'rx_host': '',                   # receiver address ('' = destination address)
             'extra_streams': [],             # streams 2..N (sender live view), same keys as above
         },
         'recv': {
@@ -5869,6 +6176,11 @@ class TUI:
                         hide=lambda: not is_tcp(), show=lambda v: 'continuous' if not v else f"{v:g}"),
             _dict_field('TCP then pause (s)', 'float', sc, 'tcp_off', lo=0, hi=3600,
                         hide=lambda: not is_tcp() or not sc.get('tcp_on', 0) > 0, show=lambda v: 'none' if not v else f"{v:g}"),
+            _dict_field('Ask receiver for values', 'bool', sc, 'rx_query'),
+            _dict_field('Receiver query interval (s)', 'float', sc, 'rx_interval', lo=0.2, hi=3600,
+                        hide=lambda: not sc.get('rx_query')),
+            _dict_field('Receiver address', 'text', sc, 'rx_host',
+                        hide=lambda: not sc.get('rx_query'), show=lambda v: v or 'destination address'),
             _dict_field('TCP reconnect every (s)', 'float', sc, 'tcp_recycle', lo=0, hi=86400,
                         hide=lambda: not is_tcp(), show=lambda v: 'never' if not v else f"{v:g}"),
             _dict_field('Packet size (bytes)', 'int', sc, 'packet_size',
@@ -6846,6 +7158,9 @@ class SenderView:
                   + f"   {st.rate_pps:,.1f} pps now")
             err = st.error_text()
             d2 = f" {st.errors} send errors" if (st.errors and err) else ''
+            rt = st.rxq_text()
+            if rt:
+                d2 = (d2 + '   ' if d2 else ' ') + rt
             if err:
                 d2 += f"   last error: {err}"
             elif st.notes:
@@ -8175,8 +8490,8 @@ class _WebHub:
     def _coerce_stream(d):
         ints = ('destination_port', 'packet_size', 'dscp_value', 'ttl', 'source_port', 'connections',
                 'tcp_sndbuf', 'tcp_mss')
-        floats = ('packets_per_second', 'burst_mbps', 'tcp_on', 'tcp_off', 'tcp_recycle')
-        bools = ('df_bit', 'burst_mode', 'tcp_nodelay')
+        floats = ('packets_per_second', 'burst_mbps', 'tcp_on', 'tcp_off', 'tcp_recycle', 'rx_interval')
+        bools = ('df_bit', 'burst_mode', 'tcp_nodelay', 'rx_query')
         q = {}
         for k in _STREAM_KEYS:
             if k not in d:
@@ -8433,7 +8748,8 @@ class _WebHub:
                 'state': st.state_text(), 'params': p, 'rate': st.rate_text(),
                 'dscp': dscp_to_name(p['dscp_value']), 'sent': st.sent,
                 'mbps': round(st.rate_mbps, 3), 'pps': round(st.rate_pps, 1),
-                'error': st.error_text(), 'seq': st.seq, 'tcp': st.tcp_text(), 'tcpd': st.tcp_info()})
+                'error': st.error_text(), 'seq': st.seq, 'tcp': st.tcp_text(), 'tcpd': st.tcp_info(),
+                'rxq': st.rxq_info()})
         return out
 
     def tcp_hist(self, i):
@@ -8451,6 +8767,7 @@ class _WebHub:
             h = {'kind': 'udp', 'points': list(st._hist), 'size': st.p['packet_size'],
                  'rate': st.rate_text()}
         h['text'] = st.tcp_text()
+        h['rx'] = st.rxq_hist(st._tcp_t0 if st.p.get('protocol') == 'tcp' else st._hist_t0)
         h['dest'] = f"{st.p['destination_address']}:{st.p['destination_port']}"
         h['conns'] = int(st.p.get('connections') or 1)
         h['num'] = str(i + 1)
@@ -9292,6 +9609,9 @@ function txFields(){
     {k:'tcp_on', label:'TCP send for (s)', hint:'burst / pause pattern: send this long ... (0 = continuous)', type:'number', show:function(o){ return o.protocol==='tcp'; }},
     {k:'tcp_off', label:'TCP then pause (s)', hint:'... then stay silent: idle connection, slow start restart', type:'number', show:function(o){ return o.protocol==='tcp' && +o.tcp_on>0; }},
     {k:'tcp_recycle', label:'TCP reconnect every (s)', hint:'close and open the connections again (0 = never): slow start each time', type:'number', show:function(o){ return o.protocol==='tcp'; }},
+    {k:'rx_query', label:'Ask the receiver for its values', hint:'(TCP to the receiver data port; the receiver must allow TCP; only this direction has to be open)', type:'check'},
+    {k:'rx_interval', label:'Receiver query interval (s)', type:'number', show:function(o){ return o.rx_query; }},
+    {k:'rx_host', label:'Receiver address', hint:'empty = destination address (needed for multicast / broadcast)', type:'text', show:function(o){ return o.rx_query; }},
     {k:'packet_size', label:'Packet size (bytes)', hint:'UDP: wire size, 55 up to the interface MTU (DF off: up to 65507, fragmented); TCP: message size', type:'number'},
     {k:'burst_mode', label:'Burst mode', hint:'(as fast as the limit allows)', type:'check'},
     {k:'packets_per_second', label:'Rate (pps)', type:'number', enabled:function(o){ return !o.burst_mode; }},
@@ -9369,6 +9689,7 @@ function txTable(tx){
       + '<td>'+esc(p.source_address||'any')+(p.source_port?':'+p.source_port:'')+'</td><td class="r">'+num(s.sent)+'</td><td class="r">'+f2(s.mbps)+'</td><td class="r">'+(s.pps?Math.round(s.pps).toLocaleString('en-US'):'0')+'</td>'
       + '<td>'+grBox('tx', String(i))+'</td></tr>'
       + (s.tcpd ? '<tr><td></td><td colspan="13">'+tcpChips(s.tcpd)+'</td></tr>' : '')
+      + (s.rxq ? '<tr><td></td><td colspan="13">'+rxChips(s.rxq, p.protocol==='tcp')+'</td></tr>' : '')
       + (s.error ? '<tr><td></td><td colspan="13" class="bad"><div class="fixo">'+esc(s.error)+'</div></td></tr>' : '') + '</tbody>';
   });
   var T = {sent:0, mbps:0, pps:0}; rows.forEach(function(s){ T.sent += s.sent; T.mbps += s.mbps; T.pps += s.pps; });
@@ -9487,6 +9808,30 @@ function tcpChips(d){
   b += c('negotiated', d.opts||null, '', 28);
   return '<div class="fixo">'+a+'</div>' + (txDetail && d.ca ? '<div class="fixo">'+b+'</div>' : '');
 }
+var RXTIP = {
+  'receiver': 'Receiver asked by this sender (TCP to the data port): state and streams found',
+  'rx Mbit/s': 'Throughput that arrived at the receiver in the last interval',
+  'rx pps': 'Packets per second that arrived at the receiver',
+  'loss': 'Loss at the receiver in the last interval; in brackets the lost packets summed up since the start of the stream',
+  'misorder': 'Packets that arrived late (out of order), summed up since the start of the stream',
+  'delay': 'One-way delay at the receiver: avg / min / max of the last interval',
+  'rx DSCP': 'DSCP of the packets as they arrive',
+  'rx size': 'Average packet size at the receiver'
+};
+function rxChips(r, tcp){
+  function c(k, v, cls, w){
+    var t = esc(RXTIP[k]||'');
+    return '<span class="tc" style="width:'+w+'ch" title="'+t+'"><span class="tk" title="'+t+'">'+k+'</span> <span class="tv'+(cls?' '+cls:'')+'" title="'+t+'">'+v+'</span></span>';
+  }
+  var a = c('receiver', r.state==='ok' ? esc(r.host)+' ('+r.found+'/'+r.n+')' : esc(r.state), r.state==='ok'?'ok':'warnc', r.state==='ok' ? 38 : 70);
+  if(r.state==='ok'){
+    a += c('rx Mbit/s', f2(r.mbit), '', 20) + c('rx pps', num(Math.round(r.pps)), '', 18);
+    if(!tcp) a += c('loss', f2(r.loss)+' % (&Sigma; '+num(r.miss_tot)+')', r.miss_tot?'warnc':'', 34) + c('misorder', '&Sigma; '+num(r.ord_tot), r.ord_tot?'warnc':'', 26);
+    a += c('delay', r.davg!=null ? f2(r.davg)+' / '+f2(r.dmin)+' / '+f2(r.dmax)+' ms' : 'n/a', '', 40);
+    a += c('rx DSCP', esc(r.dscp||'-'), '', 14) + c('rx size', r.size+' B', '', 14);
+  }
+  return '<div class="fixo">'+a+'</div>';
+}
 var txDetail = true;
 try{ txDetail = load('mautg_txdetail') !== '0'; }catch(e){}
 
@@ -9507,6 +9852,14 @@ function histDraw(d, pn){
   var T = pn.querySelector('.gt'), SM = pn.querySelector('.gs'), CH = pn.querySelector('.gc');
   if(!d) return;
   var P = d.points || [], tcp = d.kind==='tcp', rxk = d.kind==='rx';
+  var RXH = (!rxk && d.rx && d.rx.length > 1 && P.length) ? d.rx : null, rb = P.length ? P[0].length : 0;
+  if(RXH){                                   /* append the receiver's values (nearest answer within 1.6 s) */
+    P = P.map(function(p){
+      var best = null, bd = 1.6;
+      RXH.forEach(function(r){ var dd = Math.abs(r[0]-p[0]); if(dd < bd){ bd = dd; best = r; } });
+      return p.concat(best ? best.slice(1) : [null,null,null,null,null,null,null,null]);
+    });
+  }
   T.textContent = grTitle(d);
   if(P.length < 2){ SM.textContent = 'collecting data ... (one value per second)'; CH.innerHTML = ''; return; }
   var n = P.length, panels, sumHtml, tipFn, legend;
@@ -9536,7 +9889,7 @@ function histDraw(d, pn){
       {title:'RTT (ms)', h:130, lines:[{get:function(p){ return p[1]; }, c:'#7fd1ff'}], band:[function(p){ return p[2]; }, function(p){ return p[3]; }]},
       {title:'Retransmits per second', h:70, bars:function(p, i){ return i ? Math.max(0, p[7]-P[i-1][7]) : 0; }, c:'#ff4b4b'},
       {title:'Windows / queue (KB)', h:110, lines:[{get:function(p){ return p[4]; }, c:'#3ddc60'},{get:function(p){ return p[5]; }, c:'#e5c07b'},{get:function(p){ return p[6]; }, c:'#c792ea'}]},
-      {title:'Throughput (Mbit/s)', h:80, lines:[{get:function(p){ return p[8]; }, c:'#3ddc60'}]}];
+      {title:'Throughput (Mbit/s)', h:80, lines:[{get:function(p){ return p[8]; }, c:'#3ddc60'}].concat(RXH ? [{get:function(p){ return p[rb]; }, c:'#ffb86c'}] : [])}];
     tipFn = function(p, i){ return 'avg-rtt: '+p[1].toFixed(2)+' ms<br>min-rtt: '+p[2].toFixed(2)+' ms<br>max-rtt: '+p[3].toFixed(2)+' ms<br>retransmits '+(i?p[7]-P[i-1][7]:0)+'/s (total '+p[7]+')<br>cwnd '+p[4]+' KB, rwnd '+p[5]+' KB<br>send queue '+p[6]+' KB<br>'+p[8]+' Mbit/s'; };
     legend = '<span style="color:#7fd1ff">RTT avg (band = fastest..slowest connection)</span> <span style="color:#ff4b4b">retransmits</span> <span style="color:#3ddc60">cwnd</span> <span style="color:#e5c07b">rwnd</span> <span style="color:#c792ea">send queue</span>';
   } else {
@@ -9545,11 +9898,21 @@ function histDraw(d, pn){
       + ' &nbsp; pps avg <b>'+Math.round(q.avg).toLocaleString('en-US')+'</b> / max <b>'+Math.round(q.max).toLocaleString('en-US')+'</b>'
       + ' &nbsp; deviation (stddev) <b>'+m.sd.toFixed(2)+'</b> Mbit/s &nbsp; send errors <b>'+er+'</b> &nbsp; set: <b>'+esc(d.rate||'')+'</b>'+(d.size?', '+d.size+' B':'');
     panels = [
-      {title:'Throughput (Mbit/s)', h:130, lines:[{get:function(p){ return p[1]; }, c:'#3ddc60'}]},
-      {title:'Packets per second', h:110, lines:[{get:function(p){ return p[2]; }, c:'#7fd1ff'}]},
+      {title:'Throughput (Mbit/s)', h:130, lines:[{get:function(p){ return p[1]; }, c:'#3ddc60'}].concat(RXH ? [{get:function(p){ return p[rb]; }, c:'#ffb86c'}] : [])},
+      {title:'Packets per second', h:110, lines:[{get:function(p){ return p[2]; }, c:'#7fd1ff'}].concat(RXH ? [{get:function(p){ return p[rb+1]; }, c:'#ffb86c'}] : [])},
       {title:'Send errors per second', h:70, bars:function(p, i){ return i ? Math.max(0, p[3]-P[i-1][3]) : 0; }, c:'#ff4b4b'}];
     tipFn = function(p, i){ return p[1].toFixed(2)+' Mbit/s<br>'+Math.round(p[2]).toLocaleString('en-US')+' pps<br>send errors '+(i?p[3]-P[i-1][3]:0)+'/s (total '+p[3]+')'; };
     legend = '<span style="color:#3ddc60">Mbit/s</span> <span style="color:#7fd1ff">pps</span> <span style="color:#ff4b4b">send errors</span>';
+  }
+  if(RXH){                                   /* receiver panels */
+    panels.push({title:'Receiver delay (ms): avg per interval, band = min..max', h:110, lines:[{get:function(p){ return p[rb+4]; }, c:'#ffb86c'}], band:[function(p){ return p[rb+5]; }, function(p){ return p[rb+6]; }]});
+    if(!tcp) panels.push({title:'Receiver: lost packets per interval', h:60, bars:function(p){ return p[rb+2]||0; }, c:'#ff4b4b'});
+    if(!tcp) panels.push({title:'Receiver: misordered packets per interval', h:60, bars:function(p){ return p[rb+3]||0; }, c:'#ffb86c'});
+    var _tip = tipFn;
+    tipFn = function(p, i){ return _tip(p, i) + (p[rb]!=null ? '<br>receiver: '+p[rb].toFixed(2)+' Mbit/s, '+Math.round(p[rb+1])+' pps'+(p[rb+4]!=null ? ', delay '+p[rb+4].toFixed(2)+' ms' : '')+(tcp ? '' : ', lost '+p[rb+2]+', misordered '+p[rb+3]) : ''); };
+    legend += ' <span style="color:#ffb86c">receiver (orange)</span>';
+    var rl = d.rx[d.rx.length-1];
+    sumHtml += '<br>receiver: <b>'+rl[1].toFixed(2)+'</b> Mbit/s'+(rl[5]!=null ? ', delay avg <b>'+rl[5].toFixed(2)+'</b> ms' : '')+(tcp ? '' : ', lost (last interval) <b>'+rl[3]+'</b>');
   }
   panels = panels.filter(function(q){ return !q.skip; });
   SM.innerHTML = sumHtml + ' &nbsp; <span class="dim">'+n+' s</span>';
@@ -10083,6 +10446,12 @@ def build_parser():
                    help='TCP: pause for S seconds after every --tcp-on period')
     s.add_argument('--tcp-recycle', type=float, metavar='S',
                    help='TCP: close and reconnect every S seconds (slow start each time)')
+    s.add_argument('--rx-query', action='store_true', default=None,
+                   help='ask the receiver for the values of the streams (TCP to the data port; the receiver must allow TCP)')
+    s.add_argument('--rx-interval', type=float, metavar='S',
+                   help='receiver query interval in seconds (default 1)')
+    s.add_argument('--rx-host', metavar='ADDR',
+                   help='receiver address for the query (default: destination; needed for multicast / broadcast)')
     s.add_argument('--nagle', action='store_true', default=None,
                    help='TCP: Nagle algorithm on (default: off = TCP_NODELAY)')
     s.add_argument('--source', metavar='IP',
@@ -10200,6 +10569,12 @@ def _apply_send_args(args, cfg):
     for k in ('tcp_on', 'tcp_off', 'tcp_recycle'):
         if getattr(args, k) is not None:
             sc[k], sc['protocol'] = getattr(args, k), 'tcp'
+    if args.rx_query or args.rx_interval is not None or args.rx_host:
+        sc['rx_query'] = True
+    if args.rx_interval is not None:
+        sc['rx_interval'] = args.rx_interval
+    if args.rx_host:
+        sc['rx_host'] = args.rx_host
 
 
 def _send_plist(args, cfg):

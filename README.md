@@ -24,6 +24,8 @@ By Ewald Jeitler - https://www.jeitler.cc
 - TCP streams (parallel connections, per-message delay, kernel TCP statistics, congestion control, window/buffer settings, traffic patterns, slow reader, step / algorithm / bufferbloat tests), see [TCP](#tcp)
 - Burst mode, DSCP, TTL, DF, source address/port
 - Receiver query: the sender shows the values that arrive at the receiver (Mbit/s, pps, loss, misorder, delay, DSCP), also in its graphs, see [Receiver query](#receiver-query-sender-asks-the-receiver)
+- Remote control: one web GUI controls other mautg instances (overview, complete GUI per instance, SSH install / update, setups), see [Remote control](#remote-control-instance-strip)
+- Max run time per stream, tooltips for every field in the web GUI
 - Receiver overload detection (RX drops, display limit), CSV log, Wireshark dissectors
 - Full-screen ANSI text UI with line-menu fallback; web GUI (`-web`) or web view of a terminal run (`-wv`, `-wvc`)
 - Python 3.6.1+ (also Cisco IOS-XE Guest Shell)
@@ -115,6 +117,10 @@ Rate column = measured over the last 0.5 s. Send errors: `ERROR` + reason, retri
 
 `--stream DEST:PORT[,pps=N][,size=N][,dscp=N|NAME][,ttl=N][,burst[=MBIT]][,src=IP][,sport=N][,df][,tcp][,conn=N][,cc=NAME][,sndbuf=KB][,mss=N][,nagle][,on=S][,off=S][,recycle=S][,rx[=0]][,rxiv=S][,rxhost=ADDR]`; unset values come from the other `send` options and the saved config. Without terminal or with `--no-live`: one stream prints plain output, several a status line every 5 s.
 
+### Max run time
+
+Per stream (stream editor in the TUI and web GUI, `--max-runtime S` on the command line): the stream stops by itself after S seconds so a forgotten test cannot keep using the bandwidth. UDP: counted from the start of the stream; TCP: from the first established connection (no timer while the connect fails). Default `0` = until stop. A stream that ended this way shows `stopped *` in the web GUI (tooltip: reason); starting it again restarts the timer.
+
 ### Options (`send`)
 
 | Option | Description |
@@ -140,6 +146,7 @@ Rate column = measured over the last 0.5 s. Send errors: `ERROR` + reason, retri
 | `--rx-host ADDR` | Receiver address (default: destination; required for multicast / broadcast; implies `--rx-query`) |
 | `--tcp-on S` / `--tcp-off S` | TCP: send for S s, then pause S s, repeated |
 | `--tcp-recycle S` | TCP: reconnect every S s (sequence and stream identity continue) |
+| `--max-runtime S` | Stop the stream after S s (UDP: from the start, TCP: from the established connection; default: until stop), see [Max run time](#max-run-time) |
 | `--stream SPEC` | Add stream (repeatable, max 32) |
 | `--sync-port` | Local sync server port (default 5556) |
 | `--no-sync-server` | No sync server |
@@ -202,7 +209,7 @@ Burst max, 1500-byte packets (975 Mbit/s, 81k pps = line rate), summary view: re
 | `q` | stop the receiver (final statistics follow) |
 | `e` | edit receiver settings; Apply restarts the receiver, statistics start from zero |
 | `p` | pause log |
-| `i` | show/hide sender IP |
+| `i` | show/hide sender IP and destination IP (MC group / BC / UC address) |
 | `r` | reset view (streams, counters, clock, RX OVERLOAD; sync and CSV keep running) |
 | `d` | per-packet / summary |
 | `+` / `-` | summary interval 1, 2, 3, 5, 10, 20, 30, 60 s |
@@ -230,7 +237,7 @@ Summary values are per interval, one line per stream; Ctrl+C prints totals. `Del
 | `-l`, `--log` | CSV log in the current directory; without name `mautg-log_<date>_<time>.csv` |
 | `--sender` | Sender IP for sync (default: auto-detect; `none` = no sync) |
 | `--sender-sync-port` | Sync port of the sender (default: from packets; 5556 with `--sender`) |
-| `--show-ip` | Sender IP in every line |
+| `--show-ip` | Sender IP and destination IP (multicast group / broadcast / unicast address) in every line and in the stream table |
 | `--no-tcp` | No TCP listeners (default: TCP accepted on the data ports) |
 | `--tcp-rcvbuf KB` | TCP receive buffer of the listeners (limits the announced window; default: autotuning) |
 | `--tcp-read-rate MBIT` | Slow reader: read at most MBIT Mbit/s |
@@ -345,6 +352,30 @@ Table per step: Mbit/s (avg/min/max), RTT (avg/p95/max), retransmits, retransmit
 - **Graphs:** `graph` checkbox per row (also `SUM`); last 15 min, one value per second, collected in the background; several graphs side by side; `enlarge` button per graph = full-window view with taller panels (Esc / `shrink` = back); the divider below the graph area is draggable (height remembered, double-click = default). Title `#no. protocol ip:port (conns) DSCP rate size` (receiver `#A protocol ip:port DSCP size`); the mouse-over tooltip stays until the mouse moves, is clicked or leaves. Receiver: delay (avg, band min..max), lost / misordered per second, Mbit/s, pps. Sender UDP: Mbit/s, pps, send errors. Sender TCP: RTT (band fastest..slowest connection), retransmits per second, cwnd / rwnd / send queue, throughput, summary min/avg/p95/max and jitter. RESET on a graph clears that stream; receiver RESET / sender RESET STATS clear all.
 - Sender errors (send error, TCP reconnect) show for about 8 s; a stream that stopped on an error keeps its message. `RX OVERLOAD` stays until the receiver reset.
 - Server gone: dialog MAUTG.PY STOPPED; the page reloads when mautg is back. `-wv`/`-wvc`: terminal status bars show `web :PORT` (`ro` = read only). `-wvc` without `send`/`recv`: text menu in the terminal, everything also in the browser.
+
+### Tooltips
+
+Every form field (receiver settings, stream editor, TCP test, QUICK TEST, ADD REMOTE / UPDATE / REMOVE, setups), every table header (receiver, sender, overview), the status line and the buttons have a tooltip (mouse over) with a short explanation of what the value does.
+
+### Remote control (instance strip)
+
+![Web overview](screenshots/web-overview.png)
+
+One instance controls other instances (Web GUI). The web GUI starts with a strip `OVERVIEW | LOCAL | <remote 1> | <remote 2> | ... | + ADD REMOTE | SAVE SETUP | LOAD SETUP` (status dot per instance; list of instances: name, address, web port; stored in `~/.mau/remotes.json` on the controlling instance). Every instance - `LOCAL` included - is shown the same way: its complete GUI (own SENDER / RECEIVER tabs and buttons) in a frame below the strip, without a second title (no cascading). Frames stay loaded when switching; the last view is remembered (start page: `LOCAL`).
+
+- **Proxy:** requests to `/r/<id>/...` are forwarded to the web GUI of the instance `<id>` (only list entries are reachable). The GUI is relative-URL based, so the complete GUI of the remote (streams, graphs, settings, receiver query) is shown in a frame; the browser only talks to the controlling instance. The remote needs `-web -port N` and must be reachable from the controlling instance (TCP).
+- **Setups (settings of the remote locations):** `SAVE SETUP` stores the list of remote instances (name, address, web port, SSH settings, never a password) **and the current settings of every online instance** (receiver settings, all streams with parameters and running / stopped) under a name in `~/.mau/setups/<name>.json` on the controlling instance. `LOAD SETUP` loads a setup: replaces the remote list (option) and applies the saved settings to the online instances (option; their streams are replaced, the receiver is started with the saved settings). `RESTORE` (per instance and in the row `ALL`) applies the settings saved last (kept per entry in `~/.mau/remotes.json`) - e.g. after a restart, when an instance came up with its defaults. `UPDATE` / `INSTALL` take a snapshot of the running instance (offline: the last saved one) before the update and apply it again after the start, so ports and streams survive an update (also when the instance now starts as root and therefore reads another `~/.mau/config.json`).
+- **ICMP check:** for an offline instance (web GUI not reachable) the controlling instance pings the host with the `ping` command of its own computer (Linux / macOS / Windows, one echo, cached a few seconds) and shows `ping ok <ms>` (host is up, only mautg is down) or `no ping`.
+- **Overview:** state (online/offline), version, receiver (running, streams, Mbit/s, loss), sender (running/streams, Mbit/s) via `/api/summary` (older instances: fallback to `/api/status`). Per instance: `RX START` / `RX RESTART` (receiver settings dialog of that instance) and `RX STOP`, `OPEN` (frame, several can stay open), `START ALL`, `STOP ALL`, `RESET`, `REMOVE`; the row `LOCAL` has the same buttons (without `EDIT` / `REMOVE` / `UPDATE`). `REMOVE` (also the `x` behind the instance in the strip) can additionally stop all sender streams and the receiver and quit mautg on the host: first through the web GUI (`exit`); only if that does not work, the SSH fields appear in the same dialog (kills the process from `mautg.pid`, sudo if needed). A password entered for a host (INSTALL / UPDATE / TEST / SSH stop) is kept in the memory of the browser page until reload and pre-filled for that host; it is never written to disk. The first row `ALL` applies `RX START` (one settings dialog for all), `RX STOP`, `OPEN`, `START ALL`, `STOP ALL`, `RESET` to every online instance (`LOCAL` included), `RESTORE` to every online remote instance; a horizontal line below it separates it from the instances (`LOCAL` first, then the remote ones).
+- **QUICK TEST:** sender instance, receiver instance, protocol, rate (Mbit/s), packet size, port, DSCP, destination address (default: address from the list). Starts/extends the receiver of instance B (unicast, port added if needed, TCP listener for TCP tests) and adds a stream with receiver query on instance A; `STOP TEST` stops and deletes that stream. Optional duration (the browser has to stay open).
+- **ADD REMOTE with ssh install:** the `ADD REMOTE` dialog (button at the end of the strip) can install and start mautg on a **Linux** host first (checkbox *Install / start mautg on this host with SSH*): copies `mautg.py` with the **ssh client of the controlling computer** (OpenSSH on Linux / macOS / Windows) in one connection (file through stdin) and starts it with `-web -port <web port> [-bind ...] --no-sudo` (`setsid nohup`, directory relative to the home, default `~/mautg`). Buttons: `TEST SSH` (changes nothing: login, user, OS, python3, **root / sudo state**, directory, installed version, port, privileged port), `ADD` (entry only), `DEPLOY & ADD`.
+  - **sudo:** root only if available: user is root, `sudo -n` works, or sudo works with the entered password (`sudo -S`, the password reaches the host through the encrypted ssh channel, never in a command line). A privileged web port (< 1024) without root is refused with a hint. Without sudo mautg runs as the normal user.
+  - **INSTALL:** an offline entry has an `INSTALL` button behind `REMOVE` (same procedure and dialog as `UPDATE`, nothing to stop): copies `mautg.py` with ssh and starts it on the host.
+  - **UPDATE:** a button behind `REMOVE` appears when the remote runs an older version than the controlling instance: copies the new `mautg.py` with ssh, stops the running instance and starts it again (settings of the entry are reused, password asked again).
+  - Login: key / ssh-agent (`BatchMode`), or an optional password: handed to ssh only through the environment of the ssh child (`SSH_ASKPASS` helper, `SSH_ASKPASS_REQUIRE=force`, OpenSSH >= 8.4), not stored, not logged. **The web GUI is not encrypted:** if the GUI is not opened on `localhost`, the password travels in clear text from the browser to the controlling mautg - the dialog shows a warning and needs a confirmation. Use keys or open the GUI locally.
+  - Host key: `accept new keys` (`StrictHostKeyChecking=accept-new`, default), `accept everything` (no check, no known_hosts) or `only known hosts`. Settings (user, ssh port, directory, bind address, host key mode) are stored in `~/.mau/remotes.json`, **never the password**.
+  - Tested: key login against a local sshd (TEST, deploy, update), sudo with and without password (real sudo, local user), wrong password / wrong user, privileged port. Not tested: password login against a real ssh server, Windows / macOS as controlling computer.
+- **No authentication / no TLS:** only for trusted networks (`-bind` limits the listening address). `-wv` (read-only view) does not forward POST requests.
 
 ## Protocol
 

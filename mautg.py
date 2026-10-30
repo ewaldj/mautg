@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-VERSION = "2.30"
+VERSION = "2.61"
 AUTHOR = "Ewald Jeitler"
 URL = "https://www.jeitler.cc"
 CREDIT = f"by {AUTHOR} - {URL}"
@@ -51,8 +51,11 @@ import zipfile
 import tempfile
 import _thread
 import http.server
+import http.client
+import shlex
 import socketserver
 import urllib.parse
+import html
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict, OrderedDict, deque
@@ -1641,6 +1644,8 @@ class Stream:
         self.dscp_stats = defaultdict(DscpStats)
         self.last_dscp = 0                # DSCP of the most recent packet
         self.cast = ''                    # MC / UC / BC of the most recent packet
+        self.dst = ''                     # destination address (MC group / BC / UC address) of the most recent packet
+        self._dst_k = b''
         self.conn = None                  # TCP: the connection this stream arrives on
 
         # interval counters (reset after each summary)
@@ -2289,7 +2294,7 @@ class PacketReceiver:
 
         if self.live and self._live_level('pkt') == 'narrow':
             # narrow format, only used on small terminals
-            who = ((f" {s.label}" if self.multi else "") + (f" {s.ip:<15s}" if self.show_ip else "")
+            who = ((f" {s.label}" if self.multi else "") + (f" {s.ip:<15s} {s.dst:<15s}" if self.show_ip else "")
                    + (f" {s.port:>5d}" if self.port_col else "") + f" {pkt.cast or '--':<2s}")
             dl = f"{disp:7.2f}ms" if pkt.delay_ms is not None else "    n/a  "
             mk = "~" if (pkt.delay_ms is not None and pkt.delay_ms < 0) else " "
@@ -2299,7 +2304,7 @@ class PacketReceiver:
             return
         lab = f" | {s.label}" if self.multi else ""
         if self.show_ip:
-            lab += f" | {s.ip:<15s}"
+            lab += f" | {s.ip:<15s} | {s.dst:<15s}"
         if self.port_col:
             lab += f" | {s.port:>5d}"
         lab += f" | {pkt.cast or '--':<4s}"
@@ -2312,7 +2317,7 @@ class PacketReceiver:
     def _live_level(self, kind):
         """'full' (original format), 'compact' or 'narrow' for kind 'pkt'/'sum'."""
         avail = self.live._size[0] - 1
-        extra = (4 if self.multi else 0) + (18 if self.show_ip else 0) + 7   # 7: Cast column
+        extra = (4 if self.multi else 0) + (36 if self.show_ip else 0) + 7   # 7: Cast column
         extra += (8 if kind == 'pkt' else 8) if self.port_col else 0
         if kind == 'pkt':
             return 'full' if 87 + extra <= avail else 'narrow'
@@ -2326,17 +2331,17 @@ class PacketReceiver:
         multi, ip = self.multi, self.show_ip
         if not self.summary_interval:
             who = (' | ' + 'S') if multi else ''
-            who += (' | ' + f"{'Sender-IP':<15s}") if ip else ''
+            who += (' | ' + f"{'Sender-IP':<15s}" + ' | ' + f"{'Dest-IP':<15s}") if ip else ''
             who += (' | ' + f"{'Port':>5s}") if self.port_col else ''
             if self._live_level('pkt') == 'full':
                 who += ' | ' + f"{'Cast':<4s}"
                 return (f"{'Time':<8s}{who} | {'Sequence':<10s} | {'Size':<10s} "
                         f"| {'DSCP':<11s}| {'Delay':<15s} | {'State':<5s} | Loss")
-            who = (((' ' + 'S') if multi else '') + ((' ' + f"{'Sender-IP':<15s}") if ip else '')
+            who = (((' ' + 'S') if multi else '') + ((' ' + f"{'Sender-IP':<15s}" + ' ' + f"{'Dest-IP':<15s}") if ip else '')
                    + ((' ' + f"{'Port':>5s}") if self.port_col else '') + ' Ty')
             return (f"{'Time':<8s}{who} {'Sequence':<10s} {'Size':<6s} {'DSCP':<7s}"
                     f"{'Delay':<13s} {'State':<5s}{'Loss':>7s}")
-        lab = (('S | ' if multi else '') + (f"{'Sender-IP':<15s} | " if ip else '')
+        lab = (('S | ' if multi else '') + (f"{'Sender-IP':<15s} | {'Dest-IP':<15s} | " if ip else '')
                + (f"{'Port':>5s} | " if self.port_col else '') + f"{'Cast':<4s} | ")
         lvl = self._live_level('sum')
         if lvl == 'full':
@@ -2386,7 +2391,7 @@ class PacketReceiver:
     def _print_stream_summary(self, s, time_str, range_str, iv_elapsed):
         lab = f"{s.label} | " if self.multi else ""
         if self.show_ip:
-            lab += f"{s.ip:<15s} | "
+            lab += f"{s.ip:<15s} | {s.dst:<15s} | "
         if self.port_col:
             lab += f"{s.port:>5d} | "
         lab += f"{s.cast or '--':<4s} | "
@@ -3140,6 +3145,10 @@ class PacketReceiver:
         s = stream
         if cast:
             s.cast = cast
+            d = self._dst_raw
+            if d != s._dst_k and len(d) == 4:
+                s._dst_k = d
+                s.dst = socket.inet_ntoa(d)
             if cast == 'TCP':
                 size -= _UDP_IP_OVERHEAD         # a TCP message is the payload: no UDP/IP header added to it
         status, gap = s.check_order(seq)
@@ -3673,7 +3682,7 @@ _STREAM_KEYS = ('destination_address', 'destination_port', 'packet_size',
                 'packets_per_second', 'source_address', 'source_port',
                 'dscp_value', 'ttl', 'burst_mbps', 'df_bit', 'burst_mode',
                 'protocol', 'connections', 'tcp_cc', 'tcp_sndbuf', 'tcp_mss', 'tcp_nodelay',
-                'tcp_on', 'tcp_off', 'tcp_recycle', 'rx_query', 'rx_interval', 'rx_host')
+                'tcp_on', 'tcp_off', 'tcp_recycle', 'rx_query', 'rx_interval', 'rx_host', 'max_runtime')
 
 
 def _stream_params(d=None):
@@ -3812,6 +3821,8 @@ class SendStream:
         self.rxq = None                   # latest values of the receiver (dict), see _rxq_run()
         self._rxh = []                    # [monotonic t, Mbit/s, pps, lost, misordered, delay avg, min, max, loss %] per answer
         self._rxq_thread = None
+        self._t_begin = None              # start of the max run time (UDP: start of the stream, TCP: first established connection)
+        self.ended = ''                   # why the stream stopped by itself (max run time)
 
     # -- control -------------------------------------------------------------
     def params(self):
@@ -3851,10 +3862,24 @@ class SendStream:
         self.rxq = None
         self._rxh = []
         self.state = 'running'
+        self.ended = ''
+        self._t_begin = None if self.p.get('protocol') == 'tcp' else time.monotonic()
         self._samp = (self.sent, self.bytes, time.monotonic())
         self._thread = threading.Thread(target=self._run, daemon=True, name='send-stream')
         self._thread.start()
+        threading.Thread(target=self._watch, args=(self._thread,), daemon=True, name='send-watch').start()
         self._rxq_ensure()
+
+    def _watch(self, thr):
+        """Max run time of the stream (UDP: from the start, TCP: from the first established connection)."""
+        while not self._halt and self._thread is thr and thr.is_alive():
+            mx = float(self.p.get('max_runtime') or 0)
+            t0 = self._t_begin
+            if mx > 0 and t0 is not None and time.monotonic() - t0 >= mx:
+                self.ended = f"max run time of {mx:g} s reached"
+                self.stop(wait=False)
+                return
+            time.sleep(0.2)
 
     def stop(self, wait=True):
         self._halt = True
@@ -4135,6 +4160,8 @@ class SendStream:
                 if p.get('protocol') == 'tcp':
                     self._run_tcp(p, gen, dest)
                     continue
+                if self._t_begin is None:
+                    self._t_begin = time.monotonic()
                 sock = _open_send_socket(p, report=self._note)
                 if sock is None:
                     self._fail(self.notes[-1] if self.notes else 'cannot open the send socket')
@@ -4335,6 +4362,8 @@ class SendStream:
                 continue
             fails = 0
             self.error = ''                  # connected again: the old message is obsolete
+            if self._t_begin is None:
+                self._t_begin = time.monotonic()     # TCP: the max run time starts with the first established connection
             with self._tcp_lock:
                 self._tcp_up += 1
                 self._tcp_conn_ms[idx] = conn_ms
@@ -4952,6 +4981,7 @@ def _default_config():
             'tcp_on': 0.0,                   # TCP pattern: send for N seconds ... (0 = continuous)
             'tcp_off': 0.0,                  # ... then pause for N seconds (idle connection: slow-start restart)
             'tcp_recycle': 0.0,              # TCP: close and reconnect every N seconds (0 = never)
+            'max_runtime': 0.0,              # stop the stream after N seconds (0 = until stop); TCP: counted from the first established connection
             'rx_query': False,               # ask the receiver for the values of this stream (TCP to the data port)
             'rx_interval': 1.0,              # ... every N seconds
             'rx_host': '',                   # receiver address ('' = destination address)
@@ -5169,7 +5199,7 @@ def receiver_menu(cfg, sync_server):
         print(f"  9. CSV Log File:           {log_label}   (in current directory)")
         print(f"  a. Local OWD Sync Server:  port {cfg['sync_port']}")
         print(f"  v. Verify every packet:    {'on' if rc['verify'] else 'off'}")
-        print(f"  i. Show sender IP:         {'on' if rc.get('show_ip') else 'off'}")
+        print(f"  i. Show sender+dest IP:    {'on' if rc.get('show_ip') else 'off'}")
         print(f"  m. Multicast interface:    {rc.get('interface') or 'all'}   (all | auto | IP | name)")
         print(f"\n  {Colors.GREEN}0. START Receiver{Colors.ENDC}")
         print(f"  {Colors.YELLOW}s. Save Config{Colors.ENDC}")
@@ -5765,6 +5795,8 @@ class LiveView:
         """Column layout of the stream table for this width (widest that fits)."""
         def build(extra, mn, sep_sync, ordc, sepall=False, missc=True):
             g1 = [('st', 'St', 2, '<'), ('src', 'Source', 15, '<')]
+            if self.rx.show_ip:
+                g1.append(('dst', 'Dest', 15, '<'))
             if pc:
                 g1.append(('port', 'Port', 5, '>'))
             g1.append(('cast', 'Cast', 4, '<') if mn else ('cast', 'Ty', 2, '<'))
@@ -5854,7 +5886,7 @@ class LiveView:
                     size = s.total_bytes // s.total_packets if s.total_packets else 0
                     loss = s.loss_pct()
                     vals = {
-                        'st': s.label, 'src': s.ip, 'port': s.port, 'cast': s.cast or '--',
+                        'st': s.label, 'src': s.ip, 'dst': s.dst, 'port': s.port, 'cast': s.cast or '--',
                         'pk': _short(s.total_packets, 8),
                         'loss': '-' if s.cast == 'TCP' else (f"{loss:.2f}" if loss < 100 else "100"),
                         'miss': '-' if s.cast == 'TCP' else _short(s.total_missing, 5),
@@ -6196,6 +6228,8 @@ class TUI:
             _dict_field('DSCP', 'pick', sc, 'dscp_value', lo=0, hi=63, cast=int,
                         items=self._dscp_items, title='DSCP value',
                         show=lambda v: f"{v} ({dscp_to_name(v)})"),
+            _dict_field('Max run time (s)', 'float', sc, 'max_runtime', lo=0, hi=31536000,
+                        show=lambda v: 'until stop' if not v else f"{v:g}"),
             _dict_field('TTL', 'int', sc, 'ttl', lo=1, hi=255),
             _dict_field("Don't fragment (DF)", 'bool', sc, 'df_bit',
                         enabled=lambda: not is_tcp() or sys.platform == 'linux'),
@@ -6306,7 +6340,7 @@ class TUI:
             _dict_field('TCP then pause (s)', 'float', rc, 'tcp_read_off', lo=0, hi=3600,
                         enabled=lambda: rc.get('tcp', True) and rc.get('tcp_read_on', 0) > 0,
                         show=lambda v: 'none' if not v else f"{v:g}"),
-            _dict_field('Show sender IP', 'bool', rc, 'show_ip'),
+            _dict_field('Show sender / destination IP', 'bool', rc, 'show_ip'),
             _dict_field('Verify every packet', 'bool', rc, 'verify'),
             _dict_field('CSV log', 'choice', rc, '_log_mode', choices=['off', 'auto', 'file']),
             _dict_field('Log file name', 'text', rc, '_log_file',
@@ -7713,6 +7747,355 @@ class WebLive(LiveView):
             _WEB.rx_poll(self, now)
 
 
+REMOTES_MAX = 40
+
+
+def _remote_clean(r):
+    """One entry of the instance list: {id, name, host, port}; ValueError with the problem."""
+    if not isinstance(r, dict):
+        raise ValueError('bad entry')
+    host = str(r.get('host') or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9._:\-\[\]]{1,253}', host):
+        raise ValueError('address: IP address or host name expected')
+    if host.startswith('-'):
+        raise ValueError('address: IP address or host name expected')
+    try:
+        port = int(r.get('port') or 8081)
+    except (TypeError, ValueError):
+        raise ValueError('port: number expected')
+    if not 1 <= port <= 65535:
+        raise ValueError('port: 1 - 65535')
+    rid = str(r.get('id') or '')
+    if not re.fullmatch(r'[a-z0-9]{4,12}', rid):
+        rid = os.urandom(4).hex()
+    name = re.sub(r'[\x00-\x1f<>&"\']', '', str(r.get('name') or '')).strip()[:40]
+    out = {'id': rid, 'name': name or f"{host}:{port}", 'host': host, 'port': port}
+    out.update(_ssh_clean(r))
+    snap = r.get('snap')
+    if isinstance(snap, dict) and len(json.dumps(snap, default=str)) <= 200000:
+        out['snap'] = snap                              # settings of that instance (receiver, streams) for RESTORE / INSTALL / UPDATE
+    return out
+
+
+def _ssh_clean(r):
+    """SSH settings of an entry (DEPLOY): user, port, directory, bind address, host key mode."""
+    user = str(r.get('ssh_user') or '').strip()
+    if user and not re.fullmatch(r'[A-Za-z0-9._][A-Za-z0-9._\-]{0,63}', user):
+        raise ValueError('SSH user: letters, digits, . _ - expected')
+    try:
+        sport = int(r.get('ssh_port') or 22)
+    except (TypeError, ValueError):
+        raise ValueError('SSH port: number expected')
+    if not 1 <= sport <= 65535:
+        raise ValueError('SSH port: 1 - 65535')
+    sdir = str(r.get('ssh_dir') or 'mautg').strip()
+    if not re.fullmatch(r'[A-Za-z0-9._/~\-]{1,200}', sdir) or '..' in sdir:
+        raise ValueError('directory: letters, digits, . _ - / ~ expected')
+    bind = str(r.get('bind') or '').strip()
+    if bind and (not re.fullmatch(r'[A-Za-z0-9.:\-]{1,253}', bind) or bind.isdigit()):
+        raise ValueError('bind address: an IP address or host name (the web port is a separate field)')
+    hk = str(r.get('hostkey') or 'accept-new')
+    if hk not in ('accept-new', 'off', 'strict'):
+        hk = 'accept-new'
+    return {'ssh_user': user, 'ssh_port': sport, 'ssh_dir': sdir, 'bind': bind, 'hostkey': hk}
+
+
+def _remotes_load():
+    try:
+        with open(CONFIG_DIR / 'remotes.json', 'r') as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for x in (d if isinstance(d, list) else []):
+        try:
+            out.append(_remote_clean(x))
+        except ValueError:
+            pass
+    return out[:REMOTES_MAX]
+
+
+def _remotes_save(lst):
+    """Validate and store the instance list (~/.mau/remotes.json); returns the clean list."""
+    if not isinstance(lst, list):
+        raise ValueError('list expected')
+    if len(lst) > REMOTES_MAX:
+        raise ValueError(f"at most {REMOTES_MAX} instances")
+    out, seen = [], set()
+    for x in lst:
+        c = _remote_clean(x)
+        if c['id'] in seen:
+            c['id'] = os.urandom(4).hex()
+        seen.add(c['id'])
+        out.append(c)
+    new_dir = not CONFIG_DIR.exists()
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if new_dir:
+            _give_back(CONFIG_DIR)
+        with open(CONFIG_DIR / 'remotes.json', 'w') as f:
+            json.dump(out, f, indent=2)
+        _give_back(CONFIG_DIR / 'remotes.json')
+    except OSError as e:
+        raise ValueError(f"cannot save: {e}")
+    return out
+
+
+_SSH_PRE = r"""
+IFS= read -r PW || PW=""
+D=@DIR@
+case "$D" in /*) ;; "~/"*) D="$HOME/${D#"~/"}";; *) D="$HOME/$D";; esac
+SUDOMODE=nosudo
+if [ "$(id -u)" = 0 ]; then SUDOMODE=root
+elif command -v sudo >/dev/null 2>&1; then
+  if sudo -n true 2>/dev/null; then SUDOMODE=nopass
+  elif [ -z "$PW" ]; then SUDOMODE=needpw
+  elif printf '%s\n' "$PW" | sudo -S -p '' true 2>/dev/null; then SUDOMODE=password
+  else SUDOMODE=denied; fi
+fi
+"""
+
+_SSH_TEST = _SSH_PRE + r"""
+echo "user=$(id -un)"
+echo "os=$(uname -sr)"
+if command -v python3 >/dev/null 2>&1; then echo "python=$(python3 -c 'import sys;print(sys.version.split()[0])')"; else echo "python=none"; fi
+case "$SUDOMODE" in
+  root) echo "root=yes (the user is root)";;
+  nopass) echo "root=possible: sudo works without a password";;
+  password) echo "root=possible: sudo works with the password entered";;
+  needpw) echo "root=no: sudo needs a password - enter it above";;
+  denied) echo "root=no: sudo does NOT work (wrong password or no sudo rights)";;
+  *) echo "root=no: sudo is not installed";;
+esac
+if mkdir -p "$D" 2>/dev/null && [ -w "$D" ]; then echo "dir=writable"; else echo "dir=NOT writable"; fi
+if [ -f "$D/mautg.py" ]; then echo "installed=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$D/mautg.py" | head -n 1)"; else echo "installed=none"; fi
+if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":@PORT@ "; then echo "port=@PORT@ in use"; else echo "port=@PORT@ free"; fi
+if [ @PORT@ -lt 1024 ]; then
+  case "$SUDOMODE" in root|nopass|password) echo "webport=privileged port, root is available";; *) echo "webport=privileged port - needs root, NOT possible with this login";; esac
+fi
+"""
+
+_SSH_STOP = _SSH_PRE + r"""
+PID=$(cat "$D/mautg.pid" 2>/dev/null)
+RUN=""
+alive() { { [ -n "$PID" ] && ps -p "$PID" >/dev/null 2>&1; } || pgrep -f '[m]autg.py -web -port @PORT@' >/dev/null 2>&1; }
+killit() {
+  [ -n "$PID" ] && kill "$PID" 2>/dev/null
+  pkill -f '[m]autg.py -web -port @PORT@' 2>/dev/null
+}
+if ! alive; then echo "OK not running"; exit 0; fi
+killit; sleep 1
+alive && case "$SUDOMODE" in
+  nopass) sudo -n sh -c "kill $PID 2>/dev/null; pkill -f '[m]autg.py -web -port @PORT@' 2>/dev/null";;
+  password) printf '%s\n' "$PW" | sudo -S -p '' sh -c "kill $PID 2>/dev/null; pkill -f '[m]autg.py -web -port @PORT@' 2>/dev/null";;
+esac
+sleep 1
+if alive; then echo "ERR still running (started as root? sudo is needed)"; exit 4; else echo "OK stopped"; fi
+"""
+
+_SSH_DEPLOY = _SSH_PRE + r"""
+command -v python3 >/dev/null 2>&1 || { echo "ERR python3 not found on the remote host"; exit 3; }
+mkdir -p "$D" 2>/dev/null || { echo "ERR cannot create $D"; exit 3; }
+if [ @PORT@ -lt 1024 ]; then
+  case "$SUDOMODE" in root|nopass|password) ;; *) echo "ERR port @PORT@ needs root and sudo does not work here (sudo needs a password: enter it, or use a port >= 1024)"; exit 5;; esac
+fi
+cat > "$D/mautg.py.new" || { echo "ERR cannot write $D"; exit 3; }
+mv "$D/mautg.py.new" "$D/mautg.py" && chmod 755 "$D/mautg.py"
+rm -f "$D/mautg-web.log" "$D/mautg.pid" 2>/dev/null
+cat > "$D/mautg-start.sh" <<'EOS'
+#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+setsid nohup python3 mautg.py -web -port @PORT@ @BIND@ --no-sudo > mautg-web.log 2>&1 < /dev/null &
+echo $! > mautg.pid
+EOS
+case "$SUDOMODE" in
+  nopass) sudo -n sh "$D/mautg-start.sh";;
+  password) printf '%s\n' "$PW" | sudo -S -p '' sh "$D/mautg-start.sh";;
+  *) sh "$D/mautg-start.sh";;
+esac
+sleep 2
+PID=$(cat "$D/mautg.pid" 2>/dev/null)
+if [ -n "$PID" ] && ps -p "$PID" >/dev/null 2>&1; then
+  case "$SUDOMODE" in
+    root) echo "OK started as root";;
+    nopass) echo "OK started as root (sudo without password)";;
+    password) echo "OK started as root (sudo with password)";;
+    *) echo "OK started without root";;
+  esac
+else
+  echo "ERR start failed:"; tail -n 8 "$D/mautg-web.log" 2>/dev/null; exit 4
+fi
+"""
+
+
+def _ssh_run(inst, req, kind):
+    """TEST / DEPLOY through the ssh client of this computer (Linux, macOS, Windows): one connection,
+    the script of this mautg goes through stdin. The password (optional) only lives in the environment of
+    the ssh child process (SSH_ASKPASS helper) and is never stored."""
+    import subprocess
+    exe = shutil.which('ssh')
+    if not exe:
+        return {'ok': False, 'error': 'no ssh client found on this computer (OpenSSH client)'}
+    try:
+        c = _ssh_clean(req)
+    except ValueError as e:
+        return {'ok': False, 'error': str(e)}
+    pw = str(req.get('password') or '')
+    if '\n' in pw or '\r' in pw or '\x00' in pw:
+        return {'ok': False, 'error': 'password: line breaks are not possible'}
+    try:
+        port = int(req.get('web_port') or inst['port'])
+        if not 1 <= port <= 65535:
+            return {'ok': False, 'error': 'web port: 1 - 65535'}
+        script = {'test': _SSH_TEST, 'stop': _SSH_STOP}.get(kind, _SSH_DEPLOY)
+        script = (script.replace('@DIR@', shlex.quote(c['ssh_dir'])).replace('@PORT@', str(port))
+                  .replace('@BIND@', f"-bind {shlex.quote(c['bind'])}" if c['bind'] else ''))
+        body = b''
+        if kind == 'deploy':
+            with open(os.path.abspath(__file__), 'rb') as f:
+                body = f.read()
+    except (OSError, ValueError) as e:
+        return {'ok': False, 'error': str(e)}
+    hk = c['hostkey']
+    opts = ['-o', 'ConnectTimeout=10', '-o', 'LogLevel=ERROR',
+            '-o', 'StrictHostKeyChecking=' + {'accept-new': 'accept-new', 'off': 'no', 'strict': 'yes'}[hk]]
+    if hk == 'off':
+        opts += ['-o', 'UserKnownHostsFile=' + os.devnull]
+    env = dict(os.environ)
+    tmp = None
+    try:
+        if pw:
+            opts += ['-o', 'NumberOfPasswordPrompts=1']
+            tmp = tempfile.mkdtemp(prefix='mautg-ssh-')
+            win = sys.platform == 'win32'
+            ask = os.path.join(tmp, 'askpass.cmd' if win else 'askpass.sh')
+            code = '"import os,sys; sys.stdout.write(os.environ[\'MAUTG_SSHPW\'] + chr(10))"'
+            with open(ask, 'w') as f:
+                f.write(f'@"{sys.executable}" -c {code}\r\n' if win else f'#!/bin/sh\nexec "{sys.executable}" -c {code}\n')
+            os.chmod(ask, 0o700)
+            env.update({'MAUTG_SSHPW': pw, 'SSH_ASKPASS': ask, 'SSH_ASKPASS_REQUIRE': 'force'})
+            env.setdefault('DISPLAY', ':0')
+        else:
+            opts += ['-o', 'BatchMode=yes']
+        target = (c['ssh_user'] + '@' if c['ssh_user'] else '') + inst['host'].strip('[]')
+        cmd = [exe, '-p', str(c['ssh_port'])] + opts + [target, 'sh -c ' + shlex.quote(script)]
+        kw = {'creationflags': 0x08000000} if sys.platform == 'win32' else {'start_new_session': True}
+        try:
+            pr = subprocess.run(cmd, input=(pw + '\n').encode('utf-8') + body, capture_output=True, timeout=90, env=env, **kw)
+        except subprocess.TimeoutExpired:
+            return {'ok': False, 'error': 'ssh: timeout'}
+        except OSError as e:
+            return {'ok': False, 'error': f"ssh: {e}"}
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    out = re.sub(r'\x1b\[[0-9;]*m', '', pr.stdout.decode('utf-8', 'replace')).strip()
+    err = re.sub(r'\x1b\[[0-9;]*m', '', pr.stderr.decode('utf-8', 'replace')).strip()
+    if pw:
+        out, err = out.replace(pw, '***'), err.replace(pw, '***')
+    if pr.returncode == 255 or (pr.returncode != 0 and not out):
+        hint = ''
+        if 'Permission denied' in err:
+            hint = ' (no valid key / agent, wrong user or wrong password)' if not pw else ' (wrong user or password)'
+        elif 'Host key verification failed' in err or 'REMOTE HOST IDENTIFICATION' in err:
+            hint = ' (host key not accepted - host key option)'
+        return {'ok': False, 'error': ('ssh: ' + (err or f"exit code {pr.returncode}") + hint)[:600]}
+    info = {}
+    for ln in out.splitlines():
+        if '=' in ln and not ln.startswith(('OK', 'ERR')):
+            k, v = ln.split('=', 1)
+            info[k.strip()] = v.strip()
+    if kind == 'test':
+        ok = info.get('python', 'none') != 'none' and info.get('dir') == 'writable'
+        return {'ok': ok, 'info': info, 'error': '' if ok else 'python3 missing or directory not writable'}
+    if kind == 'stop':
+        ok = pr.returncode == 0 and out.startswith('OK')
+        return {'ok': ok, 'out': out, 'error': '' if ok else (out or err or 'stop failed')[:600]}
+    ok = pr.returncode == 0 and 'OK started' in out
+    return {'ok': ok, 'out': out, 'error': '' if ok else (out or err or 'start failed')[:600]}
+
+
+_PING_CACHE = {}
+
+
+def _ping_host(host):
+    """One ICMP echo with the ping command of this computer (Linux / macOS / Windows); cached for a few seconds.
+    Returns {'ok': True/False/None, 'rtt': ms or None}."""
+    import subprocess
+    host = host.strip('[]')
+    now = time.monotonic()
+    c = _PING_CACHE.get(host)
+    if c and now - c[0] < 4.0:
+        return c[1]
+    exe = shutil.which('ping')
+    if not exe or host.startswith('-'):
+        res = {'ok': None, 'rtt': None}
+    else:
+        win = sys.platform == 'win32'
+        cmd = ([exe, '-n', '1', '-w', '1500', host] if win else
+               [exe, '-c', '1', '-W', '1500' if sys.platform == 'darwin' else '2', host])
+        try:
+            pr = subprocess.run(cmd, capture_output=True, timeout=6,
+                                **({'creationflags': 0x08000000} if win else {}))
+            out = pr.stdout.decode('utf-8', 'replace')
+            ok = pr.returncode == 0 and (not win or 'TTL=' in out.upper())
+            m = re.search(r'time[=<]\s*([0-9.]+)\s*ms', out, re.I)
+            res = {'ok': ok, 'rtt': float(m.group(1)) if (ok and m) else None}
+        except (OSError, subprocess.SubprocessError):
+            res = {'ok': None, 'rtt': None}
+    if len(_PING_CACHE) > 200:
+        _PING_CACHE.clear()
+    _PING_CACHE[host] = (now, res)
+    return res
+
+
+SETUP_DIR_NAME = 'setups'
+
+
+def _setup_path(name):
+    name = str(name or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9._ \-]{1,60}', name) or name.startswith('.'):
+        raise ValueError('name: letters, digits, space . _ - (1 - 60) expected')
+    return CONFIG_DIR / SETUP_DIR_NAME / (name + '.json')
+
+
+def _setups_list():
+    try:
+        return sorted(f[:-5] for f in os.listdir(CONFIG_DIR / SETUP_DIR_NAME) if f.endswith('.json'))
+    except OSError:
+        return []
+
+
+def _setup_save(name, remotes):
+    path = _setup_path(name)
+    clean = [_remote_clean(x) for x in (remotes if isinstance(remotes, list) else [])][:REMOTES_MAX]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _give_back(CONFIG_DIR) if not path.parent.parent.exists() else None
+        with open(path, 'w') as f:
+            json.dump({'version': VERSION, 'saved': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'remotes': clean}, f, indent=1)
+        _give_back(path)
+    except OSError as e:
+        raise ValueError(f"cannot save: {e}")
+    return len(clean)
+
+
+def _setup_load(name):
+    path = _setup_path(name)
+    try:
+        with open(path, 'r') as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        raise ValueError('setup not found')
+    out = []
+    for x in (d.get('remotes') if isinstance(d, dict) else []) or []:
+        try:
+            out.append(_remote_clean(x))
+        except ValueError:
+            pass
+    return {'remotes': out, 'saved': d.get('saved', '') if isinstance(d, dict) else ''}
+
+
 class _WebServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -7753,14 +8136,31 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         hub = self.server.hub
         url = urllib.parse.urlsplit(self.path)
-        if url.path in ('/', '/index.html'):
+        if url.path.startswith('/r/'):
+            self._proxy('GET', url)
+        elif url.path in ('/', '/index.html'):
             self._send(200, WEB_INDEX_HTML, 'text/html; charset=utf-8')
+        elif url.path == '/api/summary':
+            self._json(200, hub.summary())
+        elif url.path == '/api/remotes':
+            self._json(200, {'remotes': _remotes_load()})
+        elif url.path == '/api/setups':
+            self._json(200, {'setups': _setups_list()})
+        elif url.path == '/api/setup_load':
+            try:
+                self._json(200, dict(_setup_load((urllib.parse.parse_qs(url.query).get('name') or [''])[0]), ok=True))
+            except ValueError as e:
+                self._json(200, {'ok': False, 'error': str(e)})
+        elif url.path == '/api/ping':
+            rid = (urllib.parse.parse_qs(url.query).get('id') or [''])[0]
+            inst = next((x for x in _remotes_load() if x['id'] == rid), None)
+            self._json(200, _ping_host(inst['host']) if inst else {'ok': None, 'rtt': None})
         elif url.path == '/api/status':
             try:
                 ls = int(urllib.parse.parse_qs(url.query).get('ls', ['0'])[0])
             except ValueError:
                 ls = 0
-            self._json(200, hub.status(ls))
+            self._json(200, hub.status(ls, urllib.parse.parse_qs(url.query).get('lite', ['0'])[0] == '1'))
         elif url.path == '/api/rx_hist':
             self._json(200, hub.rx_hist(urllib.parse.parse_qs(url.query).get('l', [''])[0]))
         elif url.path == '/api/tcp_hist':
@@ -7783,6 +8183,57 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._send(404, 'not found', 'text/plain; charset=utf-8')
 
+    def _proxy(self, method, url):
+        """/r/<id>/<path>: forward the request to the registered mautg instance <id> (web GUI of the
+        remote, shown by the REMOTE tab). Only instances of the list are reachable."""
+        hub = self.server.hub
+        parts = url.path.split('/', 3)                  # ['', 'r', id, rest]
+        rid = parts[2] if len(parts) > 2 else ''
+        if len(parts) == 3:
+            self._send(301, '', 'text/plain', {'Location': f"/r/{rid}/"})
+            return
+        inst = next((x for x in _remotes_load() if x['id'] == rid), None)
+        if inst is None:
+            self._json(404, {'ok': False, 'error': 'unknown instance'})
+            return
+        body, hdrs = None, {'X-Requested-With': 'mautg'}
+        if method == 'POST':
+            if self.headers.get('X-Requested-With') != 'mautg':
+                self._json(403, {'ok': False, 'error': 'forbidden'})
+                return
+            if not hub.control:
+                self._json(403, {'ok': False, 'error': 'read only'})
+                return
+            body = self._body(UPLOAD_MAX)
+            if body is None:
+                self._json(413, {'ok': False, 'error': 'request too large'})
+                return
+            hdrs['Content-Type'] = self.headers.get('Content-Type', 'application/json')
+        target = '/' + parts[3] + ('?' + url.query if url.query else '')
+        conn = None
+        try:
+            conn = http.client.HTTPConnection(inst['host'].strip('[]'), inst['port'], timeout=50)
+            conn.request(method, target, body=body, headers=hdrs)
+            resp = conn.getresponse()
+            data = resp.read()
+            ctype = resp.getheader('Content-Type') or 'application/octet-stream'
+            extra = {k: resp.getheader(k) for k in ('Content-Disposition',) if resp.getheader(k)}
+            code = resp.status
+        except (OSError, http.client.HTTPException) as e:
+            if method == 'GET' and parts[3] == '' and 'text/html' in (self.headers.get('Accept') or ''):
+                msg = html.escape(f"{inst['name']}: {e}")          # frame / page: readable message, retries by itself
+                self._send(502, ('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="3">'
+                                 '<body style="background:#0a0f0a;color:#9fb39f;font:14px monospace;padding:24px">'
+                                 f'<b style="color:#e66">not reachable</b><br><br>{msg}<br><br>trying again ...</body>').encode(),
+                           'text/html; charset=utf-8')
+                return
+            self._json(502, {'ok': False, 'error': f"{inst['name']}: {e}"})
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+        self._send(code, data, ctype, extra)
+
     def _body(self, limit):
         try:
             n = int(self.headers.get('Content-Length', '0'))
@@ -7795,8 +8246,11 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         hub = self.server.hub
         url = urllib.parse.urlsplit(self.path)
+        if url.path.startswith('/r/'):
+            self._proxy('POST', url)
+            return
         if url.path not in ('/api/command', '/api/upload_file', '/api/delete_files',
-                            '/api/upload_config', '/api/load_config'):
+                            '/api/upload_config', '/api/load_config', '/api/remotes_set', '/api/remote_ssh', '/api/setup_save', '/api/setup_delete'):
             self._send(404, 'not found', 'text/plain; charset=utf-8')
             return
         if self.headers.get('X-Requested-With') != 'mautg':
@@ -7824,7 +8278,22 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             self._json(400, {'ok': False, 'error': 'not valid JSON'})
             return
-        if url.path == '/api/delete_files':
+        if url.path == '/api/setup_save':
+            try:
+                self._json(200, {'ok': True, 'n': _setup_save(req.get('name'), req.get('remotes'))})
+            except ValueError as e:
+                self._json(200, {'ok': False, 'error': str(e)})
+        elif url.path == '/api/setup_delete':
+            try:
+                _setup_path(req.get('name')).unlink()
+                self._json(200, {'ok': True})
+            except (ValueError, OSError) as e:
+                self._json(200, {'ok': False, 'error': str(e)})
+        elif url.path == '/api/remotes_set':
+            self._json(200, hub.remotes_set(req.get('remotes')))
+        elif url.path == '/api/remote_ssh':
+            self._json(200, hub.remote_ssh(req))
+        elif url.path == '/api/delete_files':
             self._json(200, hub.delete_files(req.get('names')))
         elif url.path == '/api/upload_config':
             run = (urllib.parse.parse_qs(url.query).get('run') or [''])[0] == '1'
@@ -8490,7 +8959,7 @@ class _WebHub:
     def _coerce_stream(d):
         ints = ('destination_port', 'packet_size', 'dscp_value', 'ttl', 'source_port', 'connections',
                 'tcp_sndbuf', 'tcp_mss')
-        floats = ('packets_per_second', 'burst_mbps', 'tcp_on', 'tcp_off', 'tcp_recycle', 'rx_interval')
+        floats = ('packets_per_second', 'burst_mbps', 'tcp_on', 'tcp_off', 'tcp_recycle', 'rx_interval', 'max_runtime')
         bools = ('df_bit', 'burst_mode', 'tcp_nodelay', 'rx_query')
         q = {}
         for k in _STREAM_KEYS:
@@ -8701,7 +9170,7 @@ class _WebHub:
             tot_mbit += mbit
             rates[s.label] = (mbit, pps)
             rows.append({
-                'st': s.label, 'src': s.ip, 'port': s.port, 'cast': s.cast or '--',
+                'st': s.label, 'src': s.ip, 'dst': s.dst, 'port': s.port, 'cast': s.cast or '--',
                 'pk': s.total_packets, 'loss': round(s.loss_pct(), 3), 'miss': s.total_missing, 'cons': s.max_gap,
                 'ord': s.total_misorder,
                 'avg': round(ds.avg, 3) if have else None,
@@ -8749,7 +9218,7 @@ class _WebHub:
                 'dscp': dscp_to_name(p['dscp_value']), 'sent': st.sent,
                 'mbps': round(st.rate_mbps, 3), 'pps': round(st.rate_pps, 1),
                 'error': st.error_text(), 'seq': st.seq, 'tcp': st.tcp_text(), 'tcpd': st.tcp_info(),
-                'rxq': st.rxq_info()})
+                'rxq': st.rxq_info(), 'ended': st.ended})
         return out
 
     def tcp_hist(self, i):
@@ -8777,7 +9246,82 @@ class _WebHub:
         h['size'] = st.p['packet_size']
         return h
 
-    def status(self, ls):
+    def summary(self):
+        """Small status for the instance overview of another mautg (REMOTE tab)."""
+        now = time.monotonic()
+        rx, rxs = self.rx, {'running': False}
+        try:
+            if rx is not None:
+                x = self._rx_status(rx, True)
+                rxs = {'running': True, 'streams': len(x['rows']), 'mbit': x['mbit'], 'pk': x['packets'],
+                       'loss': max([q['loss'] for q in x['rows']] or [0.0]), 'where': x['where']}
+        except Exception:
+            rxs = {'running': rx is not None}
+        sts = list(self.streams or [])
+        for st in sts:
+            st.sample(now)
+        run = [st for st in sts if st.state == 'running']
+        try:
+            host = socket.gethostname()
+        except OSError:
+            host = ''
+        return {'version': VERSION, 'host': host, 'mode': 'web' if self.headless else ('control' if self.control else 'view'),
+                'readonly': not self.control, 'ifaces': self._local_ifaces(),
+                'rx': rxs, 'tx': {'streams': len(sts), 'running': len(run),
+                                  'mbit': round(sum(st.rate_mbps for st in run), 3),
+                                  'controllable': self.controllable}}
+
+    def remote_ssh(self, req):
+        """/api/remote_ssh: {id, test, password, ssh_user, ssh_port, ssh_dir, bind, hostkey}"""
+        rid = str(req.get('id') or '')
+        inst = next((x for x in _remotes_load() if x['id'] == rid), None) if rid else None
+        if inst is None:
+            if rid and not req.get('host'):
+                return {'ok': False, 'error': 'unknown instance (list changed - reload the page)'}
+            try:                                       # ADD REMOTE / entry no longer in the list: host and port come from the request
+                inst = _remote_clean({'host': req.get('host'), 'port': req.get('web_port') or req.get('port')})
+            except ValueError as e:
+                return {'ok': False, 'error': str(e)}
+        test = bool(req.get('test'))
+        stop = bool(req.get('stop'))
+        if not test and not stop:                                   # a running instance on that address is stopped first (update)
+            try:
+                c = http.client.HTTPConnection(inst['host'].strip('[]'), inst['port'], timeout=3)
+                c.request('GET', '/api/summary')
+                if c.getresponse().status:
+                    c.close()
+                    c = http.client.HTTPConnection(inst['host'].strip('[]'), inst['port'], timeout=5)
+                    c.request('POST', '/api/command', body=json.dumps({'cmd': 'exit', 'value': '', 'data': {}}),
+                              headers={'Content-Type': 'application/json', 'X-Requested-With': 'mautg'})
+                    c.getresponse().read()
+                    c.close()
+                    time.sleep(2.0)
+            except (OSError, http.client.HTTPException):
+                pass
+        res = _ssh_run(inst, req, 'stop' if stop else ('test' if test else 'deploy'))
+        if res.get('ok') and not test and not stop and rid:
+            try:
+                lst = _remotes_load()
+                for x in lst:
+                    if x['id'] == inst['id']:
+                        x.update(_ssh_clean(req))
+                        try:
+                            if req.get('web_port') and 1 <= int(req['web_port']) <= 65535:
+                                x['port'] = int(req['web_port'])
+                        except (TypeError, ValueError):
+                            pass
+                _remotes_save(lst)
+            except ValueError:
+                pass
+        return res
+
+    def remotes_set(self, lst):
+        try:
+            return {'ok': True, 'remotes': _remotes_save(lst)}
+        except ValueError as e:
+            return {'ok': False, 'error': str(e)}
+
+    def status(self, ls, lite=False):
         self.last_poll = time.time()
         now = time.monotonic()
         rx = self.rx
@@ -8791,7 +9335,7 @@ class _WebHub:
             rxs = {'running': rx is not None, 'rows': [], 'error': str(e)}
         with self.lock:
             seq = self.seq
-            lines = [l for n, l in self.log if n > ls] if ls <= seq else [l for _n, l in self.log]
+            lines = [] if lite else ([l for n, l in self.log if n > ls] if ls <= seq else [l for _n, l in self.log])
         text, err, at = self.message
         send_defaults = _stream_params(self.cfg['send'])
         return {
@@ -9210,13 +9754,34 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
   #ro{color:var(--acc)}
   .layout{display:flex;flex-direction:column;height:100%}
   .body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+  #remwrap{flex:1 1 auto;min-height:0;display:none;flex-direction:column}
+  body.top .bar,body.top .stats,body.top #foot,body.top .body>:not(#remwrap){display:none !important}
+  body.top #remwrap{display:flex}
+  body.framed header{display:none}
+  #remstrip{flex:0 0 auto;display:flex;flex-wrap:wrap;gap:6px;padding:6px 12px;border-bottom:1px solid var(--line);align-items:center}
+  #remtabs{display:inline-flex;flex-wrap:wrap;gap:6px;align-items:center}
+  #remstrip button.cur{border-color:var(--acc);color:var(--acc)}
+  #remover{flex:1 1 auto;min-height:0;overflow:auto;padding:8px 10px;font-size:var(--fs)}
+  #remover table.t td,#remover table.t th{padding:5px 1.2ch}
+  #remover button{padding:2px 8px;font-size:12px}
+  #remover td.act button{min-width:var(--bw,8ch);text-align:center}
+  #remover button[data-act=rxstart]{--bw:13ch} #remover button[data-act=rxstop]{--bw:9ch} #remover button[data-act=open]{--bw:7ch}
+  #remover button[data-act=startall]{--bw:11ch} #remover button[data-act=stopall]{--bw:10ch} #remover button[data-act=reset]{--bw:8ch}
+  #remover button[data-act=update]{--bw:8ch} #remover button[data-act=restore]{--bw:9ch} #remover button[data-act=del]{--bw:9ch}
+  #remover table.t tr.grp0 td{border-bottom:2px solid var(--dim);background:#0c130c}
+  #remtoolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px}
+  #remframes{flex:1 1 auto;min-height:0;display:none;position:relative}
+  #remframes iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:var(--bg);display:none}
   #testbox{flex:0 0 auto;max-height:40%;overflow:auto;padding:6px 8px;border-top:1px solid var(--line);font-size:var(--fs)}
   #testbox .th{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;gap:10px}
   #testbox table{border-collapse:collapse} #testbox th{color:var(--dim);font-weight:400;text-align:right;padding:2px 10px} #testbox td{padding:2px 10px;text-align:right;white-space:nowrap}
   #testbox th:first-child,#testbox td:first-child{text-align:center}
   .tbar{display:inline-block;height:9px;background:var(--up);vertical-align:middle;margin-left:6px;border-radius:2px;opacity:.75}
-  #grid{flex:0 0 auto;max-height:46%;overflow:auto;padding:4px 0 0 8px;font-size:var(--fs);line-height:1.35}
+  #grid{flex:0 0 auto;max-height:46%;overflow:auto;padding:4px 0 0 0;font-size:var(--fs);line-height:1.35}
   table.t{border-collapse:collapse}
+  #grid table.t{width:100%}                          /* the selection bar spans the whole width */
+  #grid table.t thead th:last-child{width:100%}          /* the last column takes the free space: counters stay compact, the bar spans everything */
+  #grid table.t th:first-child,#grid table.t td:first-child{padding-left:calc(8px + 1.2ch)}
   table.t th,table.t td{padding:2px 1.2ch;white-space:nowrap;border-bottom:1px solid #131b13}
   table.t tfoot td{font-weight:700;border-top:1px solid var(--dim);border-bottom:0;background:var(--panel);position:sticky;bottom:0}
   table.t th{color:var(--dim);font-weight:600;text-align:left;border-bottom:1px solid var(--line);user-select:none}
@@ -9242,20 +9807,23 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
   .modal-box p{margin:0 0 14px;color:#b4c4b4;font-size:14px;line-height:1.5}
   table.t.tx tbody.sg tr.clk td{padding-top:7px;padding-bottom:3px;border-bottom:0}
   table.t.tx tbody.sg tr:nth-child(2) td{padding:2px 1.2ch 8px;border-bottom:0;background:#0c130c}
-  table.t.tx tbody.sg{border-top:1px solid var(--line);border-bottom:0}
-  table.t.tx tbody.sg:last-of-type{border-bottom:1px solid var(--line)}
+  table.t.tx tbody.sg td{border-bottom:0}
+  table.t.tx tbody.sg tr.clk td{border-top:2px solid #4d724d}   /* separator between the streams (cells, not row groups: border-collapse) */
+  table.t.tx tfoot td{border-top:2px solid #4d724d}
   table.t.tx tbody.sg tr.sel td{background:#182418}
-  table.t.tx tbody.sg tr.sel + tr td{background:#101c10}
+  table.t.tx tbody.sg.sel tr td{background:#182418}               /* the whole selected stream block (incl. receiver part) in one colour */
+  table.t.tx th{border-bottom:2px solid #4d724d}
   .gck{cursor:pointer;color:var(--acc);user-select:none} .gck input{vertical-align:middle;margin:0 3px 0 0;cursor:pointer}
   #graphs{flex:0 1 auto;min-height:0;align-self:stretch;max-height:55%;overflow:auto;padding:6px 8px;border-top:1px solid var(--line);display:none;
-    grid-template-columns:repeat(auto-fill,minmax(520px,1fr));gap:10px;align-content:start}
+    grid-template-columns:repeat(auto-fill,minmax(600px,1fr));gap:10px;align-content:start}
   #gsplit{flex:0 0 auto;height:11px;cursor:row-resize;background:#1c261c;border-top:1px solid var(--line);border-bottom:1px solid var(--line);position:relative;touch-action:none;user-select:none}
   #gsplit:hover,#gsplit.drag{background:#2a3d2a}
   #gsplit span{position:absolute;left:50%;top:3px;width:60px;margin-left:-30px;height:5px;border-top:1px solid var(--acc);border-bottom:1px solid var(--acc)}
   #graphs{scrollbar-width:auto;scrollbar-color:#4a6a4a #101810}
   #graphs::-webkit-scrollbar{width:12px;height:12px} #graphs::-webkit-scrollbar-track{background:#101810} #graphs::-webkit-scrollbar-thumb{background:#4a6a4a;border-radius:6px}
-  .gp{max-width:780px;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px 10px;min-width:0}
-  .gh{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+  .gp{max-width:900px;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px 10px;min-width:0}
+  .gh{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:4px}
+  .gh .gt{min-width:0;flex:1 1 auto} .gh>span{flex:none;white-space:nowrap}      /* the buttons always stay in one line */
   .gh button{padding:1px 8px;font-size:12px}
   .rttlink{cursor:pointer}
   .fixw{width:0;min-width:100%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
@@ -9269,7 +9837,7 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
   .thsum{font-size:13px;margin:0 0 8px;color:#d6e2d6}
   .thsum b{color:var(--fg)}
   .thleg{font-size:13px;display:flex;gap:14px;flex-wrap:wrap;margin-top:6px}
-  .gp.big{position:fixed;left:2vw;right:2vw;top:2vh;bottom:2vh;max-width:none;z-index:50;overflow:auto;padding:12px 18px;box-shadow:0 0 0 100vmax rgba(0,0,0,.65)}
+  .gp.big{position:fixed;left:2vw;right:2vw;top:2vh;bottom:2vh;max-width:none;z-index:50;overflow:hidden;padding:12px 18px;box-shadow:0 0 0 100vmax rgba(0,0,0,.65)}
   .gp.big .thsum{font-size:15px} .gp.big .thleg{font-size:15px} .gp.big .gt{font-size:18px}
   .thtip{position:absolute;pointer-events:none;background:#0b0f0b;border:1px solid var(--ctrl-line);border-radius:4px;padding:6px 8px;font-size:12px;line-height:1.5;width:max-content;white-space:nowrap;z-index:60}
   .modal-box.wide{width:900px;max-width:92vw;max-height:82vh;overflow-y:auto}
@@ -9317,8 +9885,8 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
 
   <div class="bar">
     <span class="row" id="rowTabs">
-      <button id="tabRx" class="on">RECEIVER</button>
       <button id="tabTx">SENDER</button>
+      <button id="tabRx" class="on">RECEIVER</button>
       <span class="sep">&nbsp;|&nbsp;</span>
       <span id="ctrlRx" class="grp" style="flex-wrap:wrap">
         <button id="btnRxStart" title="receiver settings - start or restart the receiver">START RECEIVER</button>
@@ -9330,7 +9898,7 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
           <option value="1">1 s</option><option value="2">2 s</option><option value="3">3 s</option><option value="5">5 s</option>
           <option value="10">10 s</option><option value="20">20 s</option><option value="30">30 s</option><option value="60">60 s</option>
         </select>
-        <button id="btnIp" title="show the sender IP in every log line">SHOW IP</button>
+        <button id="btnIp" title="show the sender IP and the destination address (multicast group / broadcast / unicast) in every log line and in the stream table">SHOW IP</button>
         <button id="btnRxReset" title="forget all streams and counters (sync and CSV log keep running)">RESET</button>
         <button id="btnLog" title="start / stop writing the received packets to a CSV file">START LOG</button>
         <button id="btnClearLog" title="clear the log display">CLEAR LOG</button>
@@ -9396,6 +9964,11 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
     <div id="graphs" style="display:none"></div>
     <div id="gsplit" title="drag up/down to resize the graph area (double-click: reset)" style="display:none"><span></span></div>
     <div id="logwrap"><div id="loghead"></div><pre id="log"></pre></div>
+    <div id="remwrap">
+      <div id="remstrip"><span id="remtabs"></span><span id="remmsg" class="msg"></span></div>
+      <div id="remover"></div>
+      <div id="remframes"></div>
+    </div>
   </div>
   <footer id="foot">connecting ...</footer>
 </div>
@@ -9406,8 +9979,11 @@ var prevRows = 0, S = null, tab = 'receiver', selRow = 0, logSeq = 0, logAll = [
 var $ = function(id){ return document.getElementById(id); };
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
-function store(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
-function load(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+var IN_FRAME = window.top !== window.self;
+document.body.classList.add(IN_FRAME ? 'framed' : 'top');
+var NS = (location.pathname.indexOf('/r/')===0) ? location.pathname.split('/').slice(0,3).join('/')+':' : '';
+function store(k,v){ try{ localStorage.setItem(NS+k,v); }catch(e){} }
+function load(k){ try{ return localStorage.getItem(NS+k); }catch(e){ return null; } }
 function num(n){ return (n==null)?'':Number(n).toLocaleString('en-US'); }
 function f2(n){ return (n==null)?'n/a':Number(n).toFixed(2); }
 
@@ -9453,7 +10029,7 @@ function post(cmd, value, data, cb){
 }
 function scrollEnd(){ var el = $('log'); el.scrollTop = el.scrollHeight; }
 function stick(){ endUntil = Date.now() + 3500; scrollEnd(); }
-function note(t, err){ var e = tab==='receiver' ? $('msg') : $('msg2'); e.textContent = t; e.className = 'msg'+(err?' err':''); }
+function note(t, err){ var e = !IN_FRAME ? $('remmsg') : (tab==='receiver' ? $('msg') : $('msg2')); e.textContent = t; e.className = 'msg'+(err?' err':''); }
 
 /* ---------- generic form modal ---------- */
 function openForm(title, intro, fields, values, buttons, warn){
@@ -9468,13 +10044,14 @@ function openForm(title, intro, fields, values, buttons, warn){
       h += '<div class="frow"><label>'+esc(f.label)+(f.hint?' <small>'+esc(f.hint)+'</small>':'')+'</label><select id="'+id+'">'
         + f.options.map(function(o){ return '<option value="'+esc(o[0])+'"'+(String(o[0])===String(val)?' selected':'')+'>'+esc(o[1])+'</option>'; }).join('')+'</select></div>';
     } else {
-      h += '<div class="frow"><label>'+esc(f.label)+(f.hint?' <small>'+esc(f.hint)+'</small>':'')+'</label><input type="'+(f.type==='number'?'number':'text')+'" id="'+id+'"'
-        + (f.type==='number'?' step="any"':'')+' value="'+esc(val==null?'':val)+'" autocomplete="off"></div>';
+      h += '<div class="frow"><label>'+esc(f.label)+(f.hint?' <small>'+esc(f.hint)+'</small>':'')+'</label><input type="'+(f.type==='number'?'number':(f.type==='password'?'password':'text'))+'" id="'+id+'"'
+        + (f.type==='number'?' step="any"':'')+' value="'+esc(val==null?'':val)+'" autocomplete="'+(f.type==='password'?'new-password':'off')+'"></div>';
     }
   });
   h += '<div class="fwarn" id="formWarn"></div><div class="ferr" id="formErr"></div><div class="modal-buttons">'
     + buttons.map(function(b,i){ return '<button data-b="'+i+'" class="'+(b.cls||'')+'">'+esc(b.label)+'</button>'; }).join('')+'</div></div></div>';
   host.innerHTML = h;
+  tipForm(host);
   function read(){
     var o = {};
     fields.forEach(function(f){
@@ -9514,7 +10091,7 @@ document.addEventListener('keydown', function(e){
     else if(k==='Enter' && tg!=='BUTTON'){ var b = host.querySelector('button[data-b="0"]'); if(b){ e.preventDefault(); b.click(); } }
     return;
   }
-  if(tg==='INPUT' || tg==='SELECT' || tg==='TEXTAREA' || !S) return;
+  if(!IN_FRAME || tg==='INPUT' || tg==='SELECT' || tg==='TEXTAREA' || !S) return;
   var ro = !!S.readonly, kl = k.length===1 ? k.toLowerCase() : k;
   if(kl==='Tab'){ e.preventDefault(); setTab(tab==='receiver' ? 'sender' : 'receiver'); return; }
   if(document.activeElement && document.activeElement.blur && tg==='BUTTON') document.activeElement.blur();
@@ -9569,7 +10146,7 @@ function rxFields(){
     {k:'tcp_read_rate', label:'TCP read rate (Mbit/s)', hint:'slow reader: 0 = unlimited; the window shrinks up to zero', type:'number', enabled:function(o){ return o.tcp; }},
     {k:'tcp_read_on', label:'TCP read for (s)', hint:'slow reader: read this long ... (0 = always)', type:'number', enabled:function(o){ return o.tcp; }},
     {k:'tcp_read_off', label:'TCP then pause (s)', hint:'... then do not read at all (zero window)', type:'number', enabled:function(o){ return o.tcp && +o.tcp_read_on>0; }},
-    {k:'show_ip', label:'Show sender IP', type:'check'},
+    {k:'show_ip', label:'Show sender / destination IP', type:'check'},
     {k:'verify', label:'Verify every packet', hint:'(CRC + padding)', type:'check'},
     {k:'print_limit', label:'Per-packet lines per second', hint:'0 = unlimited', type:'number'},
     {k:'log_mode', label:'CSV log', type:'select', options:[['off','off'],['auto','automatic file name'],['file','file name']]},
@@ -9614,6 +10191,7 @@ function txFields(){
     {k:'rx_query', label:'Ask the receiver for its values', hint:'(TCP to the receiver data port; the receiver must allow TCP; only this direction has to be open)', type:'check'},
     {k:'rx_interval', label:'Receiver query interval (s)', type:'number', show:function(o){ return o.rx_query; }},
     {k:'rx_host', label:'Receiver address', hint:'empty = destination address (needed for multicast / broadcast)', type:'text', show:function(o){ return o.rx_query; }},
+    {k:'max_runtime', label:'Max run time (s)', hint:'0 = until stop; UDP: from the start, TCP: from the established connection', type:'number'},
     {k:'packet_size', label:'Packet size (bytes)', hint:'UDP: wire size, 55 up to the interface MTU (DF off: up to 65507, fragmented); TCP: message size', type:'number'},
     {k:'burst_mode', label:'Burst mode', hint:'(as fast as the limit allows)', type:'check'},
     {k:'packets_per_second', label:'Rate (pps)', type:'number', enabled:function(o){ return !o.burst_mode; }},
@@ -9657,12 +10235,12 @@ function rxTable(rx){
   var rows = rx.rows||[];
   if(!rows.length) return '<div class="empty">'+(rx.running ? 'waiting for traffic ...' : 'receiver not running - START RECEIVER')+'</div>';
   var pc = rx.port_col;
-  var h = '<table class="t"><thead><tr><th>ST</th><th>SOURCE</th>'+(pc?'<th class="r">PORT</th>':'')+'<th>CAST</th><th class="r">PACKETS</th><th class="r">LOSS%</th><th class="r">MISS</th><th class="r" title="most packets lost in a row">CONS</th><th class="r">ORD</th>'
+  var h = '<table class="t"><thead><tr><th>ST</th><th>SOURCE</th>'+(rx.show_ip?'<th>DEST</th>':'')+(pc?'<th class="r">PORT</th>':'')+'<th>CAST</th><th class="r">PACKETS</th><th class="r">LOSS%</th><th class="r">MISS</th><th class="r" title="most packets lost in a row">CONS</th><th class="r">ORD</th>'
         + '<th class="r">AVG</th><th class="r">MIN</th><th class="r">MAX</th><th class="r">MBIT/S</th><th class="r">PKT/S</th><th>DSCP</th><th class="r">SIZE</th><th class="r">SPORT</th><th>SYNC</th><th></th></tr></thead><tbody>';
   rows.forEach(function(s){
     var sc = {ok:'ok', FAIL:'bad', wait:'warnc', off:'dim', none:'dim'}[s.sync] || '';
     var hc = HL.hasOwnProperty(s.st) ? ' style="background:'+HLCOL[HL[s.st]]+'"' : '';
-    h += '<tr><td class="acc hlc" data-st="'+esc(s.st)+'" title="click: mark the lines of this stream in the live view (click again: remove)"'+hc+'>'+esc(s.st)+'</td><td class="hlc" data-st="'+esc(s.st)+'" title="click: mark the lines of this stream in the live view (click again: remove)"'+hc+'>'+esc(s.src)+'</td>'+(pc?'<td class="r">'+s.port+'</td>':'')+'<td>'+esc(s.cast)+'</td>'
+    h += '<tr><td class="acc hlc" data-st="'+esc(s.st)+'" title="click: mark the lines of this stream in the live view (click again: remove)"'+hc+'>'+esc(s.st)+'</td><td class="hlc" data-st="'+esc(s.st)+'" title="click: mark the lines of this stream in the live view (click again: remove)"'+hc+'>'+esc(s.src)+'</td>'+(rx.show_ip?'<td title="destination address the traffic was received with (multicast group / broadcast / unicast address)">'+esc(s.dst||'')+'</td>':'')+(pc?'<td class="r">'+s.port+'</td>':'')+'<td>'+esc(s.cast)+'</td>'
       + '<td class="r">'+num(s.pk)+'</td>'+(s.cast==='TCP' ? '<td class="r dim">-</td><td class="r dim">-</td><td class="r dim">-</td><td class="r dim">-</td>'
         : '<td class="r '+(s.miss?'warnc':'ok')+'">'+f2(s.loss)+'</td><td class="r">'+num(s.miss)+'</td><td class="r">'+num(s.cons)+'</td><td class="r">'+num(s.ord)+'</td>')
       + '<td class="r">'+f2(s.avg)+'</td><td class="r">'+f2(s.min)+'</td><td class="r">'+f2(s.max)+'</td><td class="r">'+f2(s.mbit)+'</td><td class="r">'+num(s.pps)+'</td>'
@@ -9686,7 +10264,7 @@ function txTable(tx){
   rows.forEach(function(s, i){
     var c = s.state==='running' ? 'ok' : (s.state==='ERROR' ? 'bad' : 'dim');
     var p = s.params;
-    h += '<tbody class="sg"><tr class="clk'+(i===selRow?' sel':'')+'" data-i="'+i+'"><td class="r">'+(i+1)+'</td><td class="'+c+'">'+esc(s.state)+'</td><td>'+esc(p.destination_address)+'</td>'
+    h += '<tbody class="sg'+(i===selRow?' sel':'')+'"><tr class="clk'+(i===selRow?' sel':'')+'" data-i="'+i+'"><td class="r">'+(i+1)+'</td><td class="'+c+'"'+(s.ended ? ' title="'+esc(s.ended)+'"' : '')+'>'+esc(s.state)+(s.ended ? ' *' : '')+'</td><td>'+esc(p.destination_address)+'</td>'
       + '<td class="r">'+p.destination_port+'</td><td class="r">'+p.packet_size+'</td><td>'+esc(s.rate)+'</td><td>'+p.dscp_value+' '+esc(s.dscp)+'</td><td class="r">'+p.ttl+'</td><td class="'+(p.protocol==='tcp'||p.df_bit?'acc':'dim')+'">'+(p.protocol==='tcp'?(p.df_bit?'TCP DF':'TCP'):p.df_bit?'on':'off')+'</td>'
       + '<td>'+esc(p.source_address||'any')+(p.source_port?':'+p.source_port:'')+'</td><td class="r">'+num(s.sent)+'</td><td class="r">'+f2(s.mbps)+'</td><td class="r">'+(s.pps?Math.round(s.pps).toLocaleString('en-US'):'0')+'</td>'
       + '<td>'+grBox('tx', String(i))+'</td></tr>'
@@ -9876,8 +10454,8 @@ function histDraw(d, pn){
       + ' &nbsp; Mbit/s avg <b>'+mb.avg.toFixed(2)+'</b>';
     panels = [
       {title:'Delay (ms): avg per second, band = fastest..slowest packet of the second', h:130, lines:[{get:function(p){ return p[5]; }, c:'#7fd1ff'}], band:[function(p){ return p[6]; }, function(p){ return p[7]; }]},
-      {skip:isT, title:'Lost packets per second', h:70, bars:function(p){ return p[3]; }, c:'#ff4b4b'},
-      {skip:isT, title:'Misordered packets per second', h:60, bars:function(p){ return p[4]; }, c:'#e5c07b'},
+      {skip:isT, title:'Lost packets per second', h:80, bars:function(p){ return p[3]; }, c:'#ff4b4b'},
+      {skip:isT, title:'Misordered packets per second', h:80, bars:function(p){ return p[4]; }, c:'#e5c07b'},
       {title:'Throughput (Mbit/s)', h:80, lines:[{get:function(p){ return p[1]; }, c:'#3ddc60'}]},
       {title:'Packets per second', h:80, lines:[{get:function(p){ return p[2]; }, c:'#c792ea'}]}];
     tipFn = function(p){ return 'avg-d: '+(p[5]==null?'n/a':p[5].toFixed(2)+' ms')+'<br>min-d: '+(p[6]==null?'n/a':p[6].toFixed(2)+' ms')+'<br>max-d: '+(p[7]==null?'n/a':p[7].toFixed(2)+' ms')+(isT ? '<br>' : '<br>lost '+p[3]+'/s, misordered '+p[4]+'/s<br>total loss '+p[8].toFixed(3)+'%<br>')+p[1].toFixed(2)+' Mbit/s, '+Math.round(p[2]).toLocaleString('en-US')+' pps'; };
@@ -9908,8 +10486,8 @@ function histDraw(d, pn){
   }
   if(RXH){                                   /* receiver panels */
     panels.push({title:'Receiver delay (ms): avg per interval, band = min..max', h:110, lines:[{get:function(p){ return p[rb+4]; }, c:'#ffb86c'}], band:[function(p){ return p[rb+5]; }, function(p){ return p[rb+6]; }]});
-    if(!tcp) panels.push({title:'Receiver: lost packets per interval', h:60, bars:function(p){ return p[rb+2]||0; }, c:'#ff4b4b'});
-    if(!tcp) panels.push({title:'Receiver: misordered packets per interval', h:60, bars:function(p){ return p[rb+3]||0; }, c:'#ffb86c'});
+    if(!tcp) panels.push({title:'Receiver: lost packets per interval', h:80, bars:function(p){ return p[rb+2]||0; }, c:'#ff4b4b'});
+    if(!tcp) panels.push({title:'Receiver: misordered packets per interval', h:80, bars:function(p){ return p[rb+3]||0; }, c:'#ffb86c'});
     var _tip = tipFn;
     tipFn = function(p, i){ return _tip(p, i) + (p[rb]!=null ? '<br>receiver: '+p[rb].toFixed(2)+' Mbit/s, '+Math.round(p[rb+1])+' pps'+(p[rb+4]!=null ? ', delay '+p[rb+4].toFixed(2)+' ms' : '')+(tcp ? '' : ', lost '+p[rb+2]+', misordered '+p[rb+3]) : ''); };
     legend += ' <span style="color:#ffb86c">receiver (orange)</span>';
@@ -9918,13 +10496,19 @@ function histDraw(d, pn){
   }
   panels = panels.filter(function(q){ return !q.skip; });
   SM.innerHTML = sumHtml + ' &nbsp; <span class="dim">'+n+' s</span>';
-  var KH = pn.classList.contains('big') ? 1.25 : 0.72;
+  var KH = 0.72, W = 820, L = 54, R = 10;
+  if(pn.classList.contains('big')){                 /* enlarged: fit exactly into the browser window (no scrolling) */
+    var gh = pn.querySelector('.gh'), base = 0;
+    panels.forEach(function(q){ base += q.h; });
+    var availH = pn.clientHeight - 24 - (gh ? gh.offsetHeight + 4 : 0) - SM.offsetHeight - 52 - 14*panels.length - 18;
+    W = Math.max(500, pn.clientWidth - 36);
+    KH = Math.max(0.5, Math.min(2.6, availH / (base || 1)));
+  }
   panels.forEach(function(q){ q.h = Math.round(q.h*KH); });
-  var W = 820, L = 54, R = 10;
   var t0 = P[0][0], t1 = P[n-1][0], tspan = (t1-t0)||1, y = 0, svg = '';
   function X(t){ return L + (t-t0)/tspan*(W-L-R); }
   panels.forEach(function(pn){
-    var top = y+16, bot = y+pn.h, vals = [], lo, hi;
+    var top = y+20, bot = y+pn.h, vals = [], lo, hi;
     if(pn.bars) vals = P.map(pn.bars);
     else pn.lines.forEach(function(l){ P.forEach(function(p){ var v = l.get(p); if(v!=null) vals.push(v); }); });
     if(pn.band) P.forEach(function(p){ var a = pn.band[0](p), b2 = pn.band[1](p); if(a!=null) vals.push(a, b2); });
@@ -9942,7 +10526,7 @@ function histDraw(d, pn){
       svg += '<polygon points="'+up.concat(dn).join(' ')+'" fill="#7fd1ff" opacity="0.15"/>';
     }
     if(pn.bars){
-      var bw = Math.max(1, (W-L-R)/n*0.8);
+      var bw = Math.max(1, Math.min(7, (W-L-R)/n*0.5));
       vals.forEach(function(v, i){ if(v>0) svg += '<rect x="'+(X(P[i][0])-bw/2)+'" y="'+Y(v)+'" width="'+bw+'" height="'+(bot-Y(v))+'" fill="'+pn.c+'"/>'; });
     } else pn.lines.forEach(function(l){
       svg += '<polyline fill="none" stroke="'+l.c+'" stroke-width="1.6" points="'+P.filter(function(p){ return l.get(p)!=null; }).map(function(p){ return X(p[0])+','+Y(l.get(p)); }).join(' ')+'"/>';
@@ -10061,9 +10645,152 @@ $('grid').addEventListener('mousedown', function(e){
 $('grid').addEventListener('click', function(e){ if(e.target.closest && e.target.closest('.gck')){ e.preventDefault(); e.stopPropagation(); } }, true);
 
 
+window.addEventListener('resize', function(){ Array.prototype.forEach.call(document.querySelectorAll('.gp.big'), function(el){ if(el._d) histDraw(el._d, el); }); });
+
+/* ---------- tooltips: short explanations for form fields, table headers and the status line ---------- */
+var FTIP = {
+  rx: {
+    unicast:'Receive unicast only. Without it the receiver also joins the multicast group(s) below, so multicast streams arrive.',
+    group:'Multicast group(s) the receiver joins (IGMP / MLD join). One group, a list (239.1.1.1,239.1.1.2) or a range (239.1.1.1-239.1.1.9 or 239.1.1.1-9). Not needed for unicast.',
+    interface:'Interface that joins the multicast group. all = every interface with an address, auto = the kernel decides (routing table).',
+    port:'Data port(s) to listen on (UDP and TCP): one port, a range (5001-5008) or a list (5001,6000-6003). Must match the destination port of the sender.',
+    sync_mode:'One-way delay (OWD) measurement: the receiver synchronises its clock with the sync server of the sender. auto = every sender is detected from its packets, sender IP = one fixed sender, off = no delay values.',
+    sender_ip:'IP address of the sender whose sync server is used for the delay measurement.',
+    sender_sync_port:'TCP port of the sync server of the sender. 0 = taken from the packets (the sender announces it).',
+    resync_interval:'How often (seconds) the clock offset to the sender is measured again - compensates clock drift.',
+    summary:'Seconds between summary lines in the log. 0 = one line per received packet.',
+    compact:'Shorter summary lines (fewer columns).',
+    tcp:'Also accept TCP connections on the same port numbers (for TCP streams of a sender).',
+    tcp_rcvbuf:'Receive buffer of the TCP sockets in KB. 0 = system default (autotuning). A small buffer limits the TCP window and therefore the throughput (bandwidth-delay product).',
+    tcp_read_rate:'Simulates a slow reader: the receiver reads at most this many Mbit/s, the TCP window shrinks up to zero. 0 = read as fast as possible.',
+    tcp_read_on:'Slow-reader pattern: read for this many seconds ... and then pause (next field). 0 = always read.',
+    tcp_read_off:'... then do not read at all for this many seconds: the receive window closes (zero window).',
+    show_ip:'Show the sender IP address and the destination address (multicast group / broadcast / unicast address) in every log line and in the stream table.',
+    verify:'Check every packet (CRC and padding) and count damaged packets. Costs CPU at high rates.',
+    print_limit:'Maximum number of per-packet log lines per second (protects the browser at high rates). 0 = unlimited.',
+    log_mode:'Write all received packets to a CSV file. automatic = file name from date and time, file name = your own name.',
+    log_name:'Name of the CSV file in the working directory.'},
+  tx: {
+    destination_address:'Target of the stream: IP address or host name - unicast, multicast (224.x - 239.x) or broadcast.',
+    destination_port:'Destination port (UDP / TCP). The receiver separates the streams by port, so every stream needs its own port.',
+    protocol:'UDP = datagrams with sequence number and time stamp (loss, misorder, delay). TCP = real connections (unicast only): RTT, retransmits, window.',
+    connections:'Number of parallel TCP connections (1-64); the configured rate is shared between them.',
+    tcp_cc:'TCP congestion control algorithm (Linux), e.g. cubic or bbr. Set per connection.',
+    tcp_sndbuf:'TCP send buffer in KB. 0 = system default (autotuning). A small buffer limits the window and the throughput.',
+    tcp_mss:'Maximum segment size in bytes. 0 = system default (derived from the MTU).',
+    tcp_nodelay:'On: small writes are sent immediately. Off: the Nagle algorithm collects small data into larger segments.',
+    tcp_on:'Burst / pause pattern: send for this many seconds ... 0 = send continuously.',
+    tcp_off:'... then stay silent for this many seconds. Tests idle connections and slow-start restart after idle.',
+    tcp_recycle:'Close and reopen the connections every N seconds (0 = never) - TCP starts with slow start every time.',
+    rx_query:'The sender asks the receiver for its measured values (loss, misorder, delay, Mbit/s) over a TCP connection to the data port of the receiver and shows them with the stream. Only the direction sender -> receiver has to be open; the receiver needs the TCP listener.',
+    rx_interval:'How often (seconds) the sender asks the receiver for its values.',
+    rx_host:'Address the query goes to. Empty = the destination address. Needed with multicast / broadcast: nobody accepts a TCP connection on a group or broadcast address, so the query has to go to the real unicast address of the receiver.',
+    packet_size:'UDP: size on the wire in bytes (55 up to the interface MTU; with DF off up to 65507, then fragmented). TCP: message size.',
+    burst_mode:'Send as fast as possible (limited only by the burst limit) instead of a fixed packet rate.',
+    packets_per_second:'Fixed packet rate. The Mbit/s value follows from packet size x rate.',
+    burst_mbps:'Upper limit in burst mode (Mbit/s). 0 = unlimited (fills the path).',
+    dscp_value:'DSCP value in the IP header (QoS marking), e.g. EF for voice, CS2, AF41. The network can queue the traffic by this value.',
+    ttl:'IP time-to-live / hop limit: how many routers the packets may cross. Multicast: TTL 1 stays in the local subnet.',
+    df_bit:'Set the Don\'t-Fragment bit (Linux): packets larger than the path MTU are dropped instead of fragmented. For path-MTU tests.',
+    source_address:'Source IP / interface of the packets. any = the OS chooses. With multicast / broadcast select the interface, otherwise the OS may use the wrong one.',
+    source_port:'Fixed source port. 0 = the OS chooses.',
+    max_runtime:'Stops the stream by itself after this many seconds - protects the bandwidth against a forgotten test. UDP: counted from the start of the stream; TCP: from the first established connection. 0 = until you stop it.'},
+  tt: {
+    idx:'The TCP stream the test runs on. It is changed step by step and restored afterwards.',
+    kind:'Step test = one setting is changed step by step (connections or rate limit); algorithm comparison = the same stream with different congestion control algorithms; bufferbloat = RTT of the idle path against the RTT under load.',
+    v_conn:'Numbers of parallel connections to test: list (1,2,4,8) or range with step (1-8/1).',
+    v_rate:'Rate limits to test in Mbit/s: list or range with step (100-1000/100). 0 = unlimited.',
+    v_algo:'Congestion control algorithms to compare (comma separated). Empty entry = system default.',
+    v_load:'Rate of the load phase in Mbit/s. 0 = the stream setting. The idle phase sends only 1 packet per second.',
+    dur:'Measuring time per step in seconds.',
+    warm:'Warm-up per step in seconds (not measured) - lets TCP leave slow start.'},
+  qt: {
+    sender:'Instance that sends the test stream.',
+    receiver:'Instance that receives the test stream (its receiver is started if needed).',
+    proto:'UDP or TCP test stream.',
+    rate:'Rate of the test stream in Mbit/s. 0 = unlimited.',
+    size:'Packet size in bytes.',
+    port:'Destination port of the stream; the receiver opens it if needed.',
+    dscp:'DSCP value (QoS marking) of the test stream.',
+    dest:'Address of the receiver as seen from the sender. Empty = the address from the list.',
+    dur:'Duration in seconds. 0 = until STOP TEST (the browser has to stay open for a time-limited test).'},
+  su: {
+    name:'Name of the setup (letters, digits, space . _ -).',
+    replace:'Replace the current list of remote instances by the list of the setup.',
+    apply:'Also apply the saved settings (receiver, streams) to the online instances - their streams are replaced.'},
+  ssh: {
+    host:'IP address or host name of the other mautg instance.',
+    name:'Display name in the strip and in the overview (optional).',
+    web_port:'Web port of the remote mautg (-web -port N). With SSH install it is the port the new instance will listen on.',
+    port:'Web port of the remote mautg.',
+    deploy:'Copy mautg.py to the host with the ssh client of this computer and start it there (Linux target; sudo only if it works).',
+    ssh_user:'User for the ssh login. Empty = the user of the ssh client of this computer.',
+    ssh_port:'SSH port of the host (normally 22).',
+    password:'SSH password (and sudo). Empty = key / ssh-agent. It is only kept in the memory of this browser page, never stored.',
+    ssh_dir:'Directory on the host (relative to the home directory) where mautg.py is installed.',
+    bind:'Address the remote web GUI listens on. Empty = all interfaces. The web GUI has no login - bind it to an address that only you can reach.',
+    hostkey:'How the ssh host key is handled: trust on first use, accept everything (insecure, no MITM protection) or only hosts already in known_hosts.',
+    ack:'The page is not encrypted (HTTP): the password crosses the network in clear text. Confirm that you accept this.',
+    stopall:'Stop all sender streams and the receiver of that instance before it is removed.',
+    quit:'End the mautg process on the host: first through the web GUI, if that does not work through SSH.'},
+  file: {name:'File name in the working directory of mautg.py. Empty = the default file.'}
+};
+var HTIP = {
+  rx: {ST:'Stream (sender and port). Click a row: its lines are marked in the live view (click again: remove).', SOURCE:'Source IP address of the stream.', DEST:'Destination address the traffic arrives with: multicast group, broadcast or unicast address of this host (shown with SHOW IP).', PORT:'Destination port the stream arrives on.',
+    CAST:'Type of the stream: unicast, multicast, broadcast or TCP.', PACKETS:'Received packets.', 'LOSS%':'Lost packets in percent (gaps in the sequence numbers).',
+    MISS:'Number of lost packets.', CONS:'Most packets lost in a row.', ORD:'Misordered packets (arrived out of sequence).',
+    AVG:'One-way delay, average (ms) - needs the OWD sync.', MIN:'One-way delay, minimum (ms).', MAX:'One-way delay, maximum (ms).',
+    'MBIT/S':'Received throughput in Mbit/s.', 'PKT/S':'Received packets per second.', DSCP:'DSCP value (QoS marking) of the received packets.',
+    SIZE:'Packet size on the wire (bytes).', SPORT:'Source port of the stream.', SYNC:'Clock sync with the sender for the delay measurement: ok, wait, FAIL or off.'},
+  tx: {'#':'Number of the stream.', STATE:'running / stopped / error.', DESTINATION:'Destination address of the stream.', PORT:'Destination port.', SIZE:'Packet size in bytes.',
+    RATE:'Configured rate (pps, Mbit/s or burst).', DSCP:'DSCP value (QoS marking).', TTL:'IP time-to-live / hop limit.', DF:'Don\'t-Fragment bit (TCP = TCP stream).',
+    SOURCE:'Source address (any = chosen by the OS).', SENT:'Packets / messages sent since the start (or reset).', 'MBIT/S':'Current send rate in Mbit/s.', 'PPS NOW':'Current packets per second.'},
+  ov: {NAME:'Name of the instance (LOCAL = the instance that serves this page).', ADDRESS:'Address and web port of the instance.', STATE:'online = the web GUI answers; offline = not reachable (ping shows whether the host itself is up).',
+    VERSION:'mautg version of the instance.', RECEIVER:'State of the receiver: streams seen, Mbit/s and loss.', SENDER:'Sender streams running / configured and the send rate.'}
+};
+var STIP = {
+  rx: {STREAMS:'Streams the receiver has seen.', RUNTIME:'Time since the receiver was started.', PACKETS:'Packets received in total.', RATE:'Received Mbit/s in total.',
+    SYNC:'Clock sync with the senders (OWD measurement).', VIEW:'Log view: summary or per packet.'},
+  tx: {STREAMS:'Configured streams / maximum (32).', RUNNING:'Streams that are sending now.', SENT:'Packets sent in total.', RATE:'Send rate in total (Mbit/s).',
+    'SYNC SERVER':'Port of the sync server (the receivers measure the one-way delay against it).'}
+};
+function tipCtxForm(title){
+  title = String(title||'');
+  if(/^RECEIVER SETTINGS/.test(title)) return 'rx';
+  if(/^(ADD|EDIT) STREAM/.test(title)) return 'tx';
+  if(/^TCP TEST/.test(title)) return 'tt';
+  if(/^QUICK TEST/.test(title)) return 'qt';
+  if(/SETUP$/.test(title)) return 'su';
+  if(/REMOTE|^UPDATE|^INSTALL|^REMOVE INSTANCE/.test(title)) return 'ssh';
+  return 'file';
+}
+function tipForm(host){
+  var h3 = host.querySelector('h3'), ctx = tipCtxForm(h3 && h3.textContent), T = FTIP[ctx] || {};
+  Array.prototype.forEach.call(host.querySelectorAll('.frow'), function(row){
+    var el = row.querySelector('input,select'); if(!el) return;
+    var t = T[(el.id||'').replace(/^f_/, '')]; if(!t) return;
+    row.title = t;
+  });
+}
+function tipOf(el){
+  var th = el.closest ? el.closest('th') : null, sp;
+  if(th){
+    var ctx = th.closest('#remover') ? 'ov' : (th.closest('table.tx') ? 'tx' : (th.closest('#grid') ? 'rx' : ''));
+    var t = ctx && HTIP[ctx][th.textContent.trim()];
+    if(t && !th.title) th.title = t;
+    return;
+  }
+  sp = el.closest ? el.closest('.stats > span') : null;
+  if(sp && !sp.title){
+    var c2 = sp.parentNode.id==='statsTx' ? 'tx' : 'rx', k = sp.textContent.split(':')[0].trim();
+    if(STIP[c2][k]) sp.title = STIP[c2][k];
+  }
+}
+document.addEventListener('mouseover', function(e){ tipOf(e.target); });
+
 /* ---------- tabs ---------- */
 function setTab(t){
-  tab = t; store('mautg_tab', t);
+  tab = t; if(IN_FRAME) store('mautg_tab', t);
   $('tabRx').className = (t==='receiver') ? 'on' : '';
   $('tabTx').className = (t==='sender') ? 'on' : '';
   var ro = S && S.readonly;
@@ -10081,6 +10808,572 @@ function setTab(t){
 }
 $('tabRx').onclick = function(){ setTab('receiver'); };
 $('tabTx').onclick = function(){ setTab('sender'); };
+
+/* ---------- REMOTE: other mautg instances, controlled through this one ---------- */
+/* the list is stored on this instance (~/.mau/remotes.json); every request goes to /r/<id>/... and is forwarded */
+var REM = [], RS = {}, remOpen = [], remCur = '', QT = null, remBusy = false;
+function remBase(id){ return id ? 'r/'+id+'/' : ''; }
+function remName(id){ if(!id || id==='L') return 'LOCAL'; var x = REM.filter(function(i){ return i.id===id; })[0]; return x ? x.name : id; }
+function remGet(id, path, cb){
+  var ac = new AbortController(), t = setTimeout(function(){ ac.abort(); }, 3500);
+  fetch(remBase(id)+path, {signal: ac.signal, cache:'no-store'}).then(function(r){
+    clearTimeout(t); if(!r.ok) throw r.status; return r.json();
+  }).then(function(j){ cb(null, j); }).catch(function(e){ clearTimeout(t); cb(e==null?'error':e); });
+}
+function remPost(id, cmd, value, data, cb){
+  fetch(remBase(id)+'api/command', {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'mautg'},
+        body: JSON.stringify({cmd:cmd, value:value==null?'':String(value), data:data||{}})})
+    .then(function(r){ return r.json().catch(function(){ return {ok:false,error:'bad response'}; }); })
+    .then(function(j){ cb(j); }).catch(function(){ cb({ok:false,error:'no connection'}); });
+}
+function remFromStatus(j){                        /* instance without /api/summary (older version) */
+  var rx = j.rx || {}, tx = (j.tx && j.tx.streams) || [];
+  var run = tx.filter(function(s){ return /^run/i.test(s.state||''); });
+  return {version:j.version, host:'', ifaces:j.ifaces||[], rx:{running:!!rx.running, streams:(rx.rows||[]).length, mbit:rx.mbit||0, loss:0},
+    tx:{streams:tx.length, running:run.length, mbit:run.reduce(function(a,s){ return a+(s.mbps||0); },0), controllable:!!(j.tx && j.tx.controllable)}, old:true};
+}
+function remSetOff(id, err){                       /* web GUI not reachable: ask whether the host answers ICMP */
+  var o = RS[id] || {};
+  RS[id] = {up:false, err:err, icmp:o.icmp, pt:o.pt};
+  if(id && (!o.pt || Date.now() - o.pt > 6000)){
+    RS[id].pt = Date.now();
+    fetch('api/ping?id='+encodeURIComponent(id), {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(j){
+      if(RS[id] && !RS[id].up){ RS[id].icmp = j; remDraw(); }
+    }).catch(function(){});
+  }
+  remDraw();
+}
+function remPollOne(id){
+  remGet(id, 'api/summary', function(e, j){
+    if(!e){ var was = RS[id]; RS[id] = {up:true, sum:j}; if(was && !was.up) remReloadFrame(id); remDraw(); return; }
+    if(e===404){ remGet(id, 'api/status?ls=0', function(e2, j2){ if(e2) remSetOff(id, String(e2)); else { RS[id] = {up:true, sum:remFromStatus(j2)}; remDraw(); } }); return; }
+    remSetOff(id, e===502 ? 'web GUI not reachable' : String(e));
+  });
+}
+function remReloadFrame(id){
+  var k = id==='' ? 'L' : id;
+  Array.prototype.forEach.call($('remframes').children, function(f){ if(f.getAttribute('data-id')===k) f.src = f.src; });
+}
+function remPoll(){ remPollOne(''); REM.forEach(function(i){ remPollOne(i.id); }); }
+function remLoad(cb){
+  fetch('api/remotes', {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(j){
+    REM = j.remotes || []; remOpen = remOpen.filter(function(id){ return id==='L' || REM.some(function(i){ return i.id===id; }); });
+    if(remCur && remOpen.indexOf(remCur)<0) remCur = '';
+    remDraw(); remPoll(); if(cb) cb();
+  }).catch(function(){});
+}
+var remTick = 0;
+setInterval(function(){ if(IN_FRAME || document.hidden) return; if(++remTick % 8 === 0) remLoad(); else remPoll(); }, 2000);   /* the list is re-read from the controlling instance now and then */
+
+function remRxText(s){
+  if(!s.rx || !s.rx.running) return '<span class="dim">stopped</span>';
+  var t = '<span class="ok">running</span> &middot; '+(s.rx.streams||0)+' stream'+((s.rx.streams||0)===1?'':'s')+' &middot; '+f2(s.rx.mbit)+' Mbit/s';
+  if(s.rx.loss) t += ' &middot; <span class="warnc">loss '+f2(s.rx.loss)+' %</span>';
+  return t;
+}
+function remTxText(s){
+  var t = s.tx || {};
+  if(!t.streams) return '<span class="dim">no streams</span>';
+  return (t.running ? '<span class="ok">'+t.running+'/'+t.streams+' running</span>' : '<span class="dim">0/'+t.streams+' running</span>')+' &middot; '+f2(t.mbit)+' Mbit/s';
+}
+function remDraw(){
+  if(IN_FRAME) return;
+  var h = '<div id="remtoolbar"><button data-act="test" class="on" title="start a test between two instances in one step">QUICK TEST</button>'
+    + (QT ? '<span class="warnc">test running: '+esc(remName(QT.s))+' &rarr; '+esc(remName(QT.r))+' ('+esc(QT.proto.toUpperCase())+' '+QT.rate+' Mbit/s, port '+QT.port+')</span> <button data-act="stoptest" class="danger">STOP TEST</button>' : '')
+    + '<span class="dim">The instances are controlled through this one (only this instance needs to be reachable from the browser).</span></div>';
+  h += '<table class="t"><thead><tr><th>NAME</th><th>ADDRESS</th><th>STATE</th><th>VERSION</th><th>RECEIVER</th><th>SENDER</th><th></th></tr></thead><tbody>';
+  var rows = [{id:'', name:'LOCAL', host:'', port:''}].concat(REM);
+  if(REM.length){                                    /* ALL first, separator line below it, then LOCAL and the remote instances */
+      var all = [{id:''}].concat(REM), nup = all.filter(function(x){ return RS[x.id] && RS[x.id].up; }).length, d = nup ? '' : ' disabled';
+      h += '<tr class="grp0"><td><b>ALL</b></td><td><span class="dim">'+all.length+' instances</span></td><td><span class="'+(nup===all.length?'ok':'warnc')+'">'+nup+' online</span></td><td></td><td></td><td></td><td class="act" style="white-space:nowrap">'
+        + '<button data-act="rxstart" data-id="*"'+d+' title="receiver settings - applied to all online instances">RX START</button> '
+        + '<button data-act="rxstop" data-id="*"'+d+'>RX STOP</button> '
+        + '<button data-act="open" data-id="*"'+d+' title="open all online instances">OPEN</button> '
+        + '<button data-act="startall" data-id="*"'+d+'>START ALL</button> <button data-act="stopall" data-id="*"'+d+'>STOP ALL</button> <button data-act="reset" data-id="*"'+d+'>RESET</button> <button data-act="restore" data-id="*"'+d+' title="apply the saved settings (receiver, streams) to every online remote instance (not LOCAL)">RESTORE</button></td></tr>';
+  }
+  rows.forEach(function(i){
+    var st = RS[i.id], s = st && st.sum, up = st && st.up;
+    var state = !st ? '<span class="dim">...</span>' : (up ? '<span class="ok">&#9679; online</span>' : '<span class="bad">&#9679; offline</span> <span class="dim">'+esc(st.err||'')+'</span>'
+      + (st.icmp && st.icmp.ok===true ? ' &middot; <span class="ok" title="the host answers ICMP echo (ping) - only the mautg web GUI is not reachable">ping ok'+(st.icmp.rtt!=null ? ' '+f2(st.icmp.rtt)+' ms' : '')+'</span>'
+        : (st.icmp && st.icmp.ok===false ? ' &middot; <span class="bad" title="no answer to ICMP echo (ping): host down, unreachable or ICMP filtered">no ping</span>' : '')));
+    h += '<tr data-id="'+esc(i.id)+'"><td><b>'+esc(i.id ? i.name : 'LOCAL')+'</b>'+(i.id ? '' : (s && s.host ? ' <span class="dim">('+esc(s.host)+')</span>' : ''))+'</td>'
+      + '<td>'+(i.id ? esc(i.host)+':'+i.port : '<span class="dim">local</span>')+'</td><td>'+state+'</td>'
+      + '<td>'+(s ? esc(s.version)+(s.old ? ' <span class="dim">(no summary)</span>' : '') : '')+'</td>'
+      + '<td>'+(s ? remRxText(s) : '')+'</td><td>'+(s ? remTxText(s) : '')+'</td><td class="act" style="white-space:nowrap">';
+    var upn = !!up;
+    h += '<button data-act="rxstart" data-id="'+esc(i.id)+'" title="receiver settings - start or restart the receiver"'+(upn?'':' disabled')+'>'+(s && s.rx && s.rx.running ? 'RX RESTART' : 'RX START')+'</button> '
+      + '<button data-act="rxstop" data-id="'+esc(i.id)+'" title="stop the receiver"'+(upn && s && s.rx && s.rx.running ? '' : ' disabled')+'>RX STOP</button> ';
+    if(!i.id){
+      h += '<button data-act="open" data-id="">OPEN</button> <button data-act="startall" data-id="" title="start all sender streams" '+(upn?'':'disabled')+'>START ALL</button> <button data-act="stopall" data-id="" title="stop all sender streams" '+(upn?'':'disabled')+'>STOP ALL</button> <button data-act="reset" data-id="" title="reset receiver counters and sender statistics" '+(upn?'':'disabled')+'>RESET</button> <button data-act="restore" tabindex="-1" disabled style="visibility:hidden">RESTORE</button>';
+    }
+    if(i.id){
+      h += '<button data-act="open" data-id="'+esc(i.id)+'">OPEN</button> '
+        + '<button data-act="startall" data-id="'+esc(i.id)+'" title="start all sender streams"'+(up?'':' disabled')+'>START ALL</button> '
+        + '<button data-act="stopall" data-id="'+esc(i.id)+'" title="stop all sender streams"'+(up?'':' disabled')+'>STOP ALL</button> '
+        + '<button data-act="reset" data-id="'+esc(i.id)+'" title="reset receiver counters and sender statistics"'+(up?'':' disabled')+'>RESET</button> '
+        + '<button data-act="restore" data-id="'+esc(i.id)+'" title="'+(i.snap ? 'apply the saved settings ('+esc(i.snap.t||'')+') to this instance' : 'no saved settings yet (SAVE SETUP)')+'"'+((up && i.snap)?'':' disabled')+'>RESTORE</button> '
+        + '<button data-act="del" data-id="'+esc(i.id)+'" class="danger">REMOVE</button>'
+        + ((up && s && s.version && S && S.version && verLess(s.version, S.version)) ? ' <button data-act="update" data-id="'+esc(i.id)+'" class="on" title="this remote runs '+esc(s.version)+', this instance '+esc(S.version)+' - copy the new mautg.py with ssh and restart">UPDATE</button>'
+          : ((st && !up) ? ' <button data-act="update" data-id="'+esc(i.id)+'" class="on" title="not reachable - copy mautg.py with ssh and start it on the host">INSTALL</button>' : ''));
+    }
+    h += '</td></tr>';
+  });
+  h += '</tbody></table>';
+  if(!REM.length) h += '<p class="dim">No other instance yet - ADD REMOTE (address and web port of the other mautg, e.g. started with <b>-web -port 8081</b>).</p>';
+  var ov = $('remover'); if(ov.getAttribute('data-h') !== h){ ov.innerHTML = h; ov.setAttribute('data-h', h); }
+  var cl = function(id){ return remCur===id ? ' cur' : ''; };
+  var dot = function(id){ var u = RS[id==='L' ? '' : id]; return '<span class="'+(u ? (u.up ? 'ok' : 'bad') : 'dim')+'">&#9679;</span> '; };
+  var sh = '<button data-cur="" class="'+cl('').trim()+'" title="all instances at a glance: state, receiver, sender, actions for one or all instances">OVERVIEW</button><button data-cur="L" class="'+cl('L').trim()+'" title="the instance that serves this page (green dot = reachable)">'+dot('L')+'LOCAL</button>';
+  REM.forEach(function(i){ sh += '<span class="grp" style="gap:0"><button data-cur="'+esc(i.id)+'" class="'+cl(i.id).trim()+'" title="'+esc(i.host)+':'+i.port+' - complete GUI of this remote instance (click again: reload)">'+dot(i.id)+esc(i.name)+'</button><button data-rm="'+esc(i.id)+'" title="remove this instance from the list" style="padding:4px 7px;margin-left:-1px">&times;</button></span>'; });
+  sh += '<span class="sep">&nbsp;|&nbsp;</span><button data-sact="add" title="add another mautg instance">+ ADD REMOTE</button><button data-sact="save" title="save the remote list with the settings of the instances under a name">SAVE SETUP</button><button data-sact="load" title="load a saved setup">LOAD SETUP</button>';
+  var ss = $('remtabs'); if(ss.getAttribute('data-h') !== sh){ ss.innerHTML = sh; ss.setAttribute('data-h', sh); }
+}
+function remShow(id){
+  remCur = id; if(!IN_FRAME) store('mautg_top', id);
+  $('remover').style.display = id ? 'none' : '';
+  $('remframes').style.display = id ? 'block' : 'none';
+  Array.prototype.forEach.call($('remframes').children, function(f){ f.style.display = (f.getAttribute('data-id')===id) ? 'block' : 'none'; });
+  $('remtabs').removeAttribute('data-h'); remDraw();
+}
+function remOpenInst(id){
+  if(id==='') id = 'L';
+  if(remOpen.indexOf(id)<0){
+    remOpen.push(id);
+    var f = document.createElement('iframe'); f.setAttribute('data-id', id); f.src = (id==='L') ? '/' : '/r/'+id+'/';
+    $('remframes').appendChild(f);
+  }
+  remShow(id);
+}
+function remCloseInst(id){
+  remOpen = remOpen.filter(function(x){ return x!==id; });
+  Array.prototype.forEach.call($('remframes').children, function(f){ if(f.getAttribute('data-id')===id) $('remframes').removeChild(f); });
+  if(remCur===id) remShow(''); else { $('remtabs').removeAttribute('data-h'); remDraw(); }
+}
+function remEditForm(id){
+  if(!id){ remAddForm(); return; }
+  var cur = REM.filter(function(i){ return i.id===id; })[0] || {name:'', host:'', port:8081};
+  openForm(id ? 'EDIT REMOTE' : 'ADD REMOTE', 'Address and web port of the other mautg (started with -web -port N).', [
+    {k:'name', label:'Name', hint:'optional', type:'text'},
+    {k:'host', label:'Address', hint:'IP address or host name', type:'text'},
+    {k:'port', label:'Web port', type:'number'}], {name:cur.name, host:cur.host, port:cur.port}, [
+    {label:'SAVE', cls:'on', fn:function(v, done){
+      var e = {}; for(var kk in cur) e[kk] = cur[kk];
+      e.id = id||''; e.name = v.name; e.host = v.host; e.port = v.port;
+      var lst = id ? REM.map(function(i){ return i.id===id ? e : i; }) : REM.concat([e]);
+      fetch('api/remotes_set', {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'mautg'}, body: JSON.stringify({remotes:lst})})
+        .then(function(r){ return r.json(); }).then(function(j){
+          if(!j.ok){ done(j.error||'rejected'); return; }
+          REM = j.remotes; done(null); remLoad();
+        }).catch(function(){ done('no connection'); });
+    }}, {label:'CANCEL'}]);
+}
+function remDelForm(id){
+  var cur = REM.filter(function(i){ return i.id===id; })[0]; if(!cur) return;
+  var up = !!(RS[id] && RS[id].up);
+  var needSsh = false;                               /* the SSH fields appear only after quitting through the web GUI did not work */
+  var q = function(o){ return needSsh; };
+  var fields = [];
+  if(up) fields.push({k:'stopall', label:'Stop all sender streams and the receiver first', type:'check'});
+  fields.push({k:'quit', label:'Quit mautg on the host (through the web GUI; if that fails, SSH is offered)', type:'check'});
+  fields = fields.concat([
+    {k:'ssh_user', label:'SSH user', hint:'empty = user of the ssh client', type:'text', show:q},
+    {k:'ssh_port', label:'SSH port', type:'number', show:q},
+    {k:'password', label:'Password', hint:'SSH login (if no key) and sudo; empty = key / ssh-agent; NOT stored', type:'password', show:q},
+    {k:'ssh_dir', label:'Directory on the host', hint:'relative to the home directory', type:'text', show:q},
+    {k:'hostkey', label:'Host key', type:'select', options:[['accept-new','accept new keys (trust on first use)'],['off','accept everything (insecure)'],['strict','only known hosts (known_hosts)']], show:q}]);
+  if(!SECURE_CTX) fields.push({k:'ack', label:'I know: the password is sent unencrypted from this browser to mautg', type:'check', show:function(o){ return q(o) && !!o.password; }});
+  var vals = {stopall:up, quit:false, ssh_user:cur.ssh_user||'', ssh_port:cur.ssh_port||22, password:SSHPW[cur.host]||'', ssh_dir:cur.ssh_dir||'mautg', hostkey:cur.hostkey||'accept-new', ack:false};
+  var say = function(t){ var o = $('formErr'); o.style.whiteSpace = 'pre-wrap'; o.style.color = ''; o.textContent = t; };
+  var drop = function(done, msg){
+    var lst = REM.filter(function(i){ return i.id!==id; });
+    fetch('api/remotes_set', {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'mautg'}, body: JSON.stringify({remotes:lst})})
+      .then(function(r){ return r.json(); }).then(function(j){
+        if(!j.ok){ done(j.error||'rejected'); return; }
+        remCloseInst(id); REM = j.remotes; done(null); remLoad(); if(msg) note(msg, false);
+      }).catch(function(){ done('no connection'); });
+  };
+  var isUp = function(cb){ remGet(id, 'api/summary', function(e){ cb(!e); }); };
+  openForm('REMOVE INSTANCE', 'Remove "'+cur.name+'" from the list? Without the options below the instance itself keeps running.', fields, vals, [
+    {label:'REMOVE', cls:'danger', fn:function(v, done){
+      if(needSsh && v.password && !SECURE_CTX && !v.ack){ done('confirm the warning (unencrypted password) first'); return; }
+      var steps = [];
+      if(up && v.stopall) steps.push(function(next){
+        say('stopping streams and receiver ...');
+        remPost(id, 'tx_stop', 'all', {}, function(){ remPost(id, 'rx_stop', '', {}, function(){ next(); }); });
+      });
+      if(v.quit) steps.push(function(next){
+        var askSsh = function(why){
+          needSsh = true; var c = $('f_quit'); if(c) c.dispatchEvent(new Event('change'));
+          next(why+' - enter the SSH login below and press REMOVE again (or remove without quitting)');
+        };
+        var viaSsh = function(){
+          say('stopping through SSH ...');
+          fetch('api/remote_ssh', {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'mautg'},
+            body: JSON.stringify({id:id, stop:true, password:v.password, ssh_user:v.ssh_user, ssh_port:v.ssh_port, ssh_dir:v.ssh_dir, hostkey:v.hostkey})})
+            .then(function(r){ return r.json(); }).then(function(j){
+              if(j.ok){ if(v.password) SSHPW[cur.host] = v.password; next(null); }
+              else askSsh('SSH: '+(j.error||'failed'));
+            }).catch(function(){ askSsh('SSH: no connection'); });
+        };
+        if(needSsh){ viaSsh(); return; }                 /* second attempt: SSH fields were filled in */
+        say('quitting mautg on the host ...');
+        if(!up){ askSsh('not reachable through the web GUI'); return; }
+        remPost(id, 'exit', '', {}, function(j){
+          setTimeout(function(){ isUp(function(u){ if(!u) next(null); else askSsh('mautg is still running (web quit did not work)'); }); }, 2500);
+        });
+      });
+      var i = 0;
+      (function run(err){
+        if(err){ done(err); return; }
+        if(i >= steps.length){ drop(done, cur.name+': removed'+(v.quit ? ' (mautg stopped)' : '')); return; }
+        steps[i++](run);
+      })(null);
+    }}, {label:'CANCEL'}], remSshWarn);
+}
+/* ADD REMOTE (optionally installs / starts mautg on a Linux host with the ssh client of THIS computer) and UPDATE */
+var SECURE_CTX = (location.protocol==='https:' || /^(localhost|127\.0\.0\.1|\[?::1\]?)$/.test(location.hostname));
+function remSshFields(showIf){
+  var sh = showIf || function(){ return true; };
+  var f = [
+    {k:'ssh_user', label:'SSH user', hint:'empty = user of the ssh client', type:'text', show:sh},
+    {k:'ssh_port', label:'SSH port', type:'number', show:sh},
+    {k:'password', label:'Password', hint:'SSH login (if no key) and sudo; empty = key / ssh-agent; NOT stored', type:'password', show:sh},
+    {k:'ssh_dir', label:'Directory on the host', hint:'relative to the home directory', type:'text', show:sh},
+    {k:'bind', label:'Bind address of the remote web GUI', hint:'IP address, empty = all interfaces (the GUI has no login!)', type:'text', show:sh},
+    {k:'hostkey', label:'Host key', type:'select', options:[['accept-new','accept new keys (trust on first use)'],['off','accept everything (insecure)'],['strict','only known hosts (known_hosts)']], show:sh}];
+  if(!SECURE_CTX) f.push({k:'ack', label:'I know: the password is sent unencrypted from this browser to mautg', type:'check', show:function(o){ return sh(o) && !!o.password; }});
+  return f;
+}
+function remSshWarn(o){
+  return (o.password && !SECURE_CTX) ? 'WARNING: this page is not encrypted (HTTP, address '+location.hostname+'). The password is sent in clear text over the network to the controlling mautg and can be read on the way. Use a key / ssh-agent, or open the GUI on this computer (http://localhost:port).' : '';
+}
+var SSHPW = {};                                       /* SSH passwords of this browser session (memory only, per host; gone on reload) */
+function remSshCall(v, ctx, test, done){           /* ctx: {id, host}; calls api/remote_ssh */
+  if(v.password && !SECURE_CTX && !v.ack){ done('confirm the warning (unencrypted password) first'); return; }
+  var out = $('formErr'); out.style.whiteSpace = 'pre-wrap'; out.style.color = '';
+  out.textContent = test ? 'testing ...' : 'copying and starting ... (up to a minute)';
+  var body = {id:ctx.id||'', host:ctx.host||v.host||'', test:!!test, web_port:v.web_port, password:v.password,
+              ssh_user:v.ssh_user, ssh_port:v.ssh_port, ssh_dir:v.ssh_dir, bind:v.bind, hostkey:v.hostkey};
+  fetch('api/remote_ssh', {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'mautg'}, body: JSON.stringify(body)})
+    .then(function(r){ return r.json(); }).then(function(j){
+      if(test){
+        var t = j.info ? ['user','os','python','root','dir','installed','port','webport'].filter(function(k){ return j.info[k]!=null; }).map(function(k){ return k+': '+j.info[k]; }).join('\n') : '';
+        if(j.ok && v.password) SSHPW[ctx.host||v.host||''] = v.password;
+        out.style.color = j.ok ? 'var(--up)' : ''; out.textContent = (j.ok ? 'OK - login works\n' : (j.error||'failed')+'\n') + t; return;
+      }
+      if(!j.ok){ done(j.error||'failed', j); return; }
+      if(v.password) SSHPW[ctx.host||v.host||''] = v.password;
+      out.style.color = 'var(--up)'; out.textContent = j.out || 'started';
+      done(null, j);
+    }).catch(function(){ done('no connection'); });
+}
+function remAddEntry(e, cb){
+  var lst = REM.concat([e]);
+  fetch('api/remotes_set', {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'mautg'}, body: JSON.stringify({remotes:lst})})
+    .then(function(r){ return r.json(); }).then(function(j){
+      if(!j.ok){ cb(j.error||'rejected'); return; }
+      REM = j.remotes; cb(null); remLoad();
+    }).catch(function(){ cb('no connection'); });
+}
+function remAddForm(){
+  var dep = function(o){ return !!o.deploy; };
+  var fields = [
+    {k:'host', label:'Address', hint:'IP address or host name', type:'text'},
+    {k:'name', label:'Name', hint:'optional', type:'text'},
+    {k:'web_port', label:'Web port of the remote mautg', hint:'the port its web GUI listens on / will listen on', type:'number'},
+    {k:'deploy', label:'Install / start mautg on this host with SSH', hint:'Linux target; copies mautg.py and starts it', type:'check'}
+  ].concat(remSshFields(dep));
+  var vals = {name:'', host:'', web_port:8081, deploy:false, ssh_user:'', ssh_port:22, password:'', ssh_dir:'mautg', bind:'', hostkey:'accept-new', ack:false};
+  var entry = function(v){ return {id:'', name:v.name, host:v.host, port:v.web_port, ssh_user:v.ssh_user, ssh_port:v.ssh_port, ssh_dir:v.ssh_dir, bind:v.bind, hostkey:v.hostkey}; };
+  var needSsh = function(v, done){
+    if(v.deploy) return false;
+    var c = $('f_deploy'); if(c){ c.checked = true; c.dispatchEvent(new Event('change')); }
+    done('fill in the SSH settings (user, password or key) and press the button again'); return true;
+  };
+  openForm('ADD REMOTE', 'Address and web port of the other mautg (started with -web -port N). Optionally mautg is installed and started on a Linux host first (copy with ssh, sudo only if it works).',
+    fields, vals, [
+    {label:'TEST SSH', fn:function(v, done){ if(needSsh(v, done)) return; if(!v.host){ done('address needed'); return; } remSshCall(v, {id:'', host:v.host}, true, done); }},
+    {label:'ADD', cls:'on', fn:function(v, done){ remAddEntry(entry(v), done); }},
+    {label:'DEPLOY & ADD', cls:'on', fn:function(v, done){
+      if(needSsh(v, done)) return; if(!v.host){ done('address needed'); return; }
+      remSshCall(v, {id:'', host:v.host}, false, function(err){
+        if(err){ done(err); return; }
+        setTimeout(function(){ remAddEntry(entry(v), done); }, 800);
+      });
+    }},
+    {label:'CANCEL'}], remSshWarn);
+}
+function verLess(a, b){
+  var x = String(a).split('.').map(Number), y = String(b).split('.').map(Number);
+  for(var i=0; i<Math.max(x.length, y.length); i++){ var p = x[i]||0, q = y[i]||0; if(p!==q) return p<q; }
+  return false;
+}
+function remUpdateForm(id){
+  var cur = REM.filter(function(i){ return i.id===id; })[0]; if(!cur) return;
+  var inst = !(RS[id] && RS[id].up);                 /* offline: INSTALL (the same procedure as UPDATE) */
+  var vals = {web_port:cur.port, ssh_user:cur.ssh_user||'', ssh_port:cur.ssh_port||22, password:SSHPW[cur.host]||'', ssh_dir:cur.ssh_dir||'mautg', bind:cur.bind||'', hostkey:cur.hostkey||'accept-new', ack:false};
+  var fields = [{k:'web_port', label:'Web port of the remote mautg', type:'number'}].concat(remSshFields());
+  var snapBefore = null;
+  openForm((inst ? 'INSTALL - ' : 'UPDATE - ')+cur.name, 'Copies the mautg.py of this instance ('+(S&&S.version||'')+') to the host with ssh'+(inst ? ' and starts it there' : ', stops the running instance and starts it again')+' (Linux target, sudo only if it works).',
+    fields, vals, [
+    {label:'TEST', fn:function(v, done){ remSshCall(v, {id:id, host:cur.host}, true, done); }},
+    {label:(inst ? 'INSTALL' : 'UPDATE'), cls:'on', fn:function(v, done){
+      var go = function(snap){
+        remSshCall(v, {id:id, host:cur.host}, false, function(err){
+          if(err){ done(err); return; }
+          var out = $('formErr'); out.textContent += '\nwaiting for the instance ...';
+          remWaitOnline(id, 25, function(up){
+            if(!up || !snap){ done(null); remLoad(); if(!snap) note(remName(id)+': started (no saved settings to apply)', false); else note(remName(id)+': started, but not reachable yet - RESTORE applies the saved settings', true); return; }
+            out.textContent += '\napplying the saved settings ...';
+            remRestore(id, snap, function(e2){ done(null); remLoad(); note(remName(id)+': '+(e2 ? 'settings: '+e2 : 'updated, saved settings applied'), !!e2); });
+          });
+        });
+      };
+      if(inst || !(RS[id] && RS[id].up)){ go(cur.snap || null); return; }
+      remSnapOf(id, function(e, sn){ if(!e){ remSetSnap(id, sn); go(sn); } else go(cur.snap || null); });
+    }},
+    {label:'CLOSE'}], remSshWarn);
+}
+/* settings of an instance (receiver + streams): kept per entry (snap) and in named setups; RESTORE applies them again */
+function remSnapOf(id, cb){
+  remGet(id, 'api/status?ls=0&lite=1', function(e, j){
+    if(e){ cb(e); return; }
+    cb(null, {t:new Date().toISOString().slice(0,19).replace('T',' '), rx:{running:!!(j.rx && j.rx.running), rc:(j.rx && j.rx.rc) || null},
+      tx:((j.tx && j.tx.streams) || []).map(function(s){ return {p:s.params, run:/^run/i.test(s.state||'')}; })});
+  });
+}
+function remSaveList(list, cb){
+  fetch('api/remotes_set', {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'mautg'}, body: JSON.stringify({remotes:list})})
+    .then(function(r){ return r.json(); }).then(function(j){ if(j.ok) REM = j.remotes; cb(j.ok ? null : (j.error||'rejected')); }).catch(function(){ cb('no connection'); });
+}
+function remSetSnap(id, snap, cb){
+  var lst = REM.map(function(i){ if(i.id!==id) return i; var e = {}; for(var k in i) e[k] = i[k]; e.snap = snap; return e; });
+  remSaveList(lst, cb || function(){});
+}
+function remRestore(id, snap, cb){                       /* streams: all deleted and added again; receiver: started with the saved settings */
+  if(!snap){ cb('no saved settings'); return; }
+  remGet(id, 'api/status?ls=0&lite=1', function(e, j){
+    if(e){ cb(e===502 ? 'not reachable' : String(e)); return; }
+    var have = (j.tx && j.tx.streams) || [], want = snap.tx || [], steps = [], fails = [];
+    for(var k = have.length-1; k >= 0; k--) steps.push(['tx_del', k, {}]);
+    want.forEach(function(w){ steps.push(['tx_add', '', w.p]); });
+    want.forEach(function(w, k){ if(!w.run) steps.push(['tx_stop', k, {}]); });
+    if(snap.rx && snap.rx.running && snap.rx.rc) steps.push(['rx_start', '', rxValues(snap.rx.rc)]);
+    else if(!(snap.rx && snap.rx.running) && j.rx && j.rx.running) steps.push(['rx_stop', '', {}]);
+    var i = 0;
+    (function next(){
+      if(i >= steps.length){ remPollOne(id); cb(fails.length ? fails.join('; ') : null); return; }
+      var c = steps[i++];
+      remPost(id, c[0], c[1], c[2], function(r){ if(!r.ok) fails.push(c[0]+': '+(r.error||'rejected')); next(); });
+    })();
+  });
+}
+function remWaitOnline(id, tries, cb){
+  remGet(id, 'api/summary', function(e){ if(!e){ cb(true); return; } if(tries<=0){ cb(false); return; } setTimeout(function(){ remWaitOnline(id, tries-1, cb); }, 1000); });
+}
+function remRestoreAll(ids, done){
+  var left = ids.length, errs = [];
+  if(!left){ done(['nothing to do']); return; }
+  ids.forEach(function(id){
+    var cur = REM.filter(function(i){ return i.id===id; })[0];
+    remRestore(id, cur && cur.snap, function(err){ if(err) errs.push(remName(id)+': '+err); if(--left===0) done(errs); });
+  });
+}
+function remSaveSetupForm(){
+  openForm('SAVE SETUP', 'Saves the list of remote instances with their SSH settings and the current settings of every online instance (receiver settings, streams) under a name on this instance. Offline instances keep their last saved settings.', [
+    {k:'name', label:'Name of the setup', type:'text'}], {name:''}, [
+    {label:'SAVE', cls:'on', fn:function(v, done){
+      var ids = REM.filter(function(i){ return RS[i.id] && RS[i.id].up; }).map(function(i){ return i.id; }), left = ids.length, snaps = {};
+      var fin = function(){
+        var lst = REM.map(function(i){ var e = {}; for(var k in i) e[k] = i[k]; if(snaps[i.id]) e.snap = snaps[i.id]; return e; });
+        remSaveList(lst, function(err){
+          if(err){ done(err); return; }
+          fetch('api/setup_save', {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'mautg'}, body: JSON.stringify({name:v.name, remotes:REM})})
+            .then(function(r){ return r.json(); }).then(function(j){ if(!j.ok){ done(j.error||'rejected'); return; } done(null); note('setup "'+v.name+'" saved ('+j.n+' instances)', false); remDraw(); })
+            .catch(function(){ done('no connection'); });
+        });
+      };
+      if(!left){ fin(); return; }
+      ids.forEach(function(id){ remSnapOf(id, function(e, sn){ if(!e) snaps[id] = sn; if(--left===0) fin(); }); });
+    }}, {label:'CANCEL'}]);
+}
+function remLoadSetupForm(){
+  fetch('api/setups', {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(j){
+    var names = j.setups || [];
+    if(!names.length){ note('no saved setup yet - SAVE SETUP first', true); return; }
+    openForm('LOAD SETUP', 'Loads a saved setup: the list of remote instances (with SSH settings) and, if ticked, the saved settings are applied to the online instances (their streams are replaced, the receiver is restarted).', [
+      {k:'name', label:'Setup', type:'select', options:names.map(function(n){ return [n, n]; })},
+      {k:'replace', label:'Replace the current list of remote instances', type:'check'},
+      {k:'apply', label:'Apply the saved settings to the online instances', type:'check'}], {name:names[0], replace:true, apply:true}, [
+      {label:'LOAD', cls:'on', fn:function(v, done){
+        fetch('api/setup_load?name='+encodeURIComponent(v.name), {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(d){
+          if(!d.ok){ done(d.error||'failed'); return; }
+          var apply = function(){
+            remLoad(function(){
+              if(!v.apply){ done(null); return; }
+              setTimeout(function(){
+                var ids = REM.filter(function(i){ return RS[i.id] && RS[i.id].up && i.snap; }).map(function(i){ return i.id; });
+                remRestoreAll(ids, function(errs){ done(null); note(errs.length ? errs.join('; ') : 'setup "'+v.name+'" applied to '+ids.length+' instance(s)', !!errs.length); });
+              }, 3500);
+            });
+          };
+          if(v.replace) remSaveList(d.remotes, function(err){ if(err){ done(err); return; } apply(); });
+          else apply();
+        }).catch(function(){ done('no connection'); });
+      }},
+      {label:'DELETE', cls:'danger', fn:function(v, done){
+        fetch('api/setup_delete', {method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'mautg'}, body: JSON.stringify({name:v.name})})
+          .then(function(r){ return r.json(); }).then(function(j){ done(j.ok ? null : (j.error||'failed')); }).catch(function(){ done('no connection'); });
+      }},
+      {label:'CANCEL'}]);
+  }).catch(function(){});
+}
+function remAll(act){                                /* the action for every online instance (LOCAL included) */
+  var ids = [{id:''}].concat(REM).filter(function(x){ return RS[x.id] && RS[x.id].up; }).map(function(x){ return x.id; });
+  if(!ids.length){ note('no instance online', true); return; }
+  if(act==='open'){ ids.forEach(function(id){ remOpenInst(id); }); remShow(ids[0]==='' ? 'L' : ids[0]); }
+  else if(act==='restore'){ ids = ids.filter(function(id){ return id!==''; }); if(!ids.length){ note('no remote instance online', true); return; } remRestoreAll(ids, function(errs){ note(errs.length ? errs.join('; ') : 'saved settings applied to '+ids.length+' instance(s)', !!errs.length); }); }
+  else if(act==='rxstart') remRxFormAll(ids);
+  else ids.forEach(function(id){ remBulk(id, act); });
+}
+function remRxFormAll(ids){
+  remGet(ids[0], 'api/status?ls=0', function(e, j){
+    if(e){ note(remName(ids[0])+': '+(e===502?'not reachable':e), true); return; }
+    var run = j.rx && j.rx.running;
+    openForm('RECEIVER SETTINGS - ALL ('+ids.length+')', 'The settings are applied to every online instance (a running receiver is restarted). Values taken from '+remName(ids[0])+'.',
+      rxFields(), rxValues(run ? j.rx.rc : (j.defaults && j.defaults.recv)), [
+      {label:'START ALL', cls:'on', fn:function(v, done){
+        var left = ids.length, errs = [];
+        ids.forEach(function(id){ remPost(id, 'rx_start', '', v, function(j2){
+          if(!j2.ok) errs.push(remName(id)+': '+(j2.error||'rejected')); remPollOne(id);
+          if(--left===0) done(errs.length ? errs.join('; ') : null);
+        }); });
+      }},
+      {label:'CANCEL'}]);
+  });
+}
+function remRxForm(id){
+  remGet(id, 'api/status?ls=0', function(e, j){
+    if(e){ note(remName(id)+': '+(e===502?'not reachable':e), true); return; }
+    var run = j.rx && j.rx.running;
+    openForm('RECEIVER SETTINGS - '+remName(id), run ? 'The receiver is running - START restarts it with these settings.' : '',
+      rxFields(), rxValues(run ? j.rx.rc : (j.defaults && j.defaults.recv)), [
+      {label: run ? 'RESTART' : 'START', cls:'on', fn:function(v, done){
+        remPost(id, 'rx_start', '', v, function(j2){ if(j2.ok) remPollOne(id); done(j2.ok ? null : (j2.error||'rejected')); }); }},
+      {label:'CANCEL'}]);
+  });
+}
+function remBulk(id, act){
+  var cmds = act==='startall' ? [['tx_start','all']] : act==='stopall' ? [['tx_stop','all']] : act==='rxstop' ? [['rx_stop','']] : [['tx_reset','all'], ['rx_reset','']];
+  var i = 0, fails = [];
+  (function next(){
+    if(i >= cmds.length){ if(fails.length) note(remName(id)+': '+fails.join('; '), true); else note(remName(id)+': done', false); remPollOne(id); return; }
+    var c = cmds[i++];
+    remPost(id, c[0], c[1], {}, function(j){ if(!j.ok && !(c[0]==='rx_reset' && /not running/.test(j.error||''))) fails.push(j.error||'rejected'); next(); });
+  })();
+}
+$('remover').addEventListener('click', function(e){
+  var b = e.target.closest ? e.target.closest('button[data-act]') : null; if(!b || b.disabled) return;
+  var act = b.getAttribute('data-act'), id = b.getAttribute('data-id') || '';
+  if(id==='*'){ remAll(act); return; }
+  if(act==='add') remEditForm('');
+  else if(act==='edit') remEditForm(id);
+  else if(act==='del') remDelForm(id);
+  else if(act==='open') remOpenInst(id);
+  else if(act==='test') remTestForm();
+  else if(act==='savesetup') remSaveSetupForm();
+  else if(act==='loadsetup') remLoadSetupForm();
+  else if(act==='restore'){ var c = REM.filter(function(i){ return i.id===id; })[0]; remRestore(id, c && c.snap, function(err){ note(remName(id)+': '+(err || 'saved settings applied'), !!err); }); }
+  else if(act==='rxstart') remRxForm(id);
+  else if(act==='update') remUpdateForm(id);
+  else if(act==='stoptest') remTestStop(function(err){ if(err) note(err, true); });
+  else remBulk(id, act);
+});
+$('remstrip').addEventListener('click', function(e){
+  var x = e.target.closest ? e.target.closest('button[data-rm]') : null;
+  if(x){ remDelForm(x.getAttribute('data-rm')); return; }
+  var a = e.target.closest ? e.target.closest('button[data-sact]') : null;
+  if(a){ var k = a.getAttribute('data-sact'); if(k==='add') remEditForm(''); else if(k==='save') remSaveSetupForm(); else remLoadSetupForm(); return; }
+  var b = e.target.closest ? e.target.closest('button[data-cur]') : null;
+  if(b){ var id = b.getAttribute('data-cur'); if(id==='') remShow(''); else { var again = (id===remCur); remOpenInst(id); if(again) remReloadFrame(id); } }
+});
+
+/* QUICK TEST: receiver on instance B listens on the port, sender on instance A gets a stream to B - one step */
+function remAutoDest(id){
+  if(id){ var i = REM.filter(function(x){ return x.id===id; })[0]; return i ? i.host.replace(/^\[|\]$/g, '') : ''; }
+  var f = ((RS[''] && RS['']. sum && RS[''].sum.ifaces) || (S && S.ifaces) || []).filter(function(x){ return x[0] && x[0].indexOf('127.')!==0; })[0];
+  return f ? f[0] : '';
+}
+function remPortIn(spec, port){
+  return String(spec||'').split(',').some(function(t){
+    var m = t.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/); if(!m) return false;
+    var a = +m[1], b = m[2] ? +m[2] : a; return port>=a && port<=b;
+  });
+}
+function remTestStop(cb){
+  if(!QT){ cb('no test running'); return; }
+  var t = QT;
+  remGet(t.s, 'api/status?ls=0', function(e, j){
+    if(e){ cb('sender: '+(e===502?'not reachable':e)); return; }
+    var idx = -1; ((j.tx && j.tx.streams) || []).forEach(function(s, i){
+      if(s.params && +s.params.destination_port===t.port && s.params.destination_address===t.dest) idx = i; });
+    QT = null;
+    if(idx < 0){ remDraw(); cb(null); return; }                 /* stream is already gone */
+    remPost(t.s, 'tx_stop', idx, {}, function(j1){
+      remPost(t.s, 'tx_del', idx, {}, function(j2){ remDraw(); remPollOne(t.s); cb(j2.ok ? null : (j2.error||'rejected')); });
+    });
+  });
+}
+function remTestRun(v, done){
+  if(QT){ done('a test is already running - STOP TEST first'); return; }
+  var s = v.sender, r = v.receiver, port = parseInt(v.port, 10), size = parseInt(v.size, 10), rate = parseFloat(v.rate), dur = parseFloat(v.dur) || 0;
+  if(s===r){ done('sender and receiver must be different instances'); return; }
+  if(!(port>=1 && port<=65535)){ done('port: 1 - 65535'); return; }
+  if(!(size>=16 && size<=65000)){ done('packet size: 16 - 65000'); return; }
+  if(!(rate>=0)){ done('rate: number expected (0 = unlimited)'); return; }
+  var dest = String(v.dest||'').trim() || remAutoDest(r);
+  if(!dest){ done('destination address needed'); return; }
+  var proto = v.proto==='tcp' ? 'tcp' : 'udp';
+  remGet(r, 'api/status?ls=0', function(e, j){
+    if(e){ done('receiver '+remName(r)+': '+(e===502?'not reachable':e)); return; }
+    var rxRun = j.rx && j.rx.running, rc = rxRun ? j.rx.rc : (j.defaults && j.defaults.recv);
+    var vals = rxValues(rc);
+    var go = function(){
+      remPost(s, 'tx_add', '', {destination_address:dest, destination_port:port, packet_size:size, protocol:proto,
+        dscp_value:parseInt(v.dscp,10)||0, burst_mode:true, burst_mbps:rate, rx_query:true, connections:1}, function(j2){
+        if(!j2.ok){ done('sender '+remName(s)+': '+(j2.error||'rejected')); return; }
+        QT = {s:s, r:r, dest:dest, port:port, proto:proto, rate:rate};
+        if(dur > 0) QT.timer = setTimeout(function(){ remTestStop(function(){}); }, dur*1000);
+        done(null); remDraw(); remPollOne(s); remPollOne(r);
+      });
+    };
+    if(rxRun && remPortIn(vals.port, port) && (proto==='udp' || vals.tcp)){ go(); return; }
+    if(rxRun){ vals.port = vals.port+','+port; } else { vals.port = String(port); vals.unicast = true; }
+    if(proto==='tcp') vals.tcp = true;
+    remPost(r, 'rx_start', '', vals, function(j1){
+      if(!j1.ok){ done('receiver '+remName(r)+': '+(j1.error||'rejected')); return; }
+      setTimeout(go, 700);
+    });
+  });
+}
+function remTestForm(){
+  var opts = [['', 'this instance']].concat(REM.map(function(i){ return [i.id, i.name]; }));
+  var d = (S && S.dscp) || [[0,'BE']];
+  var vals = {sender: REM.length ? REM[0].id : '', receiver: '', proto:'udp', rate:10, size:1200, port:5201, dscp:0, dest:'', dur:0};
+  openForm('QUICK TEST', QT ? 'A test is running ('+remName(QT.s)+' -> '+remName(QT.r)+') - STOP TEST ends it.' : 'Starts the receiver on one instance and a stream on another - in one step.', [
+    {k:'sender', label:'Sender instance', type:'select', options:opts},
+    {k:'receiver', label:'Receiver instance', type:'select', options:opts},
+    {k:'proto', label:'Protocol', type:'select', options:[['udp','UDP'],['tcp','TCP']]},
+    {k:'rate', label:'Rate (Mbit/s)', hint:'0 = unlimited', type:'number'},
+    {k:'size', label:'Packet size (bytes)', type:'number'},
+    {k:'port', label:'Port', hint:'the receiver opens it if needed', type:'number'},
+    {k:'dscp', label:'DSCP', type:'select', options:d.map(function(x){ return [x[0], x[1]]; })},
+    {k:'dest', label:'Destination address', hint:'of the receiver as seen from the sender; empty = address of the list', type:'text'},
+    {k:'dur', label:'Duration (s)', hint:'0 = until STOP TEST (the browser has to stay open for a time-limited test)', type:'number'}], vals, [
+    {label:'START TEST', cls:'on', fn:function(v, done){ remTestRun(v, done); }},
+    {label:'STOP TEST', cls:'danger', fn:function(v, done){ remTestStop(function(err){ done(err); }); }},
+    {label:'CLOSE'}]);
+}
 
 /* ---------- log ---------- */
 /* click on ST / SOURCE in the receiver table marks the lines of that stream in the live view (each stream its own colour) */
@@ -10382,9 +11675,14 @@ $('btnExit').onclick = function(){
     [{label:'EXIT', cls:'danger', fn:function(v, done){ post('exit', '', {}, function(){ done(null); setTimeout(function(){ try{ window.close(); }catch(e){} }, 1500); }); }}, {label:'CANCEL'}]);
 };
 
-tab = (load('mautg_tab') === 'sender') ? 'sender' : 'receiver';
+tab = (IN_FRAME && load('mautg_tab') === 'sender') ? 'sender' : 'receiver';
 setTab(tab);
 poll();
+if(!IN_FRAME) remLoad(function(){                       /* top level: instance strip; start page = last view, default LOCAL */
+  var l = load('mautg_top'); if(l===null || l==='') l = (l==='' ? '' : 'L');
+  if(l && l!=='L' && !REM.some(function(i){ return i.id===l; })) l = 'L';
+  if(l==='') remShow(''); else remOpenInst(l);
+});
 </script>
 </body>
 </html>
@@ -10454,6 +11752,8 @@ def build_parser():
                    help='TCP: pause for S seconds after every --tcp-on period')
     s.add_argument('--tcp-recycle', type=float, metavar='S',
                    help='TCP: close and reconnect every S seconds (slow start each time)')
+    s.add_argument('--max-runtime', type=float, metavar='S',
+                   help='stop the stream after S seconds (UDP: from the start, TCP: from the established connection; default: until stop)')
     s.add_argument('--rx-query', action='store_true', default=None,
                    help='ask the receiver for the values of the streams (TCP to the data port; the receiver must allow TCP)')
     s.add_argument('--rx-interval', type=float, metavar='S',
@@ -10577,6 +11877,8 @@ def _apply_send_args(args, cfg):
     for k in ('tcp_on', 'tcp_off', 'tcp_recycle'):
         if getattr(args, k) is not None:
             sc[k], sc['protocol'] = getattr(args, k), 'tcp'
+    if args.max_runtime is not None:
+        sc['max_runtime'] = max(0.0, args.max_runtime)
     if args.rx_query or args.rx_interval is not None or args.rx_host:
         sc['rx_query'] = True
     if args.rx_interval is not None:
@@ -10661,9 +11963,17 @@ def _offer_sudo(args):
             ans = 'n'
         if ans in ('n', 'no'):
             why = 'sudo declined'
-        elif subprocess.call(['sudo', '-v']) != 0:        # asks for the password
-            why = 'sudo did not work (password, rights)'
         else:
+            try:
+                rc = subprocess.call(['sudo', '-v'])      # asks for the password
+            except KeyboardInterrupt:                     # Ctrl+C at the password prompt
+                print()
+                rc = None
+            if rc is None:
+                why = 'sudo cancelled'
+            elif rc != 0:
+                why = 'sudo did not work (password, rights)'
+        if not why:
             os.execvp('sudo', ['sudo', 'env', 'MAUTG_SUDO=1', sys.executable,
                                os.path.abspath(sys.argv[0])] + sys.argv[1:])
     print(f"{Colors.YELLOW}Info: running without root ({why}) - the receive buffer is limited by "

@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-VERSION = "2.29"
+VERSION = "2.30"
 AUTHOR = "Ewald Jeitler"
 URL = "https://www.jeitler.cc"
 CREDIT = f"by {AUTHOR} - {URL}"
@@ -9266,9 +9266,11 @@ WEB_INDEX_HTML = r"""<!DOCTYPE html>
   .tv{color:var(--fg);font-weight:600}
   .tv.warnc{color:var(--warn)} .tv.ok{color:var(--up)}
   th.wsent{min-width:13ch} th.wnum{min-width:9ch}
-  .thsum{font-size:13px;margin:0 0 8px;color:#b4c4b4}
+  .thsum{font-size:13px;margin:0 0 8px;color:#d6e2d6}
   .thsum b{color:var(--fg)}
-  .thleg{font-size:12px;display:flex;gap:14px;flex-wrap:wrap;margin-top:6px}
+  .thleg{font-size:13px;display:flex;gap:14px;flex-wrap:wrap;margin-top:6px}
+  .gp.big{position:fixed;left:2vw;right:2vw;top:2vh;bottom:2vh;max-width:none;z-index:50;overflow:auto;padding:12px 18px;box-shadow:0 0 0 100vmax rgba(0,0,0,.65)}
+  .gp.big .thsum{font-size:15px} .gp.big .thleg{font-size:15px} .gp.big .gt{font-size:18px}
   .thtip{position:absolute;pointer-events:none;background:#0b0f0b;border:1px solid var(--ctrl-line);border-radius:4px;padding:6px 8px;font-size:12px;line-height:1.5;width:max-content;white-space:nowrap;z-index:60}
   .modal-box.wide{width:900px;max-width:92vw;max-height:82vh;overflow-y:auto}
   .modal-box.wide table{width:100%;border-collapse:collapse}
@@ -9896,7 +9898,7 @@ function histDraw(d, pn){
     var m = st(1), q = st(2), er = P[n-1][3] - P[0][3];
     sumHtml = 'Mbit/s <b>min '+m.min.toFixed(2)+'</b> / avg <b>'+m.avg.toFixed(2)+'</b> / max <b>'+m.max.toFixed(2)+'</b>'
       + ' &nbsp; pps avg <b>'+Math.round(q.avg).toLocaleString('en-US')+'</b> / max <b>'+Math.round(q.max).toLocaleString('en-US')+'</b>'
-      + ' &nbsp; deviation (stddev) <b>'+m.sd.toFixed(2)+'</b> Mbit/s &nbsp; send errors <b>'+er+'</b> &nbsp; set: <b>'+esc(d.rate||'')+'</b>'+(d.size?', '+d.size+' B':'');
+      + ' deviation (stddev) <b>'+m.sd.toFixed(2)+'</b> Mbit/s &nbsp; send errors <b>'+er+'</b> &nbsp; <span style="white-space:nowrap">set: <b>'+esc(d.rate||'')+'</b>'+(d.size?', '+d.size+' B':'')+'</span>';
     panels = [
       {title:'Throughput (Mbit/s)', h:130, lines:[{get:function(p){ return p[1]; }, c:'#3ddc60'}].concat(RXH ? [{get:function(p){ return p[rb]; }, c:'#ffb86c'}] : [])},
       {title:'Packets per second', h:110, lines:[{get:function(p){ return p[2]; }, c:'#7fd1ff'}].concat(RXH ? [{get:function(p){ return p[rb+1]; }, c:'#ffb86c'}] : [])},
@@ -9916,7 +9918,8 @@ function histDraw(d, pn){
   }
   panels = panels.filter(function(q){ return !q.skip; });
   SM.innerHTML = sumHtml + ' &nbsp; <span class="dim">'+n+' s</span>';
-  panels.forEach(function(q){ q.h = Math.round(q.h*0.72); });
+  var KH = pn.classList.contains('big') ? 1.25 : 0.72;
+  panels.forEach(function(q){ q.h = Math.round(q.h*KH); });
   var W = 820, L = 54, R = 10;
   var t0 = P[0][0], t1 = P[n-1][0], tspan = (t1-t0)||1, y = 0, svg = '';
   function X(t){ return L + (t-t0)/tspan*(W-L-R); }
@@ -9928,10 +9931,10 @@ function histDraw(d, pn){
     if(!vals.length) vals.push(0);
     lo = (pn.bars || pn.band) ? 0 : Math.min(0, Math.min.apply(null, vals)); hi = Math.max.apply(null, vals) || 1;
     function Y(v){ return bot - (v-lo)/(hi-lo||1)*(bot-top); }
-    svg += '<text x="'+L+'" y="'+(y+11)+'" fill="#8fa08f" font-size="12">'+pn.title+'</text>';
+    svg += '<text x="'+L+'" y="'+(y+11)+'" fill="#dbe6db" font-size="13">'+pn.title+'</text>';
     for(var g=0; g<=2; g++){
       var gv = lo+(hi-lo)*g/2, gy = Y(gv);
-      svg += '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+gy+'" y2="'+gy+'" stroke="#1e2a1e"/><text x="'+(L-4)+'" y="'+(gy+4)+'" text-anchor="end" fill="#5d6b5d" font-size="10">'+(gv>=100?gv.toFixed(0):gv.toFixed(2).replace(/\.?0+$/,''))+'</text>';
+      svg += '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+gy+'" y2="'+gy+'" stroke="#2c3b2c"/><text x="'+(L-4)+'" y="'+(gy+4)+'" text-anchor="end" fill="#b4c2b4" font-size="11">'+(gv>=100?gv.toFixed(0):gv.toFixed(2).replace(/\.?0+$/,''))+'</text>';
     }
     if(pn.band){
       var PB = P.filter(function(p){ return pn.band[0](p)!=null; });
@@ -9948,7 +9951,7 @@ function histDraw(d, pn){
   });
   var H = y;
   svg += '<g><line class="thLine" y1="14" y2="'+H+'" stroke="#c8d6c8" opacity="0" /></g>';
-  for(var q2=0; q2<=4; q2++){ var tt = t0+tspan*q2/4; svg += '<text x="'+X(tt)+'" y="'+(H+12)+'" text-anchor="middle" fill="#5d6b5d" font-size="10">'+(tt-t1).toFixed(0)+' s</text>'; }
+  for(var q2=0; q2<=4; q2++){ var tt = t0+tspan*q2/4; svg += '<text x="'+X(tt)+'" y="'+(H+12)+'" text-anchor="middle" fill="#b4c2b4" font-size="11">'+(tt-t1).toFixed(0)+' s</text>'; }
   CH.innerHTML = '<div style="position:relative"><svg class="thSvg" viewBox="0 0 '+W+' '+(H+18)+'" width="100%" style="display:block"><rect x="0" y="0" width="'+W+'" height="'+(H+18)+'" fill="transparent"/>'+svg+'</svg><div class="thtip" class="thtip" style="display:none"></div></div>'
     + '<div class="thleg">'+legend+'</div>';
   var sv = CH.querySelector('.thSvg'), tip = CH.querySelector('.thtip'), ln = CH.querySelector('.thLine');
@@ -9986,7 +9989,7 @@ function grSync(){
   keys.forEach(function(k){
     if(have[k]) return;
     var el = document.createElement('div'); el.className = 'gp'; el.setAttribute('data-s', side); el.setAttribute('data-k', k);
-    el.innerHTML = '<div class="gh"><b class="gt"></b><span><button class="gr" title="reset the statistics and the graph">RESET</button> <button class="gx" title="hide this graph">&times;</button></span></div><div class="gs thsum">loading ...</div><div class="gc"></div>';
+    el.innerHTML = '<div class="gh"><b class="gt"></b><span><button class="gz" title="enlarge / shrink this graph (Esc = shrink)">&#x26F6; enlarge</button> <button class="gr" title="reset the statistics and the graph">RESET</button> <button class="gx" title="hide this graph">&times;</button></span></div><div class="gs thsum">loading ...</div><div class="gc"></div>';
     var gc = el.querySelector('.gc');
     var refresh = function(){ if(el._dirty && el._d){ el._dirty = false; histDraw(el._d, el); } };
     gc.addEventListener('mouseenter', function(){ el._hov = true; });
@@ -10013,6 +10016,10 @@ function grFetch(el){
     if(grFirst && el.parentNode && j.points && j.points.length >= 2){ grFirst = false; if(window.grAutoFit) window.grAutoFit(); }
   }).catch(function(){});
 }
+document.addEventListener('keydown', function(e){
+  if(e.key !== 'Escape') return;
+  Array.prototype.forEach.call(document.querySelectorAll('.gp.big'), function(el){ el.classList.remove('big'); var b = el.querySelector('.gz'); if(b) b.innerHTML = '&#x26F6; enlarge'; if(el._d) histDraw(el._d, el); });
+});
 setInterval(function(){
   var side = grSide();
   Array.prototype.forEach.call($('graphs').children, function(el){ if(el.getAttribute('data-s')===side) grFetch(el); });
@@ -10037,6 +10044,7 @@ setInterval(function(){
 $('graphs').addEventListener('click', function(e){
   var el = e.target.closest ? e.target.closest('.gp') : null; if(!el) return;
   var side = el.getAttribute('data-s'), k = el.getAttribute('data-k');
+  if(e.target.closest('.gz')){ var bg = el.classList.toggle('big'); e.target.closest('.gz').innerHTML = bg ? '&#x26F6; shrink' : '&#x26F6; enlarge'; if(el._d) histDraw(el._d, el); return; }
   if(e.target.closest('.gx')){ GR[side][k] = false; grSave(); grSync(); var cb = document.querySelector('.gchk[data-s="'+side+'"][data-k="'+k+'"]'); if(cb) cb.checked = false; }
   else if(e.target.closest('.gr')){
     var done = function(j){ if(j.ok) grFetch(el); else note(j.error||'rejected', true); };

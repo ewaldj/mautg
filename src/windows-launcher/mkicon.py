@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw
 
 BG, FG = (74, 59, 52, 255), (243, 233, 220, 255)   # paw brown / cream
 
-SRC = '/mnt/user-data/uploads/mautg/icon/mautg-icon-1024.png'
+SRC = '/tmp/work/ic3/mautg-icon-1024.png'
 _base = Image.open(SRC).convert('RGBA')
 _base = _base.crop(_base.getbbox())
 
@@ -48,7 +48,7 @@ for d in ('.', '../osx-installer/res', '../osx-launcher/res', '../windows-instal
 for d in ('.', '../osx-installer/res', '../osx-launcher/res'):
     open(os.path.join(d, 'mautg.ico'), 'wb').write(ico)
     logo(256).save(os.path.join(d, 'mautg-logo.png'))
-import shutil; shutil.copy('/tmp/work/ic/icon/mautg.icns','../osx-launcher/res/mautg.icns')
+import shutil; shutil.copy('/tmp/work/ic3/mautg.icns','../osx-launcher/res/mautg.icns')
 
 # ---- resources: RT_ICON (3) x n, RT_GROUP_ICON (14), RT_MANIFEST (24) ----
 MANIFEST = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

@@ -20,7 +20,7 @@ var updateFiles = []string{"mautg.py"}
 
 // launcherVersion is the version of this mautg.exe (mversions line "mautg-windows").
 // A newer value there means: replace the whole package (mautg.exe, python ...).
-const launcherVersion = "1.02"
+const launcherVersion = "1.03"
 
 const windowsEntry = "mautg-windows" // name of the package line in mversions
 const zipPath = "Windows_Version/mautg-windows.zip"

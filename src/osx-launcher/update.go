@@ -20,7 +20,7 @@ var updateFiles = []string{"mautg.py"}
 
 // launcherVersion is the version of this launcher package (mversions line "mautg-mac").
 // A newer value there means: replace the whole package (launcher, script, python ...).
-const launcherVersion = "1.02"
+const launcherVersion = "1.03"
 
 const pkgEntry = "mautg-mac" // name of the package line in mversions
 const zipPath = "OSX_Version/mautg-mac.zip"

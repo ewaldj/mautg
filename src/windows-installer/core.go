@@ -14,7 +14,7 @@ import (
 // Platform independent part of the installer (testable on any OS).
 
 // installerVersion is shown in the title bar; raise it with every change.
-const installerVersion = "1.01"
+const installerVersion = "1.02"
 
 const (
 	defaultZipURL = "https://github.com/ewaldj/mautg/raw/main/Windows_Version/mautg-windows.zip"

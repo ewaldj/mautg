@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-VERSION = "2.66"
+VERSION = "2.72"
 AUTHOR = "Ewald Jeitler"
 URL = "https://www.jeitler.cc"
 CREDIT = f"by {AUTHOR} - {URL}"
@@ -511,6 +511,23 @@ DSCP_TABLE = [
     (44, 'VA', 'Voice-Admit (CAC voice)'), (46, 'EF', 'Expedited Forwarding (voice)'),
     (48, 'CS6', 'Network control'), (56, 'CS7', 'Network control (reserved)'),
 ]
+
+
+def mbit_txt(v):
+    """Mbit/s for the table columns: 2 decimals, fewer from 1000 Mbit/s up (fits 6 characters up to 99999)."""
+    return f"{v:.2f}" if v < 1000 else (f"{v:.1f}" if v < 10000 else f"{v:.0f}")
+
+
+def size_txt(n):
+    """Packet / message size for narrow table columns: up to 99999 as it is, above in KB (262144 -> 256K)."""
+    n = int(n)
+    return str(n) if n < 100000 else f"{round(n / 1024)}K"
+
+
+def size_b(n):
+    """Size with unit, at most 6 characters (1500B, 65536B, 256KB, 1024KB)."""
+    n = int(n)
+    return f"{n}B" if n < 100000 else f"{round(n / 1024)}KB"
 
 
 def dscp_to_name(dscp):
@@ -1816,7 +1833,7 @@ class PacketReceiver:
 
     def __init__(self, group, port, interface=None, log_file=None,
                  summary_interval=None, sync=None, unicast_mode=False,
-                 summary_compact=False, verify_all=False, show_ip=False,
+                 summary_compact=False, verify_all=False, show_ip=True,
                  live=None, print_limit=PKT_LINE_LIMIT, tcp=True, tcp_rcvbuf=0,
                  tcp_read_rate=0.0, tcp_read_on=0.0, tcp_read_off=0.0):
         self.live = live          # LiveView or None
@@ -2302,7 +2319,7 @@ class PacketReceiver:
                    + (f" {s.port:>5d}" if self.port_col else "") + f" {pkt.cast or '--':<2s}")
             dl = f"{disp:7.2f}ms" if pkt.delay_ms is not None else "    n/a  "
             mk = "~" if (pkt.delay_ms is not None and pkt.delay_ms < 0) else " "
-            print(f"{time_str}{who} Seq:{pkt.seq:6d} {pkt.packet_size:5d}B "
+            print(f"{time_str}{who} Seq:{pkt.seq:6d} {size_b(pkt.packet_size):>6s} "
                   f"{dscp_to_name(pkt.dscp):<6s}{mk}Dly:{dl} {sc}{status:<5s}{Colors.ENDC}"
                   f"{s.loss_pct():6.2f}%")
             return
@@ -2312,7 +2329,7 @@ class PacketReceiver:
         if self.port_col:
             lab += f" | {s.port:>5d}"
         lab += f" | {pkt.cast or '--':<4s}"
-        print(f"{time_str}{lab} | Seq:{pkt.seq:6d} | Size:{pkt.packet_size:5d} "
+        print(f"{time_str}{lab} | Seq:{pkt.seq:6d} | Size:{size_txt(pkt.packet_size):>5s} "
               f"| DSCP:{dscp_to_name(pkt.dscp):6s}| "
               f"{delay_str} | {sc}{status:5s}{Colors.ENDC} "
               f"| Loss:{('-' if s.cast == 'TCP' else format(s.loss_pct(), '6.2f') + '%'):>7s}")      # TCP delivers everything: no loss
@@ -2381,8 +2398,11 @@ class PacketReceiver:
             else:
                 print(f"{time_str} | {range_str} "
                       f"| {Colors.YELLOW}no traffic received{Colors.ENDC}")
+        agg = self._interval_sum() if len(self.streams) > 1 else None
         for s in self.streams.values():
             self._print_stream_summary(s, time_str, range_str, iv_elapsed)
+        if agg is not None and agg.iv_packets > 0:
+            self._print_stream_summary(agg, time_str, range_str, iv_elapsed, sumrow=True)
         new, saturated = self.health(now)
         if new:
             print(f"{Colors.RED}⚠ receiver overloaded: the local kernel dropped {new} packets "
@@ -2392,20 +2412,51 @@ class PacketReceiver:
                   f"loss shown may be caused by this host{Colors.ENDC}")
         self.iv_start_time = now
 
-    def _print_stream_summary(self, s, time_str, range_str, iv_elapsed):
-        lab = f"{s.label} | " if self.multi else ""
+    def _interval_sum(self):
+        """All streams of the current interval as one pseudo stream (SUM row)."""
+        from types import SimpleNamespace
+        ss = list(self.streams.values())
+        casts = {s.cast or '--' for s in ss if s.iv_packets > 0}
+        udp_missing = sum(s.iv_missing for s in ss if s.cast != 'TCP')
+        dscp = defaultdict(DscpStats)
+        for s in ss:
+            for d, v in s.iv_dscp_stats.items():
+                dscp[d].packets += v.packets
+        cnt = sum(s.iv_delay.count for s in ss)
+        dl = SimpleNamespace(
+            count=cnt,
+            avg=(sum(s.iv_delay.avg * s.iv_delay.count for s in ss if s.iv_delay.count) / cnt) if cnt else 0.0,
+            minimum=min((s.iv_delay.minimum for s in ss if s.iv_delay.count), default=0.0),
+            maximum=max((s.iv_delay.maximum for s in ss if s.iv_delay.count), default=0.0))
+        only_tcp = casts == {'TCP'}
+        return SimpleNamespace(
+            label='*',
+            ip='', dst='', port='SUM',
+            cast=(next(iter(casts)) if len(casts) == 1 else 'MIX'),
+            iv_packets=sum(s.iv_packets for s in ss), iv_bytes=sum(s.iv_bytes for s in ss),
+            iv_delay=dl, iv_missing=udp_missing if not only_tcp else 0,
+            iv_misorder=sum(s.iv_misorder for s in ss), iv_dscp_stats=dscp,
+            _sum_loss_pkts=sum(s.iv_packets for s in ss if s.cast != 'TCP'))
+
+    def _print_stream_summary(self, s, time_str, range_str, iv_elapsed, sumrow=False):
+        if sumrow:
+            def emit(line):
+                print(Colors.CYAN + line.replace(Colors.ENDC, Colors.ENDC + Colors.CYAN) + Colors.ENDC)
+        else:
+            emit = print
+        lab = f"{s.label} | " if (self.multi or sumrow) else ""
         if self.show_ip:
             lab += f"{s.ip:<15s} | {s.dst:<15s} | "
         if self.port_col:
-            lab += f"{s.port:>5d} | "
+            lab += f"{s.port:>5} | "
         lab += f"{s.cast or '--':<4s} | "
 
         if s.iv_packets == 0:
             if self.summary_compact:
-                print(f"{lab}{range_str} "
+                emit(f"{lab}{range_str} "
                       f"| {Colors.YELLOW}no traffic{Colors.ENDC}")
             else:
-                print(f"{time_str} | {lab}{range_str} "
+                emit(f"{time_str} | {lab}{range_str} "
                       f"| {Colors.YELLOW}no traffic received{Colors.ENDC}")
             return
 
@@ -2430,7 +2481,7 @@ class PacketReceiver:
             delay_str = "Dly(ms): n/a"
 
         # loss
-        iv_expected = s.iv_packets + s.iv_missing
+        iv_expected = (getattr(s, '_sum_loss_pkts', s.iv_packets)) + s.iv_missing
         iv_loss_pct = (s.iv_missing / iv_expected * 100) if iv_expected > 0 else 0.0
 
         # status
@@ -2448,13 +2499,13 @@ class PacketReceiver:
                else ('compact' if self.summary_compact else 'full'))
         if lvl == 'narrow':
             dly = f"{s.iv_delay.avg:.2f}" if s.iv_delay.count > 0 else "n/a"
-            print(f"{lab}{range_str[1:]} {iv_throughput:6.2f}M "
+            emit(f"{lab}{range_str[1:]} {iv_throughput:6.2f}M "
                   f"{dscp_to_name(top_dscp):<6s} {sc}{status:<5s}{Colors.ENDC} "
                   f"P:{s.iv_packets:8d} L:{'-' if s.cast == 'TCP' else s.iv_missing:>6} Dly:{dly}")
         elif lvl == 'compact':
             # compact: no timestamp, no size, short DSCP, short delay
             dly_str = f"Dly:{s.iv_delay.avg:.2f}" if s.iv_delay.count > 0 else "Dly:n/a"
-            print(f"{lab}{range_str} "
+            emit(f"{lab}{range_str} "
                   f"| {iv_throughput:7.2f} Mbps "
                   f"| {dscp_to_name(top_dscp):6s}"
                   f"| {sc}{status:4s}{Colors.ENDC} "
@@ -2462,15 +2513,17 @@ class PacketReceiver:
                   f"| LPkt:{'-' if s.cast == 'TCP' else s.iv_missing:>7} "
                   f"| {dly_str}")
         else:
-            print(f"{time_str} | {lab}{range_str} "
+            emit(f"{time_str} | {lab}{range_str} "
                   f"| {iv_throughput:7.2f} Mbps "
-                  f"| {pkt_size:5d}B "
+                  f"| {('-' if s.cast == 'MIX' else size_b(pkt_size)):>6s} "
                   f"| DSCP:{dscp_to_name(top_dscp):6s}"
                   f"| {sc}{status:6s}{Colors.ENDC} "
                   f"| Pkt:{s.iv_packets:9d} "
                   f"| Loss:{('-' if s.cast == 'TCP' else format(iv_loss_pct, '5.2f') + '%'):>6s} Pkt:{'-' if s.cast == 'TCP' else s.iv_missing:>6} "
                   f"| {delay_str}")
 
+        if sumrow:
+            return
         # reset interval counters
         s.iv_packets = 0
         s.iv_bytes = 0
@@ -4401,7 +4454,7 @@ class SendStream:
         msg = len(buf)
         wire = msg + 52                       # approx. IP + TCP (with timestamps) headers
         per = 64                              # messages that may be due at once (catching up)
-        chunk = max(1, 16384 // msg)          # messages stamped and written together
+        chunk = max(1, 65536 // msg)          # messages stamped and written together
         big = bytearray(msg * chunk)
         for i in range(chunk):
             big[i * msg:(i + 1) * msg] = buf
@@ -4995,7 +5048,7 @@ def _default_config():
             'sender_ip': '',                 # '' = auto-detect, 'none' = no OWD sync
             'sender_sync_port': 0,           # 0 = taken from the packets
             'live': True,                    # form menu: full-screen live view
-            'show_ip': False,                # show the sender IP in every line
+            'show_ip': True,                 # show the sender IP in every line
             'verify': False,                 # CRC + pattern check of every packet
             'unicast': False,
             'group': '239.1.1.1',
@@ -5899,8 +5952,8 @@ class LiveView:
                         'avg': self._fmt_dly(s.delay_stats, 'avg'),
                         'min': self._fmt_dly(s.delay_stats, 'min'),
                         'max': self._fmt_dly(s.delay_stats, 'max'),
-                        'mbit': f"{mbps:.2f}", 'pps': f"{pps:.0f}", 'sync': sync,
-                        'sport': s.sync_port, 'dscp': dname, 'size': f"{size}B"}
+                        'mbit': mbit_txt(mbps), 'pps': f"{pps:.0f}", 'sync': sync,
+                        'sport': s.sync_port, 'dscp': dname, 'size': size_b(size)}
                     colors = {
                         'loss': Colors.YELLOW if s.total_missing else Colors.GREEN,
                         'sync': {'ok': Colors.GREEN, 'FAIL': Colors.RED,
@@ -5918,7 +5971,7 @@ class LiveView:
                   'loss': f"{t['loss']:.2f}" if t['loss'] < 100 else "100",
                   'miss': _short(t['miss'], 5), 'cons': _short(t['cons'], 5),
                   'ord': _short(t['ord'], 3), 'avg': dl(t['avg']), 'min': dl(t['min']),
-                  'max': dl(t['max']), 'mbit': f"{t['mbit']:.2f}", 'pps': f"{t['pps']:.0f}",
+                  'max': dl(t['max']), 'mbit': mbit_txt(t['mbit']), 'pps': f"{t['pps']:.0f}",
                   'sync': '', 'sport': '', 'dscp': '', 'size': ''}
             tline = _ESC + '[1m' + _tbl_row(groups, tv) + _RESET
         else:
@@ -7103,7 +7156,7 @@ class SenderView:
     @staticmethod
     def _columns(width):
         def build(ttl, merge, compact, sepn=False):
-            size, sent = (4, 5) if compact else (5, 7)
+            size, sent = (5, 5) if compact else (5, 7)
             groups = ([[('n', '#', 2, '>')], [('state', 'State', 7, '<')]] if sepn else
                       [[('n', '#', 2, '>'), ('state', 'State', 7, '<')]]) + [
                       [('dest', 'Destination', 15, '<')], [('port', 'Port', 5, '>')],
@@ -7166,13 +7219,13 @@ class SenderView:
                 p = st.params()
                 state = st.state_text()
                 vals = {'n': idx + 1, 'state': state, 'dest': p['destination_address'],
-                        'port': p['destination_port'], 'size': p['packet_size'],
+                        'port': p['destination_port'], 'size': size_txt(p['packet_size']),
                         'rate': st.rate_text(),
                         'dscp': dscp_to_name(p['dscp_value']),
                         'ttl': p['ttl'],
                         'df': (('TCP DF' if p.get('df_bit') else 'TCP') if p.get('protocol') == 'tcp'
                                else 'on' if p.get('df_bit') else 'off'), 'sent': _short(st.sent, sent_w),
-                        'mbit': f"{st.rate_mbps:.2f}", 'ppsn': f"{st.rate_pps:.0f}"}
+                        'mbit': mbit_txt(st.rate_mbps), 'ppsn': f"{st.rate_pps:.0f}"}
                 if idx == self.sel:
                     line = (_sty('sel') + _tbl_row(groups, vals)[:width].ljust(width) + _RESET)
                 else:
@@ -7208,7 +7261,7 @@ class SenderView:
         if n:
             tot = {'n': '', 'state': 'SUM', 'dest': f"{n} streams", 'port': '', 'size': '', 'rate': '',
                    'dscp': '', 'ttl': '', 'df': '', 'sent': _short(sum(x.sent for x in self.streams), sent_w),
-                   'mbit': f"{sum(x.rate_mbps for x in self.streams):.2f}",
+                   'mbit': mbit_txt(sum(x.rate_mbps for x in self.streams)),
                    'ppsn': f"{sum(x.rate_pps for x in self.streams):.0f}"}
             out.append(R(6 + vis) + _ESC + '[1m' + _tbl_row(groups, tot)[:width] + _RESET + _ESC + '[K')
         else:
@@ -10085,6 +10138,7 @@ function openForm(title, intro, fields, values, buttons, warn){
       var el = $('f_'+f.k);
       if(f.enabled && el) el.disabled = !f.enabled(o);
       if(f.show && el){ var row = el.closest('.frow'); if(row) row.style.display = f.show(o) ? '' : 'none'; }
+      if(f.hintf && el){ var sm = el.closest('.frow').querySelector('small'); if(sm) sm.textContent = f.hintf(o); }
     });
     if(warn) $('formWarn').textContent = warn(o) || '';
   }
@@ -10211,7 +10265,8 @@ function txFields(){
     {k:'rx_interval', label:'Receiver query interval (s)', type:'number', show:function(o){ return o.rx_query; }},
     {k:'rx_host', label:'Receiver address', hint:'empty = destination address (needed for multicast / broadcast)', type:'text', show:function(o){ return o.rx_query; }},
     {k:'max_runtime', label:'Max run time (s)', hint:'0 = until stop; UDP: from the start, TCP: from the established connection', type:'number'},
-    {k:'packet_size', label:'Packet size (bytes)', hint:'UDP: wire size, 55 up to the interface MTU (DF off: up to 65507, fragmented); TCP: message size', type:'number'},
+    {k:'packet_size', label:'Packet size (bytes)', hint:'UDP: wire size, 55 up to the interface MTU (DF off: up to 65507, fragmented); TCP: message size', type:'number',
+     hintf:function(o){ return o.protocol==='tcp' ? 'TCP: message size, 27 up to 1048576 bytes' : 'UDP: wire size, 55 up to the interface MTU (DF off: up to 65507, fragmented)'; }},
     {k:'burst_mode', label:'Burst mode', hint:'(as fast as the limit allows)', type:'check'},
     {k:'packets_per_second', label:'Rate (pps)', type:'number', enabled:function(o){ return !o.burst_mode; }},
     {k:'burst_mbps', label:'Burst limit (Mbit/s)', hint:'0 = unlimited', type:'number', enabled:function(o){ return o.burst_mode; }},
@@ -10845,12 +10900,6 @@ function remPost(id, cmd, value, data, cb){
     .then(function(r){ return r.json().catch(function(){ return {ok:false,error:'bad response'}; }); })
     .then(function(j){ cb(j); }).catch(function(){ cb({ok:false,error:'no connection'}); });
 }
-function remFromStatus(j){                        /* instance without /api/summary (older version) */
-  var rx = j.rx || {}, tx = (j.tx && j.tx.streams) || [];
-  var run = tx.filter(function(s){ return /^run/i.test(s.state||''); });
-  return {version:j.version, host:'', ifaces:j.ifaces||[], rx:{running:!!rx.running, streams:(rx.rows||[]).length, mbit:rx.mbit||0, loss:0},
-    tx:{streams:tx.length, running:run.length, mbit:run.reduce(function(a,s){ return a+(s.mbps||0); },0), controllable:!!(j.tx && j.tx.controllable)}, old:true};
-}
 function remSetOff(id, err){                       /* web GUI not reachable: ask whether the host answers ICMP */
   var o = RS[id] || {};
   RS[id] = {up:false, err:err, icmp:o.icmp, pt:o.pt};
@@ -10865,7 +10914,6 @@ function remSetOff(id, err){                       /* web GUI not reachable: ask
 function remPollOne(id){
   remGet(id, 'api/summary', function(e, j){
     if(!e){ var was = RS[id]; RS[id] = {up:true, sum:j}; if(was && !was.up) remReloadFrame(id); remDraw(); return; }
-    if(e===404){ remGet(id, 'api/status?ls=0', function(e2, j2){ if(e2) remSetOff(id, String(e2)); else { RS[id] = {up:true, sum:remFromStatus(j2)}; remDraw(); } }); return; }
     remSetOff(id, e===502 ? 'web GUI not reachable' : String(e));
   });
 }
@@ -10917,7 +10965,7 @@ function remDraw(){
         : (st.icmp && st.icmp.ok===false ? ' &middot; <span class="bad" title="no answer to ICMP echo (ping): host down, unreachable or ICMP filtered">no ping</span>' : '')));
     h += '<tr data-id="'+esc(i.id)+'"><td><b>'+esc(i.id ? i.name : 'LOCAL')+'</b>'+(i.id ? '' : (s && s.host ? ' <span class="dim">('+esc(s.host)+')</span>' : ''))+'</td>'
       + '<td>'+(i.id ? esc(i.host)+':'+i.port : '<span class="dim">local</span>')+'</td><td>'+state+'</td>'
-      + '<td>'+(s ? esc(s.version)+(s.old ? ' <span class="dim">(no summary)</span>' : '') : '')+'</td>'
+      + '<td>'+(s ? esc(s.version) : '')+'</td>'
       + '<td>'+(s ? remRxText(s) : '')+'</td><td>'+(s ? remTxText(s) : '')+'</td><td class="act" style="white-space:nowrap">';
     var upn = !!up;
     h += '<button data-act="rxstart" data-id="'+esc(i.id)+'" title="receiver settings - start or restart the receiver"'+(upn?'':' disabled')+'>'+(s && s.rx && s.rx.running ? 'RX RESTART' : 'RX START')+'</button> '
@@ -10944,7 +10992,7 @@ function remDraw(){
   var dot = function(id){ var u = RS[id==='L' ? '' : id]; return '<span class="'+(u ? (u.up ? 'ok' : 'bad') : 'dim')+'">&#9679;</span> '; };
   var sh = '<button data-cur="" class="'+cl('').trim()+'" title="all instances at a glance: state, receiver, sender, actions for one or all instances">OVERVIEW</button><button data-cur="L" class="'+cl('L').trim()+'" title="the instance that serves this page (green dot = reachable)">'+dot('L')+'LOCAL</button>';
   REM.forEach(function(i){ sh += '<span class="grp" style="gap:0"><button data-cur="'+esc(i.id)+'" class="'+cl(i.id).trim()+'" title="'+esc(i.host)+':'+i.port+' - complete GUI of this remote instance (click again: reload)">'+dot(i.id)+esc(i.name)+'</button><button data-rm="'+esc(i.id)+'" title="remove this instance from the list" style="padding:4px 7px;margin-left:-1px">&times;</button></span>'; });
-  sh += '<span class="sep">&nbsp;|&nbsp;</span><button data-sact="add" title="add another mautg instance">+ ADD REMOTE</button><button data-sact="save" title="save the remote list with the settings of the instances under a name">SAVE SETUP</button><button data-sact="load" title="load a saved setup">LOAD SETUP</button>';
+  sh += '<span class="sep">&nbsp;|&nbsp;</span><button data-sact="add" title="add another mautg instance">+ ADD REMOTE</button><button data-sact="save" title="save the remote list with the settings of the instances under a name">SAVE SETUP</button><button data-sact="load" title="load a saved setup">LOAD SETUP</button><span class="sep">&nbsp;|&nbsp;</span><button data-sact="exit" class="danger" title="stop everything: first quit mautg on all reachable remote instances, then this one">EXIT</button>';
   var ss = $('remtabs'); if(ss.getAttribute('data-h') !== sh){ ss.innerHTML = sh; ss.setAttribute('data-h', sh); }
 }
 function remShow(id){
@@ -11247,6 +11295,26 @@ function remLoadSetupForm(){
       {label:'CANCEL'}]);
   }).catch(function(){});
 }
+function remExitForm(){                                  /* EXIT in the strip: all remote instances first, then this one */
+  var ups = REM.filter(function(i){ var u = RS[i.id]; return u && u.up; });
+  var off = REM.length - ups.length;
+  openForm('EXIT ALL', 'Stops all streams and receivers and quits mautg on '+(ups.length ? ups.length+' reachable remote instance'+(ups.length>1?'s':'')+' ('+ups.map(function(i){ return i.name; }).join(', ')+') first, then on this instance' : 'this instance (no remote instance is reachable)')
+    +'.'+(off ? ' '+off+' offline entr'+(off>1?'ies are':'y is')+' skipped (REMOVE with SSH can stop those).' : ''), [], {},
+    [{label:'EXIT', cls:'danger', fn:function(v, done){
+      var left = ups.length, bad = [];
+      var local = function(){
+        if(bad.length){ done('not stopped: '+bad.join(', ')+' - this instance keeps running (EXIT again, or REMOVE with SSH)'); return; }
+        post('exit', '', {}, function(){ done(null); setTimeout(function(){ try{ window.close(); }catch(e){} }, 1500); });
+      };
+      if(!left){ local(); return; }
+      ups.forEach(function(i){
+        remPost(i.id, 'exit', '', {}, function(j){
+          if(!j || j.ok === false) bad.push(i.name);
+          if(--left === 0) setTimeout(local, 800);
+        });
+      });
+    }}, {label:'CANCEL'}]);
+}
 function remAll(act){                                /* the action for every online instance (LOCAL included) */
   var ids = [{id:''}].concat(REM).filter(function(x){ return RS[x.id] && RS[x.id].up; }).map(function(x){ return x.id; });
   if(!ids.length){ note('no instance online', true); return; }
@@ -11312,7 +11380,7 @@ $('remstrip').addEventListener('click', function(e){
   var x = e.target.closest ? e.target.closest('button[data-rm]') : null;
   if(x){ remDelForm(x.getAttribute('data-rm')); return; }
   var a = e.target.closest ? e.target.closest('button[data-sact]') : null;
-  if(a){ var k = a.getAttribute('data-sact'); if(k==='add') remEditForm(''); else if(k==='save') remSaveSetupForm(); else remLoadSetupForm(); return; }
+  if(a){ var k = a.getAttribute('data-sact'); if(k==='add') remEditForm(''); else if(k==='save') remSaveSetupForm(); else if(k==='exit') remExitForm(); else remLoadSetupForm(); return; }
   var b = e.target.closest ? e.target.closest('button[data-cur]') : null;
   if(b){ var id = b.getAttribute('data-cur'); if(id==='') remShow(''); else { var again = (id===remCur); remOpenInst(id); if(again) remReloadFrame(id); } }
 });
@@ -11838,8 +11906,8 @@ def build_parser():
                    help='TCP slow reader: read for S seconds, then pause (--tcp-read-off)')
     r.add_argument('--tcp-read-off', type=float, metavar='S',
                    help='TCP slow reader: do not read for S seconds after every --tcp-read-on period')
-    r.add_argument('--show-ip', action='store_true',
-                   help='Show the sender IP in every line, after the stream label')
+    r.add_argument('--no-show-ip', action='store_true',
+                   help='Hide the sender / destination IP columns (default: shown)')
     r.add_argument('--verify', action='store_true',
                    help='Check CRC + padding pattern of every packet (default: '
                         'magic check only; full check on sender lock-in)')
@@ -11942,7 +12010,7 @@ def _apply_recv_args(args, cfg):
         'sender_ip': args.sender or '',
         'sender_sync_port': args.sender_sync_port or 0,
         'verify': args.verify,
-        'show_ip': args.show_ip,
+        'show_ip': not args.no_show_ip,
         'tcp': not args.no_tcp,
         'tcp_rcvbuf': args.tcp_rcvbuf or 0,
         'tcp_read_rate': args.tcp_read_rate or 0.0,

@@ -8,8 +8,7 @@
 --   Then restart Wireshark or Ctrl+Shift+L to reload Lua plugins.
 --
 -- This is a SEPARATE dissector from mau_protocol.lua. mau_protocol.lua
--- decodes the data-plane traffic packets (default UDP port 5005,
--- unchanged since the first release). This file decodes the 4-timestamp
+-- decodes the data traffic (UDP / TCP, default ports 5001-5008). This file decodes the 4-timestamp
 -- clock-sync exchange the receiver performs against the sender's embedded sync
 -- server (default UDP port 5556, --sync-port).
 --
@@ -135,10 +134,39 @@ function mau_owd_proto.dissector(buffer, pinfo, tree)
     return buf_len
 end
 
--- Register on the default OWD sync port. If a stream uses a different
--- --sync-port, right-click a packet on that port -> Decode As... -> select
--- MAU-OWD, or uncomment/add a line below for each additional port in use,
--- e.g.:
---   udp_table:add(6000, mau_owd_proto)
+-- Ports: default UDP 5556 (--sync-port). Another port: Edit -> Preferences ->
+-- Protocols -> MAU-OWD, or Decode As. In addition the messages are recognised on
+-- ANY UDP port (heuristic: size 9 / 25, type byte, plausible timestamp); switch
+-- it off in Analyze -> Enabled Protocols (mau_owd).
+local DEF_PORTS = "5556"
+mau_owd_proto.prefs.udp_ports = Pref.range("UDP ports", DEF_PORTS,
+    "UDP port of the OWD sync server (mautg --sync-port, default 5556)", 65535)
+
+local function plausible_time(buffer)
+    local ns = tonumber(tostring(buffer(1, 8):uint64()))
+    return ns ~= nil and ns > 1.5e18 and ns < 4.2e18      -- 2017 .. 2103
+end
+
+local function heur_owd(buffer, pinfo, tree)
+    local n = buffer:len()
+    if n ~= REQ_LEN and n ~= RSP_LEN then return false end
+    local t = buffer(0, 1):uint()
+    if not ((t == MSG_REQ and n == REQ_LEN) or (t == MSG_RSP and n == RSP_LEN)) then return false end
+    if not plausible_time(buffer) then return false end
+    mau_owd_proto.dissector(buffer, pinfo, tree)
+    return true
+end
+mau_owd_proto:register_heuristic("udp", heur_owd)
+
 local udp_table = DissectorTable.get("udp.port")
-udp_table:add(5556, mau_owd_proto)
+local cur_ports = DEF_PORTS
+udp_table:add(cur_ports, mau_owd_proto)
+
+function mau_owd_proto.prefs_changed()
+    local want = tostring(mau_owd_proto.prefs.udp_ports)
+    if want ~= cur_ports then
+        if cur_ports ~= "" then udp_table:remove(cur_ports, mau_owd_proto) end
+        if want ~= "" then udp_table:add(want, mau_owd_proto) end
+        cur_ports = want
+    end
+end

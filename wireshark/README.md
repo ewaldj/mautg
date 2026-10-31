@@ -2,12 +2,14 @@
 
 Two Lua dissector plugins for [Wireshark](https://www.wireshark.org/) that decode the protocols used by `mautg`:
 
-- **`mau_protocol.lua`** — the data-plane traffic packets (default UDP ports 5001-5008), format version 1 (mautg v1.05+).
+- **`mau_protocol.lua`** — the data traffic: UDP packets and TCP streams (default ports 5001-5008), data format version 2. TCP segments are reassembled to whole messages; the TCP hello and the statistics connection are decoded too.
 - **`mau_owd_sync_protocol.lua`** — the OWD (one-way delay) clock-sync exchange between the receiver and the sender's embedded sync server (default UDP port 5556, `--sync-port`). Binary `struct` format.
+
+Both recognise mautg traffic on **any port** by its content, and the ports can be changed in the Wireshark preferences.
 
 ## Data Packet Protocol Format
 
-MAU uses UDP to transmit packets with embedded timestamps for one-way delay measurement (format version 1, mautg v1.05+).
+Every UDP packet and every TCP message carries embedded timestamps for the one-way delay measurement (format version 2).
 
 ```
  0                   1                   2                   3
@@ -45,7 +47,7 @@ MAU uses UDP to transmit packets with embedded timestamps for one-way delay meas
 
 All multi-byte fields are **big-endian** (network byte order). The minimum UDP payload is 27 bytes (header only, no padding). The user-configured "packet size" refers to the IP wire size; the UDP payload is 28 bytes smaller (20 IP + 8 UDP header).
 
-Packets on the port that do not carry the magic are **not** dissected, so foreign UDP traffic stays untouched. This format is **not compatible** with mautg 1.04 and older (including the earlier mau-send/mau-recv scripts).
+Packets on the port that do not carry the magic are **not** dissected, so foreign traffic stays untouched.
 
 ## Wireshark Decoded View
 
@@ -55,7 +57,7 @@ Packets on the port that do not carry the magic are **not** dissected, so foreig
     Timestamp (µs): 1775400123456789
     Sender Timestamp (UTC): 2026-04-05 18:42:03.456789 UTC
     Magic: MAUT
-    Format Version: 1
+    Format Version: 2
     Sender OWD Sync Port (0 = none): 5556
     Padding Preamble: mautg_trafficgen_www.jeitler.cc:
     Padding: 6d61752d74675f...
@@ -64,13 +66,38 @@ Packets on the port that do not carry the magic are **not** dissected, so foreig
     Wire Size (bytes): 1500
 ```
 
-The info column shows a compact summary:
+The Info column shows a compact summary:
 
 ```
 Seq=42  Len=1500B  Sync=5556  CRC=OK
 ```
 
 CRC mismatches are flagged as expert info errors and highlighted in the packet list.
+
+## TCP Stream Format
+
+A TCP stream is a connection to the receiver's data port. Dissected by `mau_protocol.lua` (protocol `MAU-TCP`, the messages inside as `MAU`).
+
+| Part | Size | Content |
+|------|------|---------|
+| Hello (sender → receiver) | 16 bytes | `MTCP` · version `1` (uint8) · DSCP (uint8) · flags (uint16) · message size (uint32 BE) · reserved (uint32) |
+| Messages | message size, back to back | normal data message (layout above, 27 … 1048576 bytes) |
+
+A **statistics connection** (the sender asks the receiver for its values) starts with the hello `MSTA`, then one JSON line per request / reply; shown as `MAU TCP stats`.
+
+The Info column shows `hello + Seq=0 ...`, `Seq=42  Len=262144B  TCP` or, when one frame carries several messages, `5 messages  Seq=2..6  Len=300B each  TCP`. The CRC of TCP messages is **not** checked by default (TCP protects the data and the check in Lua is slow for large messages): *Edit → Preferences → Protocols → MAU-TCP → Verify the CRC*.
+
+Needs *Allow subdissector to reassemble TCP streams* (default on). A capture that starts in the middle of a connection (hello missing) cannot be framed and stays plain TCP.
+
+## Ports and automatic detection
+
+| | Default | Change |
+|---|---|---|
+| Data UDP | 5001-5008 | *Preferences → Protocols → MAU → UDP ports* |
+| Data TCP | 5001-5008 | *Preferences → Protocols → MAU-TCP → TCP ports* |
+| OWD sync UDP | 5556 | *Preferences → Protocols → MAU-OWD → UDP ports* |
+
+Besides the port lists the dissectors recognise mautg traffic on **any other port** by its content: UDP data packets (magic `MAUT` + format version 2), TCP connections (hello `MTCP` / `MSTA`, then the whole connection), OWD sync messages (size 9 / 25, type byte, plausible timestamp). Switch these off in *Analyze → Enabled Protocols* (`mau`, `mau_tcp`, `mau_owd`) if they get in the way. A port that another dissector already owns (e.g. RTP on an even UDP port) needs *Decode As…*.
 
 ## OWD Sync Protocol Format
 
@@ -135,9 +162,7 @@ MAU OWD Sync RSP  t1=2026-08-28 18:22:23.040081 UTC  server_proc=8000ns
 
 ## Usage
 
-`mau_protocol.lua` registers on **UDP ports 5001-5008** (default data port range; other ports via *Decode As*) and `mau_owd_sync_protocol.lua` on **UDP port 5556** (default `--sync-port`) automatically.
-
-For a different port: right-click any UDP packet → **Decode As…** → set UDP port → select **MAU** or **MAU-OWD**.
+Both files work without any setting on the default ports and, through the content detection, on any other port (see above). Manual way for one port: right-click a packet → **Decode As…** → select **MAU**, **MAU-TCP** or **MAU-OWD**.
 
 ### Display Filters
 
@@ -146,6 +171,8 @@ mau                          # all MAU data-packet traffic
 mau.seq >= 1000              # sequence number filter
 mau.crc_status == "MISMATCH" # CRC errors only
 mau.sync_port == 5556        # packets of senders advertising sync port 5556
+mau_tcp                      # TCP hello / statistics connections
+mau_tcp.msg_size == 262144   # connections with this message size
 
 mau_owd                              # all MAU OWD sync traffic
 mau_owd.type == 0x02                 # sync responses only
@@ -155,7 +182,7 @@ mau_owd.server_processing_ns > 5000  # slow server-side processing (ns)
 ### Capture Filter
 
 ```bash
-wireshark -i eth0 -f "udp portrange 5001-5008 or udp port 5556"
+wireshark -i eth0 -f "portrange 5001-5008 or udp port 5556"
 ```
 
 ## Related

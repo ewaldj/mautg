@@ -14,7 +14,7 @@ By Ewald Jeitler - https://www.jeitler.cc
 - Per-stream max run time, burst mode, DSCP, TTL, DF, source address / port
 - Web GUI with live graphs, tooltips on every field, file operations, CSV log
 - Remote control: one web GUI controls other mautg instances, installs / updates them over SSH, saves setups
-- Receiver overload detection, Wireshark dissectors
+- Receiver overload detection, Wireshark dissectors (UDP + TCP, any port)
 - Python 3.6.1+ (also Cisco IOS-XE Guest Shell)
 
 ## Installation / Update
@@ -60,6 +60,7 @@ One instance controls others: the strip `OVERVIEW | LOCAL | <remote> ... | + ADD
 - **Overview:** state, version, receiver and sender summary per instance; `RX START` / `RX STOP`, `OPEN`, `START ALL`, `STOP ALL`, `RESET`, `REMOVE`; the row `ALL` applies an action to every online instance.
 - **Install / update over SSH:** `ADD REMOTE` / `INSTALL` / `UPDATE` copy `mautg.py` with the ssh client of the controlling computer and start it on the Linux host (as root with sudo: own systemd service, so it survives the end of the ssh session). `TEST SSH` changes nothing. Key / agent login or password (kept in the browser memory only, never stored). Streams and ports survive an update.
 - **REMOVE:** stops the instance through the web GUI; if that fails, through SSH.
+- **EXIT** (end of the strip): quits mautg on all reachable remote instances first, then on this instance; if a remote does not answer, nothing is stopped locally.
 - **Setups:** `SAVE SETUP` stores the remote list and the settings of every online instance (`~/.mau/setups/`); `LOAD SETUP` / `RESTORE` applies them again.
 - **QUICK TEST:** sender instance A to receiver instance B in one dialog (protocol, rate, size, DSCP, port, duration).
 - Offline entries show the ICMP result (`ping ok` = host up, only mautg down).
@@ -71,7 +72,7 @@ One instance controls others: the strip `OVERVIEW | LOCAL | <remote> ... | + ADD
 ./mautg.py send -d 239.1.1.1 -p 5001 --pps 100      # sender live view
 ./mautg.py recv -g 239.1.1.1 -p 5001 -i 5           # receiver live view, summary every 5 s
 ./mautg.py send --stream 239.1.1.1:5001,pps=100,dscp=EF --stream 10.0.0.5:5003,tcp,conn=4,burst=200
-./mautg.py recv -u -p 5001-5008 --show-ip -l capture.csv
+./mautg.py recv -u -p 5001-5008 -l capture.csv
 ```
 
 ![Menu](screenshots/tui-menu.png)
@@ -81,6 +82,7 @@ One instance controls others: the strip `OVERVIEW | LOCAL | <remote> ... | + ADD
 ![Receiver live view](screenshots/tui-recv.png)
 
 - Menu: `Up` / `Down`, `Enter` edit, `Space` toggle, `s` / `r` Sender / Receiver tab, `Esc` leave. Sender live view: `Space` start / stop, `e` edit, `n` new, `d` delete, `s` / `x` start / stop all, `c` reset statistics, `r` receiver view. Receiver live view: `s` sender view, `e` settings, `i` IP columns, `d` per packet / summary, `+` / `-` interval, `r` reset.
+- With more than one stream the receiver summary ends every interval with a `SUM` line (cyan): total Mbit/s, packets, UDP loss, delay of all streams; `MIX` as cast for mixed TCP / UDP / MC / BC / UC.
 - Without root in a terminal (Linux / macOS) mautg asks `Restart with sudo?`: root allows a bigger receive buffer. `--no-sudo` / `MAUTG_NO_SUDO=1` silences it.
 - Closing the terminal stops everything (exit 129 / 143): use `tmux` / `screen`. Terminal at least 60x16, else line menus.
 - `--no-config` starts with the built-in defaults instead of `~/.mau/config.json`.

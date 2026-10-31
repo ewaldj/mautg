@@ -54,6 +54,7 @@ var (
 	pSetBkColor       = gdi32.NewProc("SetBkColor")
 	pGetStockObject   = gdi32.NewProc("GetStockObject")
 	pShellExecute     = shell32.NewProc("ShellExecuteW")
+	pDrawIconEx       = user32.NewProc("DrawIconEx")
 	pGetModuleHandle  = kernel32.NewProc("GetModuleHandleW")
 	pCreateMutex      = kernel32.NewProc("CreateMutexW")
 	pCreateJob        = kernel32.NewProc("CreateJobObjectW")
@@ -177,6 +178,8 @@ const (
 	idLink    = 17
 	idUpdate  = 18
 	idAdmin   = 19
+	idNoCfg   = 20
+	idCli     = 102
 
 	wmState  = wmApp + 2
 	wmNotify = wmApp + 3
@@ -187,6 +190,7 @@ const (
 
 var (
 	hwndMain, hStatus, hEdit, hLink uintptr
+	hCli, hNoCfg, hSmall            uintptr
 	hUpdTxt, hFoot, hRights         uintptr
 	updMu                           sync.Mutex
 	updNow                          *updInfo // newer files on GitHub, nil = current
@@ -221,9 +225,16 @@ func drawPaw(hdc uintptr, x, y int, k float64) {
 func setText(h uintptr, s string) { pSetWindowText.Call(h, uintptr(unsafe.Pointer(u16(s)))) }
 
 func getText(h uintptr) string {
-	buf := make([]uint16, 32)
+	n, _, _ := pSendMessage.Call(h, 0x0E, 0, 0) // WM_GETTEXTLENGTH
+	buf := make([]uint16, int(n)+2)
 	pGetWindowText.Call(h, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 	return syscall.UTF16ToString(buf)
+}
+
+// optionsFromWindow reads the CLI options field and the Def-Config checkbox (UI thread).
+func optionsFromWindow() (string, bool) {
+	c, _, _ := pSendMessage.Call(hNoCfg, 0xF0, 0, 0) // BM_GETCHECK
+	return getText(hCli), c == 1
 }
 
 func enable(id uintptr, on bool) {
@@ -393,12 +404,14 @@ func wndProc(hwnd, m, wp, lp uintptr) uintptr {
 			}
 			if n := portFromField(); n != 0 {
 				busy("starting ...")
-				go startWith(n, false)
+				cli, nc := optionsFromWindow()
+				go func() { run.setOptions(cli, nc); startWith(n, false) }()
 			}
 		case idRestart:
 			if n := portFromField(); n != 0 {
 				busy("restarting ...")
-				go startWith(n, true)
+				cli, nc := optionsFromWindow()
+				go func() { run.setOptions(cli, nc); startWith(n, true) }()
 			}
 		case idStop:
 			busy("stopping ...")
@@ -462,7 +475,7 @@ func wndProc(hwnd, m, wp, lp uintptr) uintptr {
 	case 0x000F: // WM_PAINT
 		var ps [72]byte // PAINTSTRUCT (x64)
 		hdc, _, _ := pBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps[0])))
-		drawPaw(hdc, 16, 258, 0.8)
+		pDrawIconEx.Call(hdc, 14, 328, hSmall, 16, 16, 0, 0, 3) // the app icon, same as on macOS
 		pEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps[0])))
 		return 0
 	case 0x0138: // WM_CTLCOLORSTATIC
@@ -539,6 +552,7 @@ func main() {
 	if small == 0 {
 		small = icon
 	}
+	hSmall = small
 	cur, _, _ := pLoadCursor.Call(0, 32512)
 	cls := u16("mautgLauncherWnd")
 	wc := wndClassEx{
@@ -557,7 +571,7 @@ func main() {
 	}
 	// WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX (fixed size), WS_EX_CONTROLPARENT
 	hwndMain, _, _ = pCreateWindowEx.Call(0x10000, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(u16("mautg (Windows) v"+launcherVersion+adminTag()))),
-		0x00C00000|0x00080000|0x00020000, 200, 200, 380, 342, 0, 0, inst, 0)
+		0x00C00000|0x00080000|0x00020000, 200, 200, 380, 410, 0, 0, inst, 0)
 	if hwndMain == 0 {
 		msgBox("cannot create window", 0x10)
 		return
@@ -585,25 +599,35 @@ func main() {
 	btn[idLog] = mk("BUTTON", "Console log", tab, 134, 124, 108, 28, idLog)
 	btn[idExit] = mk("BUTTON", "Exit", tab, 254, 124, 108, 28, idExit)
 
-	mk("STATIC", "Rights:", 0, 14, 172, 60, 18, 0)
-	hRights = mk("STATIC", rightsText(), 0, 78, 172, 170, 18, 0)
-	btn[idAdmin] = mk("BUTTON", "Admin", tab, 254, 166, 108, 28, idAdmin)
+	// options (same as the macOS launcher): Def-Config checkbox and free CLI options
+	hNoCfg = mk("BUTTON", "Disable Def-Config", tab|3, 14, 166, 260, 20, idNoCfg) // BS_AUTOCHECKBOX
+	mk("STATIC", "CLI options:", 0, 14, 204, 74, 18, 0)
+	hCli = mk("EDIT", "", tab|0x00800000|0x80, 90, 200, 270, 22, idCli) // WS_BORDER | ES_AUTOHSCROLL
+	cliText, noCfg := run.optionsText()
+	setText(hCli, cliText)
+	if noCfg {
+		pSendMessage.Call(hNoCfg, 0xF1, 1, 0) // BM_SETCHECK
+	}
+
+	mk("STATIC", "Rights:", 0, 14, 240, 60, 18, 0)
+	hRights = mk("STATIC", rightsText(), 0, 78, 240, 170, 18, 0)
+	btn[idAdmin] = mk("BUTTON", "Admin", tab, 254, 234, 108, 28, idAdmin)
 	if isElevated() {
 		pShowWindow.Call(btn[idAdmin], 0) // already administrator
 	}
 
-	mk("STATIC", "Update:", 0, 14, 212, 60, 18, 0)
-	hUpdTxt = mk("STATIC", updText, 0, 78, 212, 170, 18, 0)
-	btn[idUpdate] = mk("BUTTON", "Update", tab, 254, 206, 108, 28, idUpdate)
+	mk("STATIC", "Update:", 0, 14, 280, 60, 18, 0)
+	hUpdTxt = mk("STATIC", updText, 0, 78, 280, 170, 18, 0)
+	btn[idUpdate] = mk("BUTTON", "Update", tab, 254, 274, 108, 28, idUpdate)
 	pShowWindow.Call(btn[idUpdate], 0)         // appears only when GitHub has a newer version
-	mk("STATIC", "", 0x10, 14, 246, 340, 2, 0) // SS_ETCHEDHORZ separator
+	mk("STATIC", "", 0x10, 14, 316, 340, 2, 0) // SS_ETCHEDHORZ separator
 	ver := readVersion(dir)
 	if ver != "" {
 		ver = " v" + ver
 	}
 	foot := "mautg.py" + ver + "  -"
-	hFoot = mk("STATIC", foot, 0, 40, 260, 8*uintptr(len(foot)), 18, 0)
-	hLink = mk("STATIC", "www.jeitler.cc", 0x100, 40+8*uintptr(len(foot))+4, 260, 110, 18, idLink) // SS_NOTIFY
+	hFoot = mk("STATIC", foot, 0, 40, 330, 8*uintptr(len(foot)), 18, 0)
+	hLink = mk("STATIC", "www.jeitler.cc", 0x100, 40+8*uintptr(len(foot))+4, 330, 110, 18, idLink) // SS_NOTIFY
 
 	pShowWindow.Call(hwndMain, 1)
 	pSetForegroundWin.Call(hwndMain)

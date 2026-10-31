@@ -32,6 +32,8 @@ type winState struct {
 	PortSeq int    `json:"portSeq"`
 	Adm     string `json:"adm"`
 	AdmShow bool   `json:"admShow"`
+	Cli     string `json:"cli"`
+	NoCfg   bool   `json:"noCfg"`
 }
 
 // window is the Cocoa window run by osascript (JXA); events are the lines it prints.
@@ -147,6 +149,7 @@ func (a *app) snapshot(busy string) winState {
 	s := winState{Status: a.status(), Running: a.run.running(), Upd: upd, UpdShow: show,
 		Foot: "mautg.py" + ver + "  -", Port: a.run.getPort(), PortSeq: seq,
 		Adm: adminText(), AdmShow: a.e.admin != nil && adminNeeded()}
+	s.Cli, s.NoCfg = a.run.optionsText()
 	if busy != "" {
 		s.Status, s.Busy = busy, true
 	}
@@ -157,8 +160,9 @@ func (a *app) push(w *window, busy string) { w.setState(a.snapshot(busy)) }
 
 // handle executes one window event; true = quit.
 func (a *app) handle(w *window, ev string) bool {
-	f := strings.Fields(ev)
-	if len(f) == 0 {
+	// "start <port> <0|1> <cli options ...>": the CLI text keeps its blanks
+	f := strings.SplitN(strings.TrimSpace(ev), " ", 4)
+	if len(f) == 0 || f[0] == "" {
 		return false
 	}
 	port := func() int {
@@ -170,16 +174,27 @@ func (a *app) handle(w *window, ev string) bool {
 		a.e.note("The port must be a number from 1 to 65535.")
 		return 0
 	}
+	opts := func() {
+		if len(f) > 2 {
+			cli := ""
+			if len(f) > 3 {
+				cli = f[3]
+			}
+			a.run.setOptions(cli, f[2] == "1")
+		}
+	}
 	switch f[0] {
 	case "start":
 		if n := port(); n != 0 && !a.run.running() {
 			a.push(w, "starting ...")
+			opts()
 			a.startWith(n, false)
 			a.bumpPort()
 		}
 	case "restart":
 		if n := port(); n != 0 {
 			a.push(w, "restarting ...")
+			opts()
 			a.startWith(n, true)
 			a.bumpPort()
 		}

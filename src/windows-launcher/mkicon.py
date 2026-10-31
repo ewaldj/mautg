@@ -6,18 +6,13 @@ from PIL import Image, ImageDraw
 
 BG, FG = (74, 59, 52, 255), (243, 233, 220, 255)   # paw brown / cream
 
+SRC = '/mnt/user-data/uploads/mautg/icon/mautg-icon-1024.png'
+_base = Image.open(SRC).convert('RGBA')
+_base = _base.crop(_base.getbbox())
+
 def logo(size):
-    """mautg paw (same ellipses as the web GUI favicon, 24x24 grid) on the brown tile."""
-    S = 1024
-    im = Image.new('RGBA', (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(im)
-    d.rounded_rectangle((0, 0, S - 1, S - 1), radius=int(S * 0.22), fill=BG)
-    k = S * 0.78 / 24.0
-    ox = oy = S * 0.11
-    for cx, cy, rx, ry in ((12, 16.5, 5.4, 4.3), (5.2, 10.5, 2.5, 3.1), (18.8, 10.5, 2.5, 3.1),
-                           (8.9, 5.6, 2.4, 3.1), (15.1, 5.6, 2.4, 3.1)):
-        d.ellipse((ox + (cx - rx) * k, oy + (cy - ry) * k, ox + (cx + rx) * k, oy + (cy + ry) * k), fill=FG)
-    return im.resize((size, size), Image.LANCZOS)
+    """mautg icon (paw + MAUTG text on the brown tile) from icon/mautg-icon-1024.png."""
+    return _base.resize((size, size), Image.LANCZOS)
 
 SIZES = [16, 24, 32, 48, 64, 256]
 
@@ -53,7 +48,7 @@ for d in ('.', '../osx-installer/res', '../osx-launcher/res', '../windows-instal
 for d in ('.', '../osx-installer/res', '../osx-launcher/res'):
     open(os.path.join(d, 'mautg.ico'), 'wb').write(ico)
     logo(256).save(os.path.join(d, 'mautg-logo.png'))
-logo(512).save('../osx-launcher/res/mautg.icns')
+import shutil; shutil.copy('/tmp/work/ic/icon/mautg.icns','../osx-launcher/res/mautg.icns')
 
 # ---- resources: RT_ICON (3) x n, RT_GROUP_ICON (14), RT_MANIFEST (24) ----
 MANIFEST = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

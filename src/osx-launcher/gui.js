@@ -1,13 +1,13 @@
 // mautg launcher window (JXA / Cocoa). Started by the launcher:
 //   osascript -l JavaScript gui.js <state file> <title> <icon>
 // The launcher writes the state as JSON to <state file>; this script polls it and prints
-// user actions as lines on stdout: ready, start <port>, stop, restart <port>, open, log,
+// user actions as lines on stdout: ready, start <port> <0|1 no-config> <cli options>, stop, restart <port> <0|1> <cli>, open, log,
 // update, link, admin, exit.
 ObjC.import('Cocoa');
 
-var W = 380, H = 304;
+var W = 380, H = 372;
 var ID = { start: 1, stop: 2, restart: 3, open: 4, log: 5, exit: 6, update: 7, link: 8, admin: 9 };
-var ui = {}, lastState = '', lastPortSeq = -1, win, delegate, portField;
+var ui = {}, lastState = '', lastPortSeq = -1, win, delegate, portField, cliField, noCfgBox;
 
 function emit(s) {
   var d = $(s + '\n').dataUsingEncoding($.NSUTF8StringEncoding);
@@ -40,9 +40,10 @@ function button(txt, id, x, y, w, h) {
 
 function onButton(id) {
   var p = String(ObjC.unwrap(portField.stringValue)).replace(/\s+/g, '');
+  var o = (noCfgBox.state ? '1' : '0') + ' ' + String(ObjC.unwrap(cliField.stringValue)).replace(/[\r\n]+/g, ' ').trim();
   switch (id) {
-    case ID.start: emit('start ' + p); break;
-    case ID.restart: emit('restart ' + p); break;
+    case ID.start: emit('start ' + p + ' ' + o); break;
+    case ID.restart: emit('restart ' + p + ' ' + o); break;
     case ID.stop: emit('stop'); break;
     case ID.open: emit('open'); break;
     case ID.log: emit('log'); break;
@@ -70,6 +71,8 @@ function applyState(s) {
   if (s.portSeq !== lastPortSeq) { // the launcher changed the port
     lastPortSeq = s.portSeq;
     portField.setStringValue($(String(s.port)));
+    cliField.setStringValue($(s.cli || ''));
+    noCfgBox.setState(s.noCfg ? 1 : 0);
   }
 }
 
@@ -139,22 +142,37 @@ function start(argv) {
   ui.logb = button('Console log', ID.log, 134, 126, 112, 30);
   ui.exit = button('Exit', ID.exit, 254, 126, 112, 30);
 
-  label('Update:', 16, 176, 60, 18);
-  ui.upd = label('checking ...', 80, 176, 170, 18);
-  ui.update = button('Update', ID.update, 254, 170, 112, 30);
+  noCfgBox = $.NSButton.alloc.initWithFrame(rect(16, 168, 260, 20));
+  noCfgBox.setButtonType(3); // switch (checkbox)
+  noCfgBox.setTitle($('Disable Def-Config'));
+  win.contentView.addSubview(noCfgBox);
+
+  label('CLI options:', 16, 206, 74, 18);
+  cliField = $.NSTextField.alloc.initWithFrame(rect(92, 202, 272, 24));
+  cliField.setStringValue($(''));
+  win.contentView.addSubview(cliField);
+
+  label('Update:', 16, 244, 60, 18);
+  ui.upd = label('checking ...', 80, 244, 170, 18);
+  ui.update = button('Update', ID.update, 254, 238, 112, 30);
   ui.update.setHidden(true);
 
-  label('Admin:', 16, 216, 60, 18);
-  ui.adm = label('-', 80, 216, 170, 18);
-  ui.admin = button('Admin setup', ID.admin, 254, 210, 112, 30);
+  label('Admin:', 16, 284, 60, 18);
+  ui.adm = label('-', 80, 284, 170, 18);
+  ui.admin = button('Admin setup', ID.admin, 254, 278, 112, 30);
   ui.admin.setHidden(true);
 
-  var sep = $.NSBox.alloc.initWithFrame(rect(16, 258, W - 32, 2));
+  var sep = $.NSBox.alloc.initWithFrame(rect(16, 326, W - 32, 2));
   sep.setBoxType(2); // separator
   win.contentView.addSubview(sep);
 
-  ui.foot = label('mautg.py', 16, 270, 200, 18);
-  var link = button('www.jeitler.cc', ID.link, 214, 268, 120, 20);
+  try { // the app icon (paw) in front of the version, like the Windows launcher
+    var iv = $.NSImageView.alloc.initWithFrame(rect(16, 336, 20, 20));
+    iv.setImage($.NSImage.alloc.initWithContentsOfFile($(icon)));
+    win.contentView.addSubview(iv);
+  } catch (e) { }
+  ui.foot = label('mautg.py', 42, 338, 190, 18);
+  var link = button('www.jeitler.cc', ID.link, 240, 336, 120, 20);
   link.setBordered(false);
   try {
     var attr = $.NSMutableAttributedString.alloc.initWithString($('www.jeitler.cc'));

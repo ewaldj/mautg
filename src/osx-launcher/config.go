@@ -24,6 +24,7 @@ type config struct {
 	args     []string // arguments for mautg.py (after the script name)
 	port     int      // web gui port (for the browser and the stop request)
 	argsPath string   // mautg-args.txt (holds the port after a change)
+	user     []string // options of the user (file + command line, without the fixed ones)
 }
 
 // fieldsLine splits one line of options on blanks; a double-quoted part stays together.
@@ -122,6 +123,12 @@ func hasOpt(args []string, names ...string) bool {
 func buildConfig(dir string, cli []string, lookPath func(string) (string, error)) config {
 	argsPath := filepath.Join(dir, argsFile)
 	user := append(readArgsFile(argsPath), cli...)
+	args, port := composeArgs(user)
+	return config{dir: dir, python: findPython(dir, lookPath), args: args, port: port, argsPath: argsPath, user: user}
+}
+
+// composeArgs: -web, the default -bind, the user options and the explicit -port.
+func composeArgs(user []string) ([]string, int) {
 	port := portOf(user, defaultPort)
 	args := []string{"-web"}
 	if !hasOpt(user, "-bind", "--bind") {
@@ -129,7 +136,7 @@ func buildConfig(dir string, cli []string, lookPath func(string) (string, error)
 	}
 	args = append(args, user...)
 	args = append(args, "-port", strconv.Itoa(port))
-	return config{dir: dir, python: findPython(dir, lookPath), args: args, port: port, argsPath: argsPath}
+	return args, port
 }
 
 var portTokRe = regexp.MustCompile(`(-port|--port)(\s+|=)\d+`)

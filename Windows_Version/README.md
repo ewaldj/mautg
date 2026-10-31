@@ -25,6 +25,10 @@ Python is bundled, nothing else has to be installed. A small launcher window con
 1. Unzip `mautg-windows.zip`.
 2. Run `mautg.exe`. The web GUI opens at http://127.0.0.1:8081.
 
+## Options
+
+The window has the checkbox **Disable Def-Config** (start without `~/.mau/config.json`, option `--no-config`) and the field **CLI options** (any mautg options, e.g. `-bind 0.0.0.0`). Both are applied with Start / Restart and stored in `mautg-args.txt` next to the program.
+
 ## Administrator rights
 
 Windows ignores DSCP set on a socket. As administrator mautg creates a QoS policy per sender stream with a DSCP value

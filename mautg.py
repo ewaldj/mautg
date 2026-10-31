@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-VERSION = "2.61"
+VERSION = "2.62"
 AUTHOR = "Ewald Jeitler"
 URL = "https://www.jeitler.cc"
 CREDIT = f"by {AUTHOR} - {URL}"
@@ -11692,6 +11692,8 @@ if(!IN_FRAME) remLoad(function(){                       /* top level: instance s
 # --- Main ---------------------------------------------------------------------
 
 def _ui_flags(p):
+    p.add_argument('--no-config', action='store_true', default=argparse.SUPPRESS,
+                   help='Do not load the default config file ~/.mau/config.json (start with the built-in defaults)')
     p.add_argument('--no-sudo', action='store_true', default=argparse.SUPPRESS,
                    help='Do not offer to restart through sudo (also: MAUTG_NO_SUDO=1)')
     p.add_argument('--no-color', action='store_true', default=argparse.SUPPRESS,
@@ -12001,7 +12003,7 @@ def main():
         if why:
             print(f"{Colors.YELLOW}{why}{Colors.ENDC}")
 
-    cfg = load_config()
+    cfg = _default_config() if getattr(args, 'no_config', False) else load_config()
     no_server = getattr(args, 'no_sync_server', False)
     if getattr(args, 'sync_port', None) is not None:
         cfg['sync_port'] = args.sync_port

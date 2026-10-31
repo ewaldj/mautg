@@ -153,6 +153,7 @@ Per stream (stream editor in the TUI and web GUI, `--max-runtime S` on the comma
 | `--no-live` | Plain output |
 | `-m`, `--menu` | Sender menu |
 | `--no-tui`, `--no-color`, `--color`, `--ascii` | Output options |
+| `--no-config` | Do not load `~/.mau/config.json` (start with the built-in defaults) |
 | `-web`, `-wv`, `-wvc`, `-port`, `-bind` | [Web GUI](#web-gui) |
 
 ### Pacing and performance
@@ -250,6 +251,7 @@ Summary values are per interval, one line per stream; Ctrl+C prints totals. `Del
 | `--no-live` | Scrolling output |
 | `-m`, `--menu` | Receiver menu |
 | `--no-tui`, `--no-color`, `--color`, `--ascii` | Output options |
+| `--no-config` | Do not load `~/.mau/config.json` (start with the built-in defaults) |
 | `-web`, `-wv`, `-wvc`, `-port`, `-bind` | [Web GUI](#web-gui) |
 
 ### Multicast

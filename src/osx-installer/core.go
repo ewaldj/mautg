@@ -8,7 +8,7 @@ import (
 )
 
 // installerVersion is shown in the dialog titles; raise it with every change.
-const installerVersion = "1.00"
+const installerVersion = "1.01"
 
 const defaultURL = "https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-mac.zip"
 

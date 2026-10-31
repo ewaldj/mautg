@@ -2,17 +2,32 @@
 """Build mautg.ico (paw logo) and rsrc_windows_amd64.syso (icon + manifest resources
 for the Go linker). Usage: python3 mkicon.py"""
 import struct, io, os
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 BG, FG = (74, 59, 52, 255), (243, 233, 220, 255)   # paw brown / cream
 
-SRC = '/tmp/work/ic3/mautg-icon-1024.png'
-_base = Image.open(SRC).convert('RGBA')
-_base = _base.crop(_base.getbbox())
+PAW = [(12, 16.5, 5.4, 4.3), (5.2, 10.5, 2.5, 3.1), (18.8, 10.5, 2.5, 3.1), (8.9, 5.6, 2.4, 3.1), (15.1, 5.6, 2.4, 3.1)]
+FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
 
 def logo(size):
-    """mautg icon (paw + MAUTG text on the brown tile) from icon/mautg-icon-1024.png."""
-    return _base.resize((size, size), Image.LANCZOS)
+    """Same design as the eping launcher icon: paw + word on the brown tile (full size)."""
+    S = 1024
+    im = Image.new('RGBA', (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    d.rounded_rectangle((0, 0, S - 1, S - 1), radius=int(S * 0.22), fill=BG)
+    text = size >= 32                       # too small for readable letters: bigger paw only
+    k = 27.0 if text else 38.0              # paw grid (24x24) scale; paw spans x 2.7..21.3, y 2.5..20.8
+    cx = S / 2 - 12 * k
+    top = 120 if text else (S - 18.3 * k) / 2 - 2.5 * k
+    for ex, ey, rx, ry in PAW:
+        x, y = cx + ex * k, top + ey * k
+        d.ellipse((x - rx * k, y - ry * k, x + rx * k, y + ry * k), fill=FG)
+    if text:
+        f = ImageFont.truetype(FONT, 200)
+        w = d.textlength('MAUTG', font=f)
+        f = ImageFont.truetype(FONT, int(200 * S * 0.72 / w))   # word = ~72% of the width
+        d.text((S / 2, 800), 'MAUTG', font=f, fill=FG, anchor='mm')
+    return im.resize((size, size), Image.LANCZOS)
 
 SIZES = [16, 24, 32, 48, 64, 256]
 
@@ -48,7 +63,8 @@ for d in ('.', '../osx-installer/res', '../osx-launcher/res', '../windows-instal
 for d in ('.', '../osx-installer/res', '../osx-launcher/res'):
     open(os.path.join(d, 'mautg.ico'), 'wb').write(ico)
     logo(256).save(os.path.join(d, 'mautg-logo.png'))
-import shutil; shutil.copy('/tmp/work/ic3/mautg.icns','../osx-launcher/res/mautg.icns')
+logo(1024).save('../osx-launcher/res/mautg.icns', sizes=[(16, 16), (32, 32), (64, 64), (128, 128), (256, 256), (512, 512), (1024, 1024)])
+logo(1024).save('/tmp/work/ic3/mautg-icon-1024.png')
 
 # ---- resources: RT_ICON (3) x n, RT_GROUP_ICON (14), RT_MANIFEST (24) ----
 MANIFEST = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

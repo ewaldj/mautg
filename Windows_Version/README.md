@@ -27,7 +27,7 @@ Python is bundled, nothing else has to be installed. A small launcher window con
 
 ## Options
 
-The window has the checkbox **Disable Def-Config** (start without `~/.mau/config.json`, option `--no-config`) and the field **CLI options** (any mautg options, e.g. `-bind 0.0.0.0`). Both are applied with Start / Restart and stored in `mautg-args.txt` next to the program.
+The window has the checkboxes **Disable autostart** (mautg is not started with the launcher, press Start) and **Disable Config** (start without `~/.mau/config.json`, option `--no-config`) and the field **CLI options** (any mautg options, e.g. `-bind 0.0.0.0`). All are applied with Start / Restart and stored in `mautg-args.txt` next to the program.
 
 ## Administrator rights
 

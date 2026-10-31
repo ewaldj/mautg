@@ -9,11 +9,11 @@ import (
 )
 
 func TestSplitUser(t *testing.T) {
-	cli, n := splitUser([]string{"-bind", "0.0.0.0", "--no-config", "-port", "9000", `a b`})
-	if cli != `-bind 0.0.0.0 "a b"` || !n {
+	cli, n, au := splitUser([]string{"-bind", "0.0.0.0", "--no-config", "--no-autostart", "-port", "9000", `a b`})
+	if cli != `-bind 0.0.0.0 "a b"` || !n || !au {
 		t.Fatalf("%q %v", cli, n)
 	}
-	cli, n = splitUser([]string{"--port=1"})
+	cli, n, _ = splitUser([]string{"--port=1"})
 	if cli != "" || n {
 		t.Fatalf("%q %v", cli, n)
 	}
@@ -22,22 +22,22 @@ func TestSplitUser(t *testing.T) {
 func TestSetOptions(t *testing.T) {
 	d := t.TempDir()
 	r := &runner{cfg: buildConfig(d, nil, func(string) (string, error) { return "", os.ErrNotExist })}
-	r.setOptions("-bind 0.0.0.0", true)
+	r.setOptions("-bind 0.0.0.0", true, true)
 	want := []string{"-web", "-bind", "0.0.0.0", "--no-config", "-port", "8081"}
 	if !reflect.DeepEqual(r.cfg.args, want) {
 		t.Fatalf("%v", r.cfg.args)
 	}
 	b, _ := os.ReadFile(filepath.Join(d, argsFile))
-	if !strings.Contains(string(b), "-bind 0.0.0.0 --no-config\n") {
+	if !strings.Contains(string(b), "-bind 0.0.0.0 --no-config --no-autostart\n") {
 		t.Fatalf("%q", b)
 	}
 	// a restart reads the same options back
 	c := buildConfig(d, nil, func(string) (string, error) { return "", os.ErrNotExist })
 	r2 := &runner{cfg: c}
-	if cli, n := r2.optionsText(); cli != "-bind 0.0.0.0" || !n {
+	if cli, n, au := r2.optionsText(); cli != "-bind 0.0.0.0" || !n || !au {
 		t.Fatalf("%q %v", cli, n)
 	}
-	r.setOptions("", false)
+	r.setOptions("", false, false)
 	b, _ = os.ReadFile(filepath.Join(d, argsFile))
 	if strings.Contains(string(b), "bind") || strings.Contains(string(b), "no-config") {
 		t.Fatalf("%q", b)

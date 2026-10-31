@@ -174,6 +174,10 @@ func (a *app) adminOffer() {
 
 func (a *app) autoStart() {
 	a.adminOffer()
+	if _, _, no := a.run.optionsText(); no { // "Disable autostart"
+		a.wake()
+		return
+	}
 	a.startWith(a.run.getPort(), false)
 	go a.openWhenUp()
 	a.wake()

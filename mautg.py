@@ -7,7 +7,7 @@
 # And since the AI helped write it… good luck to all of us.
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-VERSION = "2.62"
+VERSION = "2.66"
 AUTHOR = "Ewald Jeitler"
 URL = "https://www.jeitler.cc"
 CREDIT = f"by {AUTHOR} - {URL}"
@@ -445,14 +445,16 @@ def _terminal_lost(fd):
         return e.errno in (errno.EIO, errno.ENOTTY, errno.EBADF, errno.ENXIO)
 
 
-def _install_termination_handlers():
+def _install_termination_handlers(keep_running=False):
     """Stop cleanly on SIGHUP (terminal closed), SIGTERM and SIGBREAK, and
-    watch the TTY for hang-ups that do not deliver a signal."""
+    watch the TTY for hang-ups that do not deliver a signal.
+    keep_running (web GUI only, no terminal UI): a closed terminal / ssh session does
+    not end mautg - SIGHUP is ignored and the output goes to /dev/null instead."""
     for name in ('SIGHUP', 'SIGTERM', 'SIGBREAK'):
         sig = getattr(signal, name, None)
         if sig is not None:
             try:
-                signal.signal(sig, _on_signal)
+                signal.signal(sig, signal.SIG_IGN if (keep_running and name == 'SIGHUP') else _on_signal)
             except (OSError, ValueError):
                 pass
 
@@ -472,8 +474,10 @@ def _install_termination_handlers():
             time.sleep(1.0)
             if _terminal_lost(fd):
                 global _tty_gone
-                _tty_gone = True
                 _silence_output()
+                if keep_running:
+                    return        # web GUI: keep serving without a terminal
+                _tty_gone = True
                 # SIGTERM: not blockable by an inherited signal mask like SIGHUP
                 if hasattr(signal, 'SIGTERM') and sys.platform != 'win32':
                     os.kill(os.getpid(), signal.SIGTERM)
@@ -5909,7 +5913,7 @@ class LiveView:
         if streams:
             t = _streams_total(streams, rates)
             dl = lambda v: 'n/a' if v is None else f"{v:.2f}"
-            tv = {'st': '', 'src': f"SUM {t['n']} streams", 'port': '', 'cast': '',
+            tv = {'st': '', 'src': f"SUM {t['n']} streams", 'dst': '', 'port': '', 'cast': '',
                   'pk': _short(t['pk'], 8),
                   'loss': f"{t['loss']:.2f}" if t['loss'] < 100 else "100",
                   'miss': _short(t['miss'], 5), 'cons': _short(t['cons'], 5),
@@ -7164,7 +7168,7 @@ class SenderView:
                 vals = {'n': idx + 1, 'state': state, 'dest': p['destination_address'],
                         'port': p['destination_port'], 'size': p['packet_size'],
                         'rate': st.rate_text(),
-                        'dscp': f"{p['dscp_value']} {dscp_to_name(p['dscp_value'])}",
+                        'dscp': dscp_to_name(p['dscp_value']),
                         'ttl': p['ttl'],
                         'df': (('TCP DF' if p.get('df_bit') else 'TCP') if p.get('protocol') == 'tcp'
                                else 'on' if p.get('df_bit') else 'off'), 'sent': _short(st.sent, sent_w),
@@ -7880,14 +7884,15 @@ PID=$(cat "$D/mautg.pid" 2>/dev/null)
 RUN=""
 alive() { { [ -n "$PID" ] && ps -p "$PID" >/dev/null 2>&1; } || pgrep -f '[m]autg.py -web -port @PORT@' >/dev/null 2>&1; }
 killit() {
+  systemctl --no-ask-password stop mautg-@PORT@.service >/dev/null 2>&1
   [ -n "$PID" ] && kill "$PID" 2>/dev/null
   pkill -f '[m]autg.py -web -port @PORT@' 2>/dev/null
 }
 if ! alive; then echo "OK not running"; exit 0; fi
 killit; sleep 1
 alive && case "$SUDOMODE" in
-  nopass) sudo -n sh -c "kill $PID 2>/dev/null; pkill -f '[m]autg.py -web -port @PORT@' 2>/dev/null";;
-  password) printf '%s\n' "$PW" | sudo -S -p '' sh -c "kill $PID 2>/dev/null; pkill -f '[m]autg.py -web -port @PORT@' 2>/dev/null";;
+  nopass) sudo -n sh -c "systemctl --no-ask-password stop mautg-@PORT@.service 2>/dev/null; kill $PID 2>/dev/null; pkill -f '[m]autg.py -web -port @PORT@' 2>/dev/null";;
+  password) printf '%s\n' "$PW" | sudo -S -p '' sh -c "systemctl --no-ask-password stop mautg-@PORT@.service 2>/dev/null; kill $PID 2>/dev/null; pkill -f '[m]autg.py -web -port @PORT@' 2>/dev/null";;
 esac
 sleep 1
 if alive; then echo "ERR still running (started as root? sudo is needed)"; exit 4; else echo "OK stopped"; fi
@@ -7905,7 +7910,21 @@ rm -f "$D/mautg-web.log" "$D/mautg.pid" 2>/dev/null
 cat > "$D/mautg-start.sh" <<'EOS'
 #!/bin/sh
 cd "$(dirname "$0")" || exit 1
-setsid nohup python3 mautg.py -web -port @PORT@ @BIND@ --no-sudo > mautg-web.log 2>&1 < /dev/null &
+RUN='python3 mautg.py -web -port @PORT@ @BIND@ --no-sudo >> mautg-web.log 2>&1 < /dev/null; echo "mautg: ended, exit code $? at $(date)" >> mautg-web.log'
+if [ "$(id -u)" = 0 ] && [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
+  # as root under systemd: a service of its own, so that the end of the ssh session (its session scope) cannot take mautg along
+  # (e.g. Cisco Guestshell: processes of a session are removed with the session, setsid / nohup do not help)
+  U=mautg-@PORT@
+  systemctl --no-ask-password stop "$U.service" >/dev/null 2>&1
+  systemctl reset-failed "$U.service" >/dev/null 2>&1
+  if systemd-run --quiet --unit="$U" --collect --property=WorkingDirectory="$PWD" sh -c "$RUN" >/dev/null 2>&1; then
+    sleep 1
+    systemctl show -p MainPID --value "$U.service" > mautg.pid 2>/dev/null
+    exit 0
+  fi
+fi
+# the wrapper shell writes how mautg ended (exit code 137 = killed from outside, 143 = SIGTERM)
+setsid nohup sh -c "$RUN" > /dev/null 2>&1 &
 echo $! > mautg.pid
 EOS
 case "$SUDOMODE" in
@@ -11992,7 +12011,7 @@ def main():
 
     _offer_sudo(args)
 
-    _install_termination_handlers()
+    _install_termination_handlers(keep_running=bool(getattr(args, 'web', False)))
     if getattr(args, 'no_color', False) or os.environ.get('NO_COLOR'):
         disable_colors()
     elif not getattr(args, 'color', False) and sys.stdout.isatty() and not color_ok():
@@ -12087,6 +12106,11 @@ def main():
             return
         # terminal closed / SIGTERM: everything has been unwound; end for real
         code = 128 + getattr(signal, t.signame, signal.SIGTERM)
+        try:                                  # a trace in the log (-web: mautg-web.log)
+            sys.stderr.write(f"mautg: stopped by {t.signame} at {time.strftime('%Y-%m-%d %H:%M:%S')} (pid {os.getpid()})\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
         sync_server.stop()
         sys.exit(int(code))
     else:

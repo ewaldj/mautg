@@ -9,6 +9,9 @@ import (
 // noConfigOpt starts mautg without reading ~/.mau/config.json (checkbox "Disable Def-Config").
 const noConfigOpt = "--no-config"
 
+// noAutoOpt is only for the launcher (checkbox "Disable autostart"): mautg is not started with the launcher. It is not passed to mautg.py.
+const noAutoOpt = "--no-autostart"
+
 // joinFields is the inverse of fieldsLine: a token with blanks is put in double quotes.
 func joinFields(a []string) string {
 	out := make([]string, len(a))
@@ -23,13 +26,15 @@ func joinFields(a []string) string {
 
 // splitUser separates the options of the launcher window from the free CLI options:
 // -port N / --port N / --port=N belong to the port field, --no-config to the checkbox.
-func splitUser(user []string) (cli string, noCfg bool) {
+func splitUser(user []string) (cli string, noCfg, noAuto bool) {
 	var rest []string
 	for i := 0; i < len(user); i++ {
 		a := user[i]
 		switch {
 		case a == noConfigOpt:
 			noCfg = true
+		case a == noAutoOpt:
+			noAuto = true
 		case a == "-port" || a == "--port":
 			i++ // its value
 		case strings.HasPrefix(a, "--port="):
@@ -37,7 +42,7 @@ func splitUser(user []string) (cli string, noCfg bool) {
 			rest = append(rest, a)
 		}
 	}
-	return joinFields(rest), noCfg
+	return joinFields(rest), noCfg, noAuto
 }
 
 // writeOptions stores the option line of mautg-args.txt (comment lines are kept, the
@@ -76,11 +81,14 @@ func writeOptions(path string, user []string, port int) error {
 
 // setOptions applies the window options (free CLI text + Def-Config checkbox) for the next
 // start and stores them in mautg-args.txt together with the current port.
-func (r *runner) setOptions(cliText string, noCfg bool) {
-	cli, n2 := splitUser(fieldsLine(cliText))
+func (r *runner) setOptions(cliText string, noCfg, noAuto bool) {
+	cli, n2, a2 := splitUser(fieldsLine(cliText))
 	user := fieldsLine(cli)
 	if noCfg || n2 {
 		user = append(user, noConfigOpt)
+	}
+	if noAuto || a2 {
+		user = append(user, noAutoOpt)
 	}
 	r.mu.Lock()
 	port := r.cfg.port
@@ -92,8 +100,8 @@ func (r *runner) setOptions(cliText string, noCfg bool) {
 	writeOptions(path, user, port)
 }
 
-// optionsText returns what the window shows: the CLI text and the checkbox state.
-func (r *runner) optionsText() (string, bool) {
+// optionsText returns what the window shows: the CLI text and the two checkboxes (no-config, no-autostart).
+func (r *runner) optionsText() (string, bool, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return splitUser(r.cfg.user)

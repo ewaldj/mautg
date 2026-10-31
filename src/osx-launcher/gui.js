@@ -1,13 +1,13 @@
 // mautg launcher window (JXA / Cocoa). Started by the launcher:
 //   osascript -l JavaScript gui.js <state file> <title> <icon>
 // The launcher writes the state as JSON to <state file>; this script polls it and prints
-// user actions as lines on stdout: ready, start <port> <0|1 no-config> <cli options>, stop, restart <port> <0|1> <cli>, open, log,
+// user actions as lines on stdout: ready, start <port> <no-config 0|1> <no-autostart 0|1> <cli options>, stop, restart <port> <0|1> <0|1> <cli>, open, log,
 // update, link, admin, exit.
 ObjC.import('Cocoa');
 
 var W = 380, H = 372;
 var ID = { start: 1, stop: 2, restart: 3, open: 4, log: 5, exit: 6, update: 7, link: 8, admin: 9 };
-var ui = {}, lastState = '', lastPortSeq = -1, win, delegate, portField, cliField, noCfgBox;
+var ui = {}, lastState = '', lastPortSeq = -1, win, delegate, portField, cliField, noCfgBox, noAutoBox;
 
 function emit(s) {
   var d = $(s + '\n').dataUsingEncoding($.NSUTF8StringEncoding);
@@ -40,7 +40,7 @@ function button(txt, id, x, y, w, h) {
 
 function onButton(id) {
   var p = String(ObjC.unwrap(portField.stringValue)).replace(/\s+/g, '');
-  var o = (noCfgBox.state ? '1' : '0') + ' ' + String(ObjC.unwrap(cliField.stringValue)).replace(/[\r\n]+/g, ' ').trim();
+  var o = (noCfgBox.state ? '1' : '0') + ' ' + (noAutoBox.state ? '1' : '0') + ' ' + String(ObjC.unwrap(cliField.stringValue)).replace(/[\r\n]+/g, ' ').trim();
   switch (id) {
     case ID.start: emit('start ' + p + ' ' + o); break;
     case ID.restart: emit('restart ' + p + ' ' + o); break;
@@ -73,6 +73,7 @@ function applyState(s) {
     portField.setStringValue($(String(s.port)));
     cliField.setStringValue($(s.cli || ''));
     noCfgBox.setState(s.noCfg ? 1 : 0);
+    noAutoBox.setState(s.noAuto ? 1 : 0);
   }
 }
 
@@ -142,9 +143,13 @@ function start(argv) {
   ui.logb = button('Console log', ID.log, 134, 126, 112, 30);
   ui.exit = button('Exit', ID.exit, 254, 126, 112, 30);
 
-  noCfgBox = $.NSButton.alloc.initWithFrame(rect(16, 168, 260, 20));
-  noCfgBox.setButtonType(3); // switch (checkbox)
-  noCfgBox.setTitle($('Disable Def-Config'));
+  noAutoBox = $.NSButton.alloc.initWithFrame(rect(16, 168, 160, 20));
+  noAutoBox.setButtonType(3); // switch (checkbox)
+  noAutoBox.setTitle($('Disable autostart'));
+  win.contentView.addSubview(noAutoBox);
+  noCfgBox = $.NSButton.alloc.initWithFrame(rect(190, 168, 170, 20));
+  noCfgBox.setButtonType(3);
+  noCfgBox.setTitle($('Disable Config'));
   win.contentView.addSubview(noCfgBox);
 
   label('CLI options:', 16, 206, 74, 18);

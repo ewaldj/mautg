@@ -34,6 +34,7 @@ type winState struct {
 	AdmShow bool   `json:"admShow"`
 	Cli     string `json:"cli"`
 	NoCfg   bool   `json:"noCfg"`
+	NoAuto  bool   `json:"noAuto"`
 }
 
 // window is the Cocoa window run by osascript (JXA); events are the lines it prints.
@@ -149,7 +150,7 @@ func (a *app) snapshot(busy string) winState {
 	s := winState{Status: a.status(), Running: a.run.running(), Upd: upd, UpdShow: show,
 		Foot: "mautg.py" + ver + "  -", Port: a.run.getPort(), PortSeq: seq,
 		Adm: adminText(), AdmShow: a.e.admin != nil && adminNeeded()}
-	s.Cli, s.NoCfg = a.run.optionsText()
+	s.Cli, s.NoCfg, s.NoAuto = a.run.optionsText()
 	if busy != "" {
 		s.Status, s.Busy = busy, true
 	}
@@ -160,8 +161,8 @@ func (a *app) push(w *window, busy string) { w.setState(a.snapshot(busy)) }
 
 // handle executes one window event; true = quit.
 func (a *app) handle(w *window, ev string) bool {
-	// "start <port> <0|1> <cli options ...>": the CLI text keeps its blanks
-	f := strings.SplitN(strings.TrimSpace(ev), " ", 4)
+	// "start <port> <no-config 0|1> <no-autostart 0|1> <cli options ...>": the CLI text keeps its blanks
+	f := strings.SplitN(strings.TrimSpace(ev), " ", 5)
 	if len(f) == 0 || f[0] == "" {
 		return false
 	}
@@ -175,12 +176,12 @@ func (a *app) handle(w *window, ev string) bool {
 		return 0
 	}
 	opts := func() {
-		if len(f) > 2 {
+		if len(f) > 3 {
 			cli := ""
-			if len(f) > 3 {
-				cli = f[3]
+			if len(f) > 4 {
+				cli = f[4]
 			}
-			a.run.setOptions(cli, f[2] == "1")
+			a.run.setOptions(cli, f[2] == "1", f[3] == "1")
 		}
 	}
 	switch f[0] {

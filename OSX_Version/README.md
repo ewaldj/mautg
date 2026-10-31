@@ -7,7 +7,7 @@ Python 3.11 (Apple Silicon and Intel) is included.
 
 ## Options
 
-The window has the checkbox **Disable Def-Config** (start without `~/.mau/config.json`, option `--no-config`) and the field **CLI options** (any mautg options, e.g. `-bind 0.0.0.0`). Both are applied with Start / Restart and stored in `mautg-args.txt` next to the program.
+The window has the checkboxes **Disable autostart** (mautg is not started with the launcher, press Start) and **Disable Config** (start without `~/.mau/config.json`, option `--no-config`) and the field **CLI options** (any mautg options, e.g. `-bind 0.0.0.0`). All are applied with Start / Restart and stored in `mautg-args.txt` next to the program.
 
 > **Alpha status:** hardly tested, reduced function compared to the Linux version (see the main [README](https://github.com/ewaldj/mautg#platform-status)). Expect bugs.
 > macOS: no kernel RX timestamps (user-space delay), no per-socket drop counter, no DF bit, TCP algorithm system-wide, TCP window / queue values missing.

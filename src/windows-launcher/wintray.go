@@ -179,6 +179,7 @@ const (
 	idUpdate  = 18
 	idAdmin   = 19
 	idNoCfg   = 20
+	idNoAuto  = 21
 	idCli     = 102
 
 	wmState  = wmApp + 2
@@ -190,7 +191,7 @@ const (
 
 var (
 	hwndMain, hStatus, hEdit, hLink uintptr
-	hCli, hNoCfg, hSmall            uintptr
+	hCli, hNoCfg, hNoAuto, hSmall   uintptr
 	hUpdTxt, hFoot, hRights         uintptr
 	updMu                           sync.Mutex
 	updNow                          *updInfo // newer files on GitHub, nil = current
@@ -232,9 +233,10 @@ func getText(h uintptr) string {
 }
 
 // optionsFromWindow reads the CLI options field and the Def-Config checkbox (UI thread).
-func optionsFromWindow() (string, bool) {
+func optionsFromWindow() (string, bool, bool) {
 	c, _, _ := pSendMessage.Call(hNoCfg, 0xF0, 0, 0) // BM_GETCHECK
-	return getText(hCli), c == 1
+	a, _, _ := pSendMessage.Call(hNoAuto, 0xF0, 0, 0)
+	return getText(hCli), c == 1, a == 1
 }
 
 func enable(id uintptr, on bool) {
@@ -404,14 +406,14 @@ func wndProc(hwnd, m, wp, lp uintptr) uintptr {
 			}
 			if n := portFromField(); n != 0 {
 				busy("starting ...")
-				cli, nc := optionsFromWindow()
-				go func() { run.setOptions(cli, nc); startWith(n, false) }()
+				cli, nc, na := optionsFromWindow()
+				go func() { run.setOptions(cli, nc, na); startWith(n, false) }()
 			}
 		case idRestart:
 			if n := portFromField(); n != 0 {
 				busy("restarting ...")
-				cli, nc := optionsFromWindow()
-				go func() { run.setOptions(cli, nc); startWith(n, true) }()
+				cli, nc, na := optionsFromWindow()
+				go func() { run.setOptions(cli, nc, na); startWith(n, true) }()
 			}
 		case idStop:
 			busy("stopping ...")
@@ -600,13 +602,17 @@ func main() {
 	btn[idExit] = mk("BUTTON", "Exit", tab, 254, 124, 108, 28, idExit)
 
 	// options (same as the macOS launcher): Def-Config checkbox and free CLI options
-	hNoCfg = mk("BUTTON", "Disable Def-Config", tab|3, 14, 166, 260, 20, idNoCfg) // BS_AUTOCHECKBOX
+	hNoAuto = mk("BUTTON", "Disable autostart", tab|3, 14, 166, 150, 20, idNoAuto) // BS_AUTOCHECKBOX
+	hNoCfg = mk("BUTTON", "Disable Config", tab|3, 180, 166, 170, 20, idNoCfg)
 	mk("STATIC", "CLI options:", 0, 14, 204, 74, 18, 0)
 	hCli = mk("EDIT", "", tab|0x00800000|0x80, 90, 200, 270, 22, idCli) // WS_BORDER | ES_AUTOHSCROLL
-	cliText, noCfg := run.optionsText()
+	cliText, noCfg, noAuto := run.optionsText()
 	setText(hCli, cliText)
 	if noCfg {
 		pSendMessage.Call(hNoCfg, 0xF1, 1, 0) // BM_SETCHECK
+	}
+	if noAuto {
+		pSendMessage.Call(hNoAuto, 0xF1, 1, 0)
 	}
 
 	mk("STATIC", "Rights:", 0, 14, 240, 60, 18, 0)
@@ -634,7 +640,11 @@ func main() {
 
 	go checkLoop()
 	go func() { // auto start; a busy port is reported, the user can pick another
-		ensureFirewall(cfg.python) // administrator only: inbound UDP rule for python.exe
+		ensureFirewall(cfg.python)             // administrator only: inbound UDP rule for python.exe
+		if _, _, no := run.optionsText(); no { // "Disable autostart"
+			pPostMessage.Call(hwndMain, wmState, 0, 0)
+			return
+		}
 		startWith(cfg.port, false)
 		if run.waitUp(30 * time.Second) { // open the browser when mautg answers
 			openTarget(fmt.Sprintf("http://127.0.0.1:%d", run.getPort()))

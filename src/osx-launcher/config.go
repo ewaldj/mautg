@@ -134,7 +134,11 @@ func composeArgs(user []string) ([]string, int) {
 	if !hasOpt(user, "-bind", "--bind") {
 		args = append(args, "-bind", "127.0.0.1")
 	}
-	args = append(args, user...)
+	for _, u := range user {
+		if u != noAutoOpt { // launcher only
+			args = append(args, u)
+		}
+	}
 	args = append(args, "-port", strconv.Itoa(port))
 	return args, port
 }

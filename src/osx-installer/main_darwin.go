@@ -6,9 +6,26 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 )
+
+// logf writes to stderr and to ~/Library/Logs/mautg-installer.log (nothing is shown
+// otherwise when osascript fails).
+func logf(format string, a ...interface{}) {
+	msg := fmt.Sprintf(format, a...)
+	fmt.Fprintln(os.Stderr, "mautg-installer: "+msg)
+	if h, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(h, "Library", "Logs", "mautg-installer.log")
+		if f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			fmt.Fprintf(f, "%s v%s %s\n", time.Now().Format("2006-01-02 15:04:05"), installerVersion, msg)
+			f.Close()
+		}
+	}
+}
 
 func osa(ctx context.Context, script string) (string, error) {
 	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
@@ -18,12 +35,14 @@ func osa(ctx context.Context, script string) (string, error) {
 		if strings.Contains(errb.String(), "-128") {
 			return "", errCancel
 		}
+		logf("osascript failed: %v %s", err, strings.TrimSpace(errb.String()))
 		return "", fmt.Errorf("%v %s", err, strings.TrimSpace(errb.String()))
 	}
 	return out.String(), nil
 }
 
 func main() {
+	logf("start (%s)", os.Args[0])
 	e := env{
 		dialog: func(ctx context.Context, s spec) (string, error) {
 			out, err := osa(ctx, dialogScript(s))

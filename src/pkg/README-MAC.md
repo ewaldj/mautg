@@ -14,4 +14,4 @@ button when GitHub has a newer version.
   (until the next reboot) and, if the macOS firewall is on, allows the bundled python. It asks for the administrator
   password; mautg itself always runs as your user. The first start asks once, "Never ask" is remembered.
 - Terminal mode: run `mautg.py` directly in Terminal.
-- Not notarized: right-click the app and choose Open, or run `xattr -dr com.apple.quarantine <mautg-mac folder>` once.
+- Not notarized: after a browser download press *Done*, then *Open Anyway* in System Settings / Privacy & Security (once), or download with `curl` / run `xattr -dr com.apple.quarantine <mautg-mac folder>` (Terminal needs *App Management*).

@@ -21,14 +21,20 @@ The window has the checkboxes **Disable autostart** (mautg is not started with t
 
 ## First start (apps are not notarized)
 
-macOS blocks downloaded apps from unknown developers. Either right-click the app, choose Open
-(macOS 15: System Settings / Privacy & Security / Open Anyway), or run once in Terminal:
+The apps are not signed with an Apple Developer ID, so macOS blocks them on the first start after a browser download:
+
+1. Open the app (double-click). macOS shows *"... Not Opened"*: press **Done**.
+2. System Settings / Privacy & Security: scroll to *Security*, press **Open Anyway** next to the blocked app (shown for about an hour after the attempt).
+3. Confirm with Touch ID or the password, then press **Open Anyway** again in the next dialog.
+
+This is needed once per downloaded app. Without these steps the icon only bounces and nothing appears. Alternatives: download in Terminal (curl sets no quarantine flag):
 
 ```sh
-xattr -dr com.apple.quarantine mautg-installer.app   # or the mautg-mac folder
+cd ~/Downloads && curl -fLO https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-installer-mac.zip && unzip -oq mautg-installer-mac.zip && open mautg-installer.app
 ```
 
-The installer removes the flag from the installed files itself.
+or remove the flag (Terminal needs *App Management* in Privacy & Security): `xattr -dr com.apple.quarantine mautg-installer.app` (or the `mautg-mac` folder).
+The installer removes the flag from the installed files itself. If the installer does not appear, the reason is written to `~/Library/Logs/mautg-installer.log`.
 
 ## Installer
 

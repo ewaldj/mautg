@@ -98,7 +98,7 @@ Packages with launcher window, bundled Python and update check start `mautg.py -
 | Windows 10/11 x64 | [mautg-installer.exe](https://github.com/ewaldj/mautg/raw/main/Windows_Version/mautg-installer.exe) | [mautg-windows.zip](https://github.com/ewaldj/mautg/raw/main/Windows_Version/mautg-windows.zip) |
 | macOS 10.13+ arm64 / x86_64 | [mautg-installer-mac.zip](https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-installer-mac.zip) | [mautg-mac.zip](https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-mac.zip) |
 
-Window: Start / Stop / Restart, web port, *Disable autostart*, *Disable Config*, *CLI options*, Console log, Update, Admin, Exit. macOS apps are not notarized: the first start needs *Open Anyway* in Privacy & Security, see [macOS](OSX_Version/README.md#first-start-apps-are-not-notarized). Details: [Windows](Windows_Version/README.md), [macOS](OSX_Version/README.md).
+Window: Start / Stop / Restart, web port, *Disable autostart*, *Disable Config*, *CLI options*, Console log, Update, Admin, Exit. macOS apps are not notarized: the first start needs *Open Anyway* in Privacy & Security, see [macOS](OSX_Version/README.md#installation-with-the-installer). Details: [Windows](Windows_Version/README.md), [macOS](OSX_Version/README.md).
 
 ## Protocol, files
 

@@ -19,28 +19,48 @@ The window has the checkboxes **Disable autostart** (mautg is not started with t
 | Installer | [mautg-installer-mac.zip](https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-installer-mac.zip) | Unzip, open `mautg-installer.app`: downloads the package and installs it for the current user or all users |
 | Portable | [mautg-mac.zip](https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-mac.zip) | Unzip anywhere and open `mautg.app` |
 
-## First start (apps are not notarized)
+## Installation with the installer
 
-The apps are not signed with an Apple Developer ID, so macOS blocks them on the first start after a browser download:
+The apps are not signed with an Apple Developer ID, so macOS blocks them on the first start after a browser download. This is done once per downloaded app.
 
-1. Open the app (double-click). macOS shows *"... Not Opened"*: press **Done**.
-2. System Settings / Privacy & Security: scroll to *Security*, press **Open Anyway** next to the blocked app (shown for about an hour after the attempt).
-3. Confirm with Touch ID or the password, then press **Open Anyway** again in the next dialog.
+1. Download [mautg-installer-mac.zip](https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-installer-mac.zip), unzip it and open `mautg-installer.app` (double-click). macOS shows *Not Opened*: press **Done**.
 
-This is needed once per downloaded app. Without these steps the icon only bounces and nothing appears. Alternatives: download in Terminal (curl sets no quarantine flag):
+   ![Not Opened](../screenshots/mac-install-1-not-opened.png)
 
-```sh
-cd ~/Downloads && curl -fLO https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-installer-mac.zip && unzip -oq mautg-installer-mac.zip && open mautg-installer.app
-```
+2. Open *System Settings / Privacy & Security*, scroll to *Security* and press **Open Anyway** next to the blocked app (shown for about an hour after the attempt).
 
-or remove the flag (Terminal needs *App Management* in Privacy & Security): `xattr -dr com.apple.quarantine mautg-installer.app` (or the `mautg-mac` folder).
-The installer removes the flag from the installed files itself. If the installer does not appear, the reason is written to `~/Library/Logs/mautg-installer.log`.
+   ![Open Anyway](../screenshots/mac-install-2-open-anyway.png)
 
-## Installer
+3. Press **Open Anyway** in the dialog and confirm with Touch ID or the administrator password.
 
-1. Open `mautg-installer.app`, press Install.
-2. Choose Current user (`~/Applications/mautg`) or All users (`/Applications/mautg`, asks for the admin password).
-3. Start mautg from the last dialog. Uninstall: open the installer again and press Uninstall.
+   ![Open Anyway dialog](../screenshots/mac-install-3-confirm.png) ![Password](../screenshots/mac-install-4-password.png)
+
+4. The installer window opens: press **Install**. (**Uninstall** removes mautg again.)
+
+   ![Installer](../screenshots/mac-install-5-installer.png)
+
+5. Choose *Current user* (`~/Applications/mautg`) or *All users* (`/Applications/mautg`, asks for the administrator password) and press **OK**. The package is downloaded from GitHub and installed.
+
+   ![Install location](../screenshots/mac-install-6-location.png)
+
+6. Press **Start mautg**: mautg starts in the background and the web GUI opens in the browser. **Show folder** opens the installation folder.
+
+   ![Installed](../screenshots/mac-install-7-done.png)
+
+The installer removes the quarantine flag from the installed files itself, so `mautg.app` starts without these steps. Without them the icon only bounces and nothing appears.
+If the installer window does not appear, the reason is written to `~/Library/Logs/mautg-installer.log`.
+
+### Alternatives for the first start
+
+- Download in Terminal (curl sets no quarantine flag):
+
+  ```sh
+  cd ~/Downloads && curl -fLO https://github.com/ewaldj/mautg/raw/main/OSX_Version/mautg-installer-mac.zip && unzip -oq mautg-installer-mac.zip && open mautg-installer.app
+  ```
+
+- Remove the flag from a browser download (Terminal needs *App Management* in Privacy & Security): `xattr -dr com.apple.quarantine mautg-installer.app` (or the `mautg-mac` folder).
+- The portable `mautg-mac.zip` needs the same steps for `mautg.app`.
+- Unzip into a new, empty folder: macOS remembers an earlier app at the same path and may report *The file can't be found*.
 
 ## Admin setup (optional)
 
